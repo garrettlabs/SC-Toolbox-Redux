@@ -1,0 +1,13 @@
+{
+  "charClasses": "0123456789.%",
+  "numClasses": 12,
+  "inputShape": [
+    1,
+    1,
+    28,
+    28
+  ],
+  "valAccuracy": 0.9999999403953552,
+  "source": "torch_digit_inv (inverted-polarity CNN)",
+  "samples": 1325
+}

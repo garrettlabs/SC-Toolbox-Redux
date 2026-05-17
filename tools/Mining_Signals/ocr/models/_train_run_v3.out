@@ -1,0 +1,210 @@
+2026-05-10 18:04:20,776 INFO Device: cpu
+INFO Device: cpu
+2026-05-10 18:04:20,776 INFO PyTorch: 2.11.0+cu130
+INFO PyTorch: 2.11.0+cu130
+2026-05-10 18:04:20,776 INFO Alphabet: '0123456789,' blank=11 num_classes=12
+INFO Alphabet: '0123456789,' blank=11 num_classes=12
+2026-05-10 18:04:20,776 INFO Walking C:\Users\prjgn\AppData\Roaming\ShipBit\WingmanAI\custom_skills\SC_Toolbox_Beta_V1.2\tools\Mining_Signals\training_data_panels ...
+INFO Walking C:\Users\prjgn\AppData\Roaming\ShipBit\WingmanAI\custom_skills\SC_Toolbox_Beta_V1.2\tools\Mining_Signals\training_data_panels ...
+2026-05-10 18:04:45,451 INFO Source dataset: walked=232 kept=201 skipped(pipeline)=31 skipped(no_gt)=0 skipped(empty_label)=0
+INFO Source dataset: walked=232 kept=201 skipped(pipeline)=31 skipped(no_gt)=0 skipped(empty_label)=0
+2026-05-10 18:04:45,457 INFO Built source items in 24.7s (n=201)
+INFO Built source items in 24.7s (n=201)
+2026-05-10 18:04:45,457 INFO Split: train=171 val=30
+INFO Split: train=171 val=30
+2026-05-10 18:04:45,457 INFO Expanded train set: 855 items (5x)
+INFO Expanded train set: 855 items (5x)
+2026-05-10 18:04:45,496 INFO Model params: 8712076
+INFO Model params: 8712076
+2026-05-10 18:05:13,059 INFO epoch   1/100  train_loss=2.5916  val_loss=2.1150  val_acc=0.000  lr=0.00100
+INFO epoch   1/100  train_loss=2.5916  val_loss=2.1150  val_acc=0.000  lr=0.00100
+2026-05-10 18:05:43,450 INFO epoch   2/100  train_loss=1.8713  val_loss=1.8942  val_acc=0.000  lr=0.00100
+INFO epoch   2/100  train_loss=1.8713  val_loss=1.8942  val_acc=0.000  lr=0.00100
+2026-05-10 18:06:13,440 INFO epoch   3/100  train_loss=1.6726  val_loss=1.9279  val_acc=0.000  lr=0.00100
+INFO epoch   3/100  train_loss=1.6726  val_loss=1.9279  val_acc=0.000  lr=0.00100
+2026-05-10 18:06:44,350 INFO epoch   4/100  train_loss=1.5446  val_loss=1.6034  val_acc=0.033  lr=0.00100
+INFO epoch   4/100  train_loss=1.5446  val_loss=1.6034  val_acc=0.033  lr=0.00100
+2026-05-10 18:07:14,338 INFO epoch   5/100  train_loss=1.4583  val_loss=1.5601  val_acc=0.000  lr=0.00099
+INFO epoch   5/100  train_loss=1.4583  val_loss=1.5601  val_acc=0.000  lr=0.00099
+2026-05-10 18:07:44,580 INFO epoch   6/100  train_loss=1.4338  val_loss=1.5935  val_acc=0.000  lr=0.00099
+INFO epoch   6/100  train_loss=1.4338  val_loss=1.5935  val_acc=0.000  lr=0.00099
+2026-05-10 18:08:14,460 INFO epoch   7/100  train_loss=1.4335  val_loss=1.5660  val_acc=0.000  lr=0.00099
+INFO epoch   7/100  train_loss=1.4335  val_loss=1.5660  val_acc=0.000  lr=0.00099
+2026-05-10 18:08:46,777 INFO epoch   8/100  train_loss=1.4196  val_loss=1.5578  val_acc=0.000  lr=0.00098
+INFO epoch   8/100  train_loss=1.4196  val_loss=1.5578  val_acc=0.000  lr=0.00098
+2026-05-10 18:09:14,116 INFO epoch   9/100  train_loss=1.4139  val_loss=1.5345  val_acc=0.000  lr=0.00098
+INFO epoch   9/100  train_loss=1.4139  val_loss=1.5345  val_acc=0.000  lr=0.00098
+2026-05-10 18:09:44,641 INFO epoch  10/100  train_loss=1.4152  val_loss=1.5071  val_acc=0.000  lr=0.00098
+INFO epoch  10/100  train_loss=1.4152  val_loss=1.5071  val_acc=0.000  lr=0.00098
+2026-05-10 18:10:20,866 INFO epoch  11/100  train_loss=1.3924  val_loss=1.5006  val_acc=0.000  lr=0.00097
+INFO epoch  11/100  train_loss=1.3924  val_loss=1.5006  val_acc=0.000  lr=0.00097
+2026-05-10 18:10:51,777 INFO epoch  12/100  train_loss=1.3712  val_loss=1.4685  val_acc=0.000  lr=0.00096
+INFO epoch  12/100  train_loss=1.3712  val_loss=1.4685  val_acc=0.000  lr=0.00096
+2026-05-10 18:11:24,997 INFO epoch  13/100  train_loss=1.3511  val_loss=1.4415  val_acc=0.000  lr=0.00096
+INFO epoch  13/100  train_loss=1.3511  val_loss=1.4415  val_acc=0.000  lr=0.00096
+2026-05-10 18:12:03,114 INFO epoch  14/100  train_loss=1.3390  val_loss=1.4348  val_acc=0.000  lr=0.00095
+INFO epoch  14/100  train_loss=1.3390  val_loss=1.4348  val_acc=0.000  lr=0.00095
+2026-05-10 18:12:41,820 INFO epoch  15/100  train_loss=1.3368  val_loss=1.4330  val_acc=0.000  lr=0.00095
+INFO epoch  15/100  train_loss=1.3368  val_loss=1.4330  val_acc=0.000  lr=0.00095
+2026-05-10 18:13:20,266 INFO epoch  16/100  train_loss=1.3362  val_loss=1.4422  val_acc=0.000  lr=0.00094
+INFO epoch  16/100  train_loss=1.3362  val_loss=1.4422  val_acc=0.000  lr=0.00094
+2026-05-10 18:13:59,668 INFO epoch  17/100  train_loss=1.3294  val_loss=1.4339  val_acc=0.000  lr=0.00093
+INFO epoch  17/100  train_loss=1.3294  val_loss=1.4339  val_acc=0.000  lr=0.00093
+2026-05-10 18:14:38,470 INFO epoch  18/100  train_loss=1.3326  val_loss=1.4318  val_acc=0.000  lr=0.00092
+INFO epoch  18/100  train_loss=1.3326  val_loss=1.4318  val_acc=0.000  lr=0.00092
+2026-05-10 18:15:18,720 INFO epoch  19/100  train_loss=1.3266  val_loss=1.4327  val_acc=0.000  lr=0.00091
+INFO epoch  19/100  train_loss=1.3266  val_loss=1.4327  val_acc=0.000  lr=0.00091
+2026-05-10 18:15:57,523 INFO epoch  20/100  train_loss=1.3297  val_loss=1.4264  val_acc=0.000  lr=0.00090
+INFO epoch  20/100  train_loss=1.3297  val_loss=1.4264  val_acc=0.000  lr=0.00090
+2026-05-10 18:16:45,902 INFO epoch  21/100  train_loss=1.3521  val_loss=1.4574  val_acc=0.000  lr=0.00090
+INFO epoch  21/100  train_loss=1.3521  val_loss=1.4574  val_acc=0.000  lr=0.00090
+2026-05-10 18:17:44,328 INFO epoch  22/100  train_loss=1.3342  val_loss=1.4345  val_acc=0.000  lr=0.00089
+INFO epoch  22/100  train_loss=1.3342  val_loss=1.4345  val_acc=0.000  lr=0.00089
+2026-05-10 18:18:42,321 INFO epoch  23/100  train_loss=1.3270  val_loss=1.4371  val_acc=0.000  lr=0.00088
+INFO epoch  23/100  train_loss=1.3270  val_loss=1.4371  val_acc=0.000  lr=0.00088
+2026-05-10 18:19:39,324 INFO epoch  24/100  train_loss=1.3270  val_loss=1.4455  val_acc=0.000  lr=0.00086
+INFO epoch  24/100  train_loss=1.3270  val_loss=1.4455  val_acc=0.000  lr=0.00086
+2026-05-10 18:20:32,735 INFO epoch  25/100  train_loss=1.3227  val_loss=1.4313  val_acc=0.000  lr=0.00085
+INFO epoch  25/100  train_loss=1.3227  val_loss=1.4313  val_acc=0.000  lr=0.00085
+2026-05-10 18:21:26,568 INFO epoch  26/100  train_loss=1.3243  val_loss=1.4185  val_acc=0.000  lr=0.00084
+INFO epoch  26/100  train_loss=1.3243  val_loss=1.4185  val_acc=0.000  lr=0.00084
+2026-05-10 18:22:24,987 INFO epoch  27/100  train_loss=1.3255  val_loss=1.4325  val_acc=0.000  lr=0.00083
+INFO epoch  27/100  train_loss=1.3255  val_loss=1.4325  val_acc=0.000  lr=0.00083
+2026-05-10 18:23:23,871 INFO epoch  28/100  train_loss=1.3123  val_loss=1.4131  val_acc=0.000  lr=0.00082
+INFO epoch  28/100  train_loss=1.3123  val_loss=1.4131  val_acc=0.000  lr=0.00082
+2026-05-10 18:24:20,104 INFO epoch  29/100  train_loss=1.3109  val_loss=1.3954  val_acc=0.000  lr=0.00081
+INFO epoch  29/100  train_loss=1.3109  val_loss=1.3954  val_acc=0.000  lr=0.00081
+2026-05-10 18:25:19,104 INFO epoch  30/100  train_loss=1.3291  val_loss=1.4207  val_acc=0.000  lr=0.00079
+INFO epoch  30/100  train_loss=1.3291  val_loss=1.4207  val_acc=0.000  lr=0.00079
+2026-05-10 18:26:10,364 INFO epoch  31/100  train_loss=1.3391  val_loss=1.4050  val_acc=0.000  lr=0.00078
+INFO epoch  31/100  train_loss=1.3391  val_loss=1.4050  val_acc=0.000  lr=0.00078
+2026-05-10 18:27:08,471 INFO epoch  32/100  train_loss=1.3138  val_loss=1.4553  val_acc=0.000  lr=0.00077
+INFO epoch  32/100  train_loss=1.3138  val_loss=1.4553  val_acc=0.000  lr=0.00077
+2026-05-10 18:28:11,123 INFO epoch  33/100  train_loss=1.2929  val_loss=1.4295  val_acc=0.133  lr=0.00075
+INFO epoch  33/100  train_loss=1.2929  val_loss=1.4295  val_acc=0.133  lr=0.00075
+2026-05-10 18:29:07,175 INFO epoch  34/100  train_loss=1.3024  val_loss=1.3907  val_acc=0.000  lr=0.00074
+INFO epoch  34/100  train_loss=1.3024  val_loss=1.3907  val_acc=0.000  lr=0.00074
+2026-05-10 18:29:58,363 INFO epoch  35/100  train_loss=1.2815  val_loss=1.4337  val_acc=0.000  lr=0.00073
+INFO epoch  35/100  train_loss=1.2815  val_loss=1.4337  val_acc=0.000  lr=0.00073
+2026-05-10 18:30:43,699 INFO epoch  36/100  train_loss=1.2046  val_loss=1.4778  val_acc=0.067  lr=0.00071
+INFO epoch  36/100  train_loss=1.2046  val_loss=1.4778  val_acc=0.067  lr=0.00071
+2026-05-10 18:31:26,373 INFO epoch  37/100  train_loss=1.1034  val_loss=1.9076  val_acc=0.000  lr=0.00070
+INFO epoch  37/100  train_loss=1.1034  val_loss=1.9076  val_acc=0.000  lr=0.00070
+2026-05-10 18:32:07,542 INFO epoch  38/100  train_loss=1.0167  val_loss=1.1308  val_acc=0.200  lr=0.00068
+INFO epoch  38/100  train_loss=1.0167  val_loss=1.1308  val_acc=0.200  lr=0.00068
+2026-05-10 18:32:50,502 INFO epoch  39/100  train_loss=0.8434  val_loss=1.0032  val_acc=0.200  lr=0.00067
+INFO epoch  39/100  train_loss=0.8434  val_loss=1.0032  val_acc=0.200  lr=0.00067
+2026-05-10 18:33:35,754 INFO epoch  40/100  train_loss=0.7282  val_loss=1.2169  val_acc=0.100  lr=0.00065
+INFO epoch  40/100  train_loss=0.7282  val_loss=1.2169  val_acc=0.100  lr=0.00065
+2026-05-10 18:34:17,800 INFO epoch  41/100  train_loss=0.6390  val_loss=0.8537  val_acc=0.267  lr=0.00064
+INFO epoch  41/100  train_loss=0.6390  val_loss=0.8537  val_acc=0.267  lr=0.00064
+2026-05-10 18:34:59,722 INFO epoch  42/100  train_loss=0.5330  val_loss=0.8795  val_acc=0.200  lr=0.00062
+INFO epoch  42/100  train_loss=0.5330  val_loss=0.8795  val_acc=0.200  lr=0.00062
+2026-05-10 18:35:43,381 INFO epoch  43/100  train_loss=0.4754  val_loss=0.7143  val_acc=0.367  lr=0.00061
+INFO epoch  43/100  train_loss=0.4754  val_loss=0.7143  val_acc=0.367  lr=0.00061
+2026-05-10 18:36:34,102 INFO epoch  44/100  train_loss=0.3992  val_loss=0.7291  val_acc=0.233  lr=0.00059
+INFO epoch  44/100  train_loss=0.3992  val_loss=0.7291  val_acc=0.233  lr=0.00059
+2026-05-10 18:37:19,234 INFO epoch  45/100  train_loss=0.3590  val_loss=0.7581  val_acc=0.400  lr=0.00058
+INFO epoch  45/100  train_loss=0.3590  val_loss=0.7581  val_acc=0.400  lr=0.00058
+2026-05-10 18:38:10,265 INFO epoch  46/100  train_loss=0.3220  val_loss=0.5880  val_acc=0.533  lr=0.00056
+INFO epoch  46/100  train_loss=0.3220  val_loss=0.5880  val_acc=0.533  lr=0.00056
+2026-05-10 18:39:11,039 INFO epoch  47/100  train_loss=0.2476  val_loss=0.6125  val_acc=0.500  lr=0.00055
+INFO epoch  47/100  train_loss=0.2476  val_loss=0.6125  val_acc=0.500  lr=0.00055
+2026-05-10 18:40:06,937 INFO epoch  48/100  train_loss=0.1993  val_loss=0.5044  val_acc=0.600  lr=0.00053
+INFO epoch  48/100  train_loss=0.1993  val_loss=0.5044  val_acc=0.600  lr=0.00053
+2026-05-10 18:41:04,545 INFO epoch  49/100  train_loss=0.1729  val_loss=0.5842  val_acc=0.367  lr=0.00052
+INFO epoch  49/100  train_loss=0.1729  val_loss=0.5842  val_acc=0.367  lr=0.00052
+2026-05-10 18:42:02,957 INFO epoch  50/100  train_loss=0.1495  val_loss=0.4585  val_acc=0.667  lr=0.00050
+INFO epoch  50/100  train_loss=0.1495  val_loss=0.4585  val_acc=0.667  lr=0.00050
+2026-05-10 18:43:05,514 INFO epoch  51/100  train_loss=0.1013  val_loss=0.5168  val_acc=0.600  lr=0.00048
+INFO epoch  51/100  train_loss=0.1013  val_loss=0.5168  val_acc=0.600  lr=0.00048
+2026-05-10 18:44:03,821 INFO epoch  52/100  train_loss=0.0918  val_loss=0.4393  val_acc=0.667  lr=0.00047
+INFO epoch  52/100  train_loss=0.0918  val_loss=0.4393  val_acc=0.667  lr=0.00047
+2026-05-10 18:45:02,606 INFO epoch  53/100  train_loss=0.0639  val_loss=0.4336  val_acc=0.700  lr=0.00045
+INFO epoch  53/100  train_loss=0.0639  val_loss=0.4336  val_acc=0.700  lr=0.00045
+2026-05-10 18:46:04,373 INFO epoch  54/100  train_loss=0.0521  val_loss=0.4906  val_acc=0.667  lr=0.00044
+INFO epoch  54/100  train_loss=0.0521  val_loss=0.4906  val_acc=0.667  lr=0.00044
+2026-05-10 18:47:09,550 INFO epoch  55/100  train_loss=0.0519  val_loss=0.4701  val_acc=0.667  lr=0.00042
+INFO epoch  55/100  train_loss=0.0519  val_loss=0.4701  val_acc=0.667  lr=0.00042
+2026-05-10 18:47:58,461 INFO epoch  56/100  train_loss=0.0416  val_loss=0.4008  val_acc=0.700  lr=0.00041
+INFO epoch  56/100  train_loss=0.0416  val_loss=0.4008  val_acc=0.700  lr=0.00041
+2026-05-10 18:48:42,926 INFO epoch  57/100  train_loss=0.0296  val_loss=0.4006  val_acc=0.667  lr=0.00039
+INFO epoch  57/100  train_loss=0.0296  val_loss=0.4006  val_acc=0.667  lr=0.00039
+2026-05-10 18:49:28,322 INFO epoch  58/100  train_loss=0.0597  val_loss=0.5422  val_acc=0.600  lr=0.00038
+INFO epoch  58/100  train_loss=0.0597  val_loss=0.5422  val_acc=0.600  lr=0.00038
+2026-05-10 18:50:14,273 INFO epoch  59/100  train_loss=0.0667  val_loss=0.4532  val_acc=0.667  lr=0.00036
+INFO epoch  59/100  train_loss=0.0667  val_loss=0.4532  val_acc=0.667  lr=0.00036
+2026-05-10 18:51:03,172 INFO epoch  60/100  train_loss=0.0413  val_loss=0.4245  val_acc=0.733  lr=0.00035
+INFO epoch  60/100  train_loss=0.0413  val_loss=0.4245  val_acc=0.733  lr=0.00035
+2026-05-10 18:51:51,769 INFO epoch  61/100  train_loss=0.0330  val_loss=0.4046  val_acc=0.733  lr=0.00033
+INFO epoch  61/100  train_loss=0.0330  val_loss=0.4046  val_acc=0.733  lr=0.00033
+2026-05-10 18:52:38,148 INFO epoch  62/100  train_loss=0.0244  val_loss=0.4258  val_acc=0.733  lr=0.00032
+INFO epoch  62/100  train_loss=0.0244  val_loss=0.4258  val_acc=0.733  lr=0.00032
+2026-05-10 18:53:26,023 INFO epoch  63/100  train_loss=0.0319  val_loss=0.4520  val_acc=0.700  lr=0.00030
+INFO epoch  63/100  train_loss=0.0319  val_loss=0.4520  val_acc=0.700  lr=0.00030
+2026-05-10 18:54:13,668 INFO epoch  64/100  train_loss=0.0331  val_loss=0.4415  val_acc=0.733  lr=0.00029
+INFO epoch  64/100  train_loss=0.0331  val_loss=0.4415  val_acc=0.733  lr=0.00029
+2026-05-10 18:55:03,107 INFO epoch  65/100  train_loss=0.0195  val_loss=0.4871  val_acc=0.733  lr=0.00027
+INFO epoch  65/100  train_loss=0.0195  val_loss=0.4871  val_acc=0.733  lr=0.00027
+2026-05-10 18:55:50,923 INFO epoch  66/100  train_loss=0.0199  val_loss=0.4413  val_acc=0.767  lr=0.00026
+INFO epoch  66/100  train_loss=0.0199  val_loss=0.4413  val_acc=0.767  lr=0.00026
+2026-05-10 18:56:37,419 INFO epoch  67/100  train_loss=0.0166  val_loss=0.4531  val_acc=0.733  lr=0.00025
+INFO epoch  67/100  train_loss=0.0166  val_loss=0.4531  val_acc=0.733  lr=0.00025
+2026-05-10 18:57:25,381 INFO epoch  68/100  train_loss=0.0153  val_loss=0.4380  val_acc=0.833  lr=0.00023
+INFO epoch  68/100  train_loss=0.0153  val_loss=0.4380  val_acc=0.833  lr=0.00023
+2026-05-10 18:58:12,829 INFO epoch  69/100  train_loss=0.0130  val_loss=0.4710  val_acc=0.767  lr=0.00022
+INFO epoch  69/100  train_loss=0.0130  val_loss=0.4710  val_acc=0.767  lr=0.00022
+2026-05-10 18:58:58,609 INFO epoch  70/100  train_loss=0.0167  val_loss=0.4569  val_acc=0.733  lr=0.00021
+INFO epoch  70/100  train_loss=0.0167  val_loss=0.4569  val_acc=0.733  lr=0.00021
+2026-05-10 18:59:44,895 INFO epoch  71/100  train_loss=0.0121  val_loss=0.4546  val_acc=0.733  lr=0.00019
+INFO epoch  71/100  train_loss=0.0121  val_loss=0.4546  val_acc=0.733  lr=0.00019
+2026-05-10 19:00:30,781 INFO epoch  72/100  train_loss=0.0102  val_loss=0.4529  val_acc=0.767  lr=0.00018
+INFO epoch  72/100  train_loss=0.0102  val_loss=0.4529  val_acc=0.767  lr=0.00018
+2026-05-10 19:01:17,581 INFO epoch  73/100  train_loss=0.0090  val_loss=0.4567  val_acc=0.767  lr=0.00017
+INFO epoch  73/100  train_loss=0.0090  val_loss=0.4567  val_acc=0.767  lr=0.00017
+2026-05-10 19:02:06,730 INFO epoch  74/100  train_loss=0.0085  val_loss=0.4382  val_acc=0.733  lr=0.00016
+INFO epoch  74/100  train_loss=0.0085  val_loss=0.4382  val_acc=0.733  lr=0.00016
+2026-05-10 19:03:06,307 INFO epoch  75/100  train_loss=0.0107  val_loss=0.4436  val_acc=0.767  lr=0.00015
+INFO epoch  75/100  train_loss=0.0107  val_loss=0.4436  val_acc=0.767  lr=0.00015
+2026-05-10 19:04:09,224 INFO epoch  76/100  train_loss=0.0089  val_loss=0.4615  val_acc=0.733  lr=0.00014
+INFO epoch  76/100  train_loss=0.0089  val_loss=0.4615  val_acc=0.733  lr=0.00014
+2026-05-10 19:05:36,533 INFO epoch  77/100  train_loss=0.0081  val_loss=0.4480  val_acc=0.733  lr=0.00012
+INFO epoch  77/100  train_loss=0.0081  val_loss=0.4480  val_acc=0.733  lr=0.00012
+2026-05-10 19:07:03,531 INFO epoch  78/100  train_loss=0.0079  val_loss=0.4445  val_acc=0.800  lr=0.00011
+INFO epoch  78/100  train_loss=0.0079  val_loss=0.4445  val_acc=0.800  lr=0.00011
+2026-05-10 19:08:27,641 INFO epoch  79/100  train_loss=0.0070  val_loss=0.4506  val_acc=0.767  lr=0.00010
+INFO epoch  79/100  train_loss=0.0070  val_loss=0.4506  val_acc=0.767  lr=0.00010
+2026-05-10 19:09:44,306 INFO epoch  80/100  train_loss=0.0088  val_loss=0.4540  val_acc=0.767  lr=0.00010
+INFO epoch  80/100  train_loss=0.0088  val_loss=0.4540  val_acc=0.767  lr=0.00010
+2026-05-10 19:10:45,818 INFO epoch  81/100  train_loss=0.0087  val_loss=0.4365  val_acc=0.767  lr=0.00009
+INFO epoch  81/100  train_loss=0.0087  val_loss=0.4365  val_acc=0.767  lr=0.00009
+2026-05-10 19:11:48,248 INFO epoch  82/100  train_loss=0.0073  val_loss=0.4451  val_acc=0.833  lr=0.00008
+INFO epoch  82/100  train_loss=0.0073  val_loss=0.4451  val_acc=0.833  lr=0.00008
+2026-05-10 19:12:48,750 INFO epoch  83/100  train_loss=0.0071  val_loss=0.4464  val_acc=0.767  lr=0.00007
+INFO epoch  83/100  train_loss=0.0071  val_loss=0.4464  val_acc=0.767  lr=0.00007
+2026-05-10 19:12:48,752 INFO Early stop at epoch 83 (val plateaued for 15 epochs)
+INFO Early stop at epoch 83 (val plateaued for 15 epochs)
+2026-05-10 19:12:48,753 INFO Training done in 4082.2s. best_val_loss=0.4006 best_val_acc=0.833
+INFO Training done in 4082.2s. best_val_loss=0.4006 best_val_acc=0.833
+2026-05-10 19:12:49,305 INFO Final held-out val accuracy: 0.833 (25/30)
+INFO Final held-out val accuracy: 0.833 (25/30)
+2026-05-10 19:12:49,305 INFO Exporting ONNX to C:\Users\prjgn\AppData\Local\SC_Toolbox\current\tools\Mining_Signals\ocr\models\model_signal_crnn_rgb.onnx
+INFO Exporting ONNX to C:\Users\prjgn\AppData\Local\SC_Toolbox\current\tools\Mining_Signals\ocr\models\model_signal_crnn_rgb.onnx
+C:\Users\prjgn\AppData\Local\SC_Toolbox\current\tools\Mining_Signals\ocr\train_signal_crnn_rgb.py:755: UserWarning: # 'dynamic_axes' is not recommended when dynamo=True, and may lead to 'torch._dynamo.exc.UserError: Constraints violated.' Supply the 'dynamic_shapes' argument instead if export is unsuccessful.
+  torch.onnx.export(
+W0510 19:12:51.824000 5088 site-packages\torch\onnx\_internal\exporter\_compat.py:133] Setting ONNX exporter to use operator set version 18 because the requested opset_version 14 is a lower version than we have implementations for. Automatic version conversion will be performed, which may not be successful at converting to the requested version. If version conversion is unsuccessful, the opset version of the exported model will be kept at 18. Please consider setting opset_version >=18 to leverage latest ONNX features
+W0510 19:12:53.244000 5088 site-packages\torch\onnx\_internal\exporter\_registration.py:110] torchvision is not installed. Skipping torchvision::nms
+W0510 19:12:53.246000 5088 site-packages\torch\onnx\_internal\exporter\_registration.py:110] torchvision is not installed. Skipping torchvision::roi_align
+W0510 19:12:53.246000 5088 site-packages\torch\onnx\_internal\exporter\_registration.py:110] torchvision is not installed. Skipping torchvision::roi_pool
+W0510 19:12:53.587000 5088 site-packages\torch\utils\flop_counter.py:29] triton not found; flop counting will not work for triton kernels
+C:\Users\prjgn\AppData\Local\Python\pythoncore-3.14-64\Lib\contextlib.py:148: UserWarning: The tensor attributes self.rnn._flat_weights[0], self.rnn._flat_weights[1], self.rnn._flat_weights[2], self.rnn._flat_weights[3], self.rnn._flat_weights[4], self.rnn._flat_weights[5], self.rnn._flat_weights[6], self.rnn._flat_weights[7], self.rnn._flat_weights[8], self.rnn._flat_weights[9], self.rnn._flat_weights[10], self.rnn._flat_weights[11], self.rnn._flat_weights[12], self.rnn._flat_weights[13], self.rnn._flat_weights[14], self.rnn._flat_weights[15] were assigned during export. Such attributes must be registered as buffers using the `register_buffer` API (https://pytorch.org/docs/stable/generated/torch.nn.Module.html#torch.nn.Module.register_buffer).
+  next(self.gen)
+[torch.onnx] Obtain model graph for `RGBCRNN([...]` with `torch.export.export(..., strict=False)`...
+[torch.onnx] 2026-05-10 19:13:02,571 ERROR ONNX export failed: 'charmap' codec can't encode character '\u2705' in position 88: character maps to <undefined>
+ERROR ONNX export failed: 'charmap' codec can't encode character '\u2705' in position 88: character maps to <undefined>
+2026-05-10 19:13:02,572 INFO ONNX size: 0 bytes (0.00 MB)
+INFO ONNX size: 0 bytes (0.00 MB)
+2026-05-10 19:13:02,574 INFO Wrote metadata: C:\Users\prjgn\AppData\Local\SC_Toolbox\current\tools\Mining_Signals\ocr\models\model_signal_crnn_rgb.json
+INFO Wrote metadata: C:\Users\prjgn\AppData\Local\SC_Toolbox\current\tools\Mining_Signals\ocr\models\model_signal_crnn_rgb.json
+2026-05-10 19:13:02,574 INFO DONE.
+INFO DONE.

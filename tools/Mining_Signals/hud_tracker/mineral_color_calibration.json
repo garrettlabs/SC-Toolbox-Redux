@@ -1,0 +1,67 @@
+{
+  "version": 1,
+  "source": "C:\\Users\\prjgn\\AppData\\Roaming\\ShipBit\\WingmanAI\\custom_skills\\SC_Toolbox_Beta_V1.2\\tools\\Mining_Signals\\training_data_panels\\user_20260418_154408\\region1",
+  "n_captures": 69,
+  "n_total_samples": 150656,
+  "warm_band": {
+    "h_min": 2,
+    "h_max": 47,
+    "_n_samples": 44740
+  },
+  "cyan_band": {
+    "h_min": 49,
+    "h_max": 95,
+    "_n_samples": 12775
+  },
+  "purple_band": {
+    "h_min": 134,
+    "h_max": 156,
+    "_n_samples": 75607
+  },
+  "sat_min": 88,
+  "val_min": 146,
+  "min_width_px": 50,
+  "min_height_px": 10,
+  "max_height_px": 35,
+  "min_aspect": 2.0,
+  "morph_horiz_close_px": 11,
+  "position_y_min_frac": 0.05,
+  "position_y_max_frac": 0.55,
+  "panel_y_min_frac": 0.1,
+  "panel_y_max_frac": 0.55,
+  "_per_capture_summary": [
+    {
+      "image": "cap_20260418_155705_329.png",
+      "n_samples": 1943
+    },
+    {
+      "image": "cap_20260418_155710_185.png",
+      "n_samples": 1767
+    },
+    {
+      "image": "cap_20260418_155715_919.png",
+      "n_samples": 1782
+    },
+    {
+      "image": "cap_20260418_155721_243.png",
+      "n_samples": 3732
+    },
+    {
+      "image": "cap_20260418_155725_424.png",
+      "n_samples": 1855
+    },
+    {
+      "image": "cap_20260418_155740_736.png",
+      "n_samples": 11135
+    },
+    {
+      "image": "cap_20260418_155743_480.png",
+      "n_samples": 6349
+    },
+    {
+      "image": "cap_20260418_155746_172.png",
+      "n_samples": 249
+    }
+  ],
+  "_doc": "Mineral name palette calibration. PIL HSV scale: H, S, V each in 0-255. Hue bands cover warm (orange/yellow), cyan/teal (BERYL-style) and purple (rare mineral types)."
+}

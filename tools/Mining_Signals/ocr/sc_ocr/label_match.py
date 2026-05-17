@@ -51,6 +51,27 @@ _templates_height: int = 28  # canonical height the templates are rendered at
 # is considered "not found" and the caller falls back.
 _MIN_MATCH_SCORE = 0.45
 
+# When MASS matches at or above this score we treat its position as
+# ground truth and are willing to SYNTHESIZE the resistance /
+# instability label positions from the HUD's rigid 3-row geometry
+# (``mass + pitch`` / ``mass + 2·pitch``) even if their own NCC score
+# falls below ``_MIN_MATCH_SCORE``.
+#
+# Why this exists: ``RESISTANCE:`` and ``INSTABILITY:`` are long words,
+# so their templates span 160-230 px. On panels captured at a slight
+# perspective skew the cumulative misalignment across that width tanks
+# the NCC score (observed: 0.39 / 0.25 on a skewed panel where MASS —
+# a short word — still scored 0.80). The three rows are ALWAYS present
+# and ALWAYS evenly spaced in the SC mining HUD, so a confident MASS
+# match plus the fixed pitch fully determines the other two rows.
+# Without synthesis the finder drops to a single-anchor recovery that
+# produces unusable row crops (value_crop is None / oversized-band).
+#
+# 0.65 is comfortably above ``_MIN_MATCH_SCORE`` (0.45) so synthesis
+# only triggers off a genuinely confident MASS lock, never a marginal
+# one.
+_SYNTH_MASS_FLOOR = 0.65
+
 # Multi-scale search: panels can be captured at different resolutions,
 # so the rendered label height varies. Search at multiple scales and
 # pick the best match. Scales relative to the template's native height.
@@ -216,11 +237,89 @@ def _resize_template(template: np.ndarray, scale: float) -> np.ndarray:
     return (arr - mean) / std
 
 
-_LAST_CALL_CACHE: Optional[tuple[int, tuple[int, int], str, dict]] = None
+# Per-image cache key shape:
+#   (id(img), size, mode, search_centers_key, search_radius)
+# where search_centers_key is None for full-frame calls or a
+# sorted tuple of (name, x, y) triples otherwise. Including the
+# local-search arguments in the key prevents a local-search call
+# from returning a stale full-frame result (and vice-versa) when
+# both happen against the same Image instance in a single scan.
+_LAST_CALL_CACHE: Optional[tuple[
+    int,                                                      # id(img)
+    tuple[int, int],                                          # img.size
+    str,                                                      # img.mode
+    Optional[tuple[tuple[str, int, int], ...]],               # search_centers
+    int,                                                      # search_radius
+    dict,                                                     # result
+]] = None
+
+# Default radius for label-local search. Per-label NCC against the
+# canonicalized template is cheap inside a small window, so we err
+# on the slightly-larger side: a few extra px of slack catches
+# rendering jitter / sub-pixel resampling without exploding the
+# cost.
+_DEFAULT_LOCAL_RADIUS = 40
+
+
+# Holds the matches dict produced by the most recent FULL-FRAME call to
+# ``find_label_positions`` (i.e. ``search_centers is None``). Used by
+# the auto-calibration hook in ``onnx_hud_reader._label_rows_from_anchor``
+# to read the per-label observations without re-running the expensive
+# multi-scale NCC sweep.
+#
+# Local-search calls do NOT update this — they target a narrow window
+# around predicted positions, which would skew the calibration
+# observations toward where the tracker thought the labels should be
+# (defeating the purpose of using observed data to correct stale
+# defaults).
+#
+# The dict stores image-relative coordinates from the call: when the
+# caller cropped the image first (e.g. ``_label_rows_from_anchor``
+# operating on a "below title" crop), the Y values are crop-relative
+# and the caller is responsible for adding the crop offset before
+# feeding them to the calibration learner.
+_LAST_FULL_FRAME_MATCHES: dict[str, dict] = {}
+
+
+def get_last_full_frame_matches() -> dict[str, dict]:
+    """Return a shallow copy of the most-recent full-frame
+    ``find_label_positions`` result.
+
+    Empty dict if no full-frame call has been made yet, or the last
+    full-frame call found nothing. Local-search calls do not update
+    this state.
+
+    Callers should be aware the returned coordinates are relative to
+    whatever image was passed to that ``find_label_positions`` call;
+    if the caller cropped before calling, they must add the crop
+    offset themselves before interpreting Y values in the original
+    image's coordinate frame.
+    """
+    return dict(_LAST_FULL_FRAME_MATCHES)
+
+
+def _normalize_search_centers(
+    search_centers: Optional[dict],
+) -> Optional[tuple[tuple[str, int, int], ...]]:
+    """Convert a search_centers dict into a hashable, order-stable
+    cache key. Returns None for None input.
+    """
+    if search_centers is None:
+        return None
+    items: list[tuple[str, int, int]] = []
+    for name, ctr in search_centers.items():
+        if ctr is None:
+            continue
+        items.append((str(name), int(ctr[0]), int(ctr[1])))
+    items.sort()
+    return tuple(items)
 
 
 def find_label_positions(
     img: Image.Image,
+    *,
+    search_centers: Optional[dict] = None,
+    search_radius: int = _DEFAULT_LOCAL_RADIUS,
 ) -> dict[str, dict]:
     """NCC-match the three label templates against the panel image.
 
@@ -234,30 +333,151 @@ def find_label_positions(
 
     Missing or low-confidence matches are simply absent from the dict.
     Caller should treat an empty dict as "no labels found, fall back".
+    Coordinates are always image-absolute pixels.
+
+    Local search mode
+    -----------------
+    When ``search_centers`` is provided it must be a dict mapping
+    label name → expected (x, y) image-absolute center::
+
+        find_label_positions(
+            img,
+            search_centers={
+                "mass":        (480, 350),
+                "resistance":  (480, 395),
+                "instability": (480, 440),
+            },
+        )
+
+    Each label's NCC search is restricted to a window
+    ``[cx - search_radius, cx + search_radius] ×
+    [cy - search_radius, cy + search_radius]`` around its expected
+    center, clamped to image bounds. The MASS-first anchor logic is
+    skipped — the tracker already knows where each row should be, so
+    we just confirm each one independently.
+
+    Labels absent from ``search_centers`` are NOT searched at all in
+    local-search mode (the tracker said it doesn't know where they
+    are). Pass ``None`` (the default) for full-frame behaviour.
 
     Caching: a single-entry "last image" cache keyed on
-    (id(img), img.size, img.mode) returns the cached result when the
-    same image is passed multiple times. The HUD pipeline calls this
-    via several entry points per scan (the drift-correction block,
-    ``_find_label_rows_by_ncc``, the lock-validation fast path…) —
-    without this cache each call re-runs the 8-scale NCC sweep
-    (~100-150 ms each), tripling the per-scan latency for no benefit.
+    (id(img), img.size, img.mode, search_centers, search_radius)
+    returns the cached result when the same image is passed multiple
+    times. The HUD pipeline calls this via several entry points per
+    scan (the drift-correction block, ``_find_label_rows_by_ncc``,
+    the lock-validation fast path…) — without this cache each call
+    re-runs the 8-scale NCC sweep (~100-150 ms each), tripling the
+    per-scan latency for no benefit. Local and full-frame requests
+    for the same image have DIFFERENT cache entries so they can't
+    return stale data to each other.
     """
-    global _LAST_CALL_CACHE
-    cache_key = (id(img), img.size, img.mode)
-    if _LAST_CALL_CACHE is not None and _LAST_CALL_CACHE[:3] == cache_key:
-        return _LAST_CALL_CACHE[3]
+    global _LAST_CALL_CACHE, _LAST_FULL_FRAME_MATCHES
+    sc_key = _normalize_search_centers(search_centers)
+    sr_norm = int(search_radius)
+    cache_key = (id(img), img.size, img.mode, sc_key, sr_norm)
+    if _LAST_CALL_CACHE is not None and _LAST_CALL_CACHE[:5] == cache_key:
+        return _LAST_CALL_CACHE[5]
 
     templates = _load_templates()
     if not templates:
-        _LAST_CALL_CACHE = (cache_key[0], cache_key[1], cache_key[2], {})
+        _LAST_CALL_CACHE = (*cache_key, {})
         return {}
 
-    # Restrict search to the LEFT 65% of the image (labels never sit
-    # in the right half — that's the value column).
     W, H = img.size
     if W < 40 or H < 40:
         return {}
+
+    # Local-search path: confirm each requested label independently
+    # inside its own ±radius window. Doesn't use the MASS-anchor
+    # logic — the rigid-body tracker already knows the expected
+    # positions and would only fight the anchor refinement if we ran
+    # it.
+    #
+    # Crop padding: the window is expanded by the template's max
+    # dimension at the largest scale we'll test, so the full
+    # template still fits inside the crop even when its center
+    # lands at the ±r tolerance boundary. Without this, narrow
+    # windows (e.g. ±40 px) would silently skip large templates
+    # (resistance/instability are ~170 / 160 px wide at native
+    # scale, multi-scale up to 2.0×) and miss legitimate matches.
+    # The result is then filtered to keep only candidates whose
+    # CENTER falls within ±r of the requested ``ctr``.
+    if sc_key is not None:
+        full_gray = np.asarray(img.convert("L"), dtype=np.uint8)
+        results: dict[str, dict] = {}
+        for name, ctr in (search_centers or {}).items():
+            if name not in templates or ctr is None:
+                continue
+            cx = int(ctr[0])
+            cy = int(ctr[1])
+            r = max(1, sr_norm)
+            # Pre-compute the resize-scaled templates so we can also
+            # work out the crop pad and the per-scale fit check.
+            scaled_templates: list[tuple[float, np.ndarray]] = []
+            for scale in _SCALE_FACTORS:
+                scaled = _resize_template(templates[name], scale)
+                scaled_templates.append((scale, scaled))
+            if not scaled_templates:
+                continue
+            max_tw = max(s.shape[1] for _, s in scaled_templates)
+            max_th = max(s.shape[0] for _, s in scaled_templates)
+            pad_x = max_tw // 2 + 4
+            pad_y = max_th // 2 + 4
+            wx1 = max(0, cx - r - pad_x)
+            wy1 = max(0, cy - r - pad_y)
+            wx2 = min(W, cx + r + pad_x)
+            wy2 = min(H, cy + r + pad_y)
+            if wx2 - wx1 < 8 or wy2 - wy1 < 8:
+                continue
+            window_gray = full_gray[wy1:wy2, wx1:wx2]
+            window_target = _canonicalize(window_gray)
+            best: Optional[dict] = None
+            for scale, scaled in scaled_templates:
+                if (
+                    scaled.shape[0] > window_target.shape[0]
+                    or scaled.shape[1] > window_target.shape[1]
+                ):
+                    continue
+                score, x, y = _ncc_search(window_target, scaled)
+                if score < _MIN_MATCH_SCORE:
+                    continue
+                # Image-absolute center of this candidate.
+                abs_cx = int(x) + wx1 + scaled.shape[1] // 2
+                abs_cy = int(y) + wy1 + scaled.shape[0] // 2
+                if abs(abs_cx - cx) > r or abs(abs_cy - cy) > r:
+                    # Outside the requested ±r tolerance — drop it
+                    # even though NCC was satisfied. The pad let
+                    # NCC see this candidate; the tolerance gate
+                    # enforces the contract.
+                    continue
+                if best is None or score > best["score"]:
+                    best = {
+                        "x": int(x) + wx1,  # image-absolute
+                        "y": int(y) + wy1,
+                        "w": int(scaled.shape[1]),
+                        "h": int(scaled.shape[0]),
+                        "score": float(score),
+                        "scale": float(scale),
+                    }
+            if best is not None:
+                results[name] = best
+                log.debug(
+                    "label_match[local]: %s matched at (x=%d, y=%d, "
+                    "w=%d, h=%d) score=%.2f scale=%.2f (center=%d,%d "
+                    "r=%d)",
+                    name, best["x"], best["y"], best["w"], best["h"],
+                    best["score"], best["scale"], cx, cy, r,
+                )
+            else:
+                log.debug(
+                    "label_match[local]: %s not found in window "
+                    "(center=%d,%d r=%d)", name, cx, cy, r,
+                )
+        _LAST_CALL_CACHE = (*cache_key, results)
+        return results
+
+    # Restrict search to the LEFT 65% of the image (labels never sit
+    # in the right half — that's the value column).
     search_w = int(W * 0.65)
     crop = img.crop((0, 0, search_w, H))
     target_gray = np.asarray(crop.convert("L"), dtype=np.uint8)
@@ -275,7 +495,8 @@ def find_label_positions(
     # would then drag MASS to be flagged as the inconsistent outlier.
     if "mass" not in templates:
         log.warning("label_match: no MASS template — can't anchor")
-        _LAST_CALL_CACHE = (cache_key[0], cache_key[1], cache_key[2], {})
+        _LAST_CALL_CACHE = (*cache_key, {})
+        _LAST_FULL_FRAME_MATCHES = {}
         return {}
 
     # Step 1: Find the best MASS match across all scales.
@@ -293,7 +514,8 @@ def find_label_positions(
             }
     if best_mass is None:
         log.debug("label_match: MASS not found at any scale")
-        _LAST_CALL_CACHE = (cache_key[0], cache_key[1], cache_key[2], {})
+        _LAST_CALL_CACHE = (*cache_key, {})
+        _LAST_FULL_FRAME_MATCHES = {}
         return {}
 
     # Step 2: Pitch (vertical row spacing) ≈ 1.4× MASS-template height
@@ -329,6 +551,40 @@ def find_label_positions(
         windowed = target[win_top:win_bot, :]
         score, x, y = _ncc_search(windowed, scaled)
         if score < _MIN_MATCH_SCORE:
+            # NCC failed for this label. Before dropping it, check
+            # whether MASS matched confidently enough to synthesize
+            # the position from the HUD's rigid 3-row geometry.
+            #
+            # The window we just searched is already centered on the
+            # geometric expected_cy (``mass_cy + N·pitch``), so the
+            # synthesized box is simply that expected position at the
+            # MASS scale. Left edge is shared with MASS — all three
+            # numeric labels are left-aligned in the panel.
+            if best_mass["score"] >= _SYNTH_MASS_FLOOR:
+                synth_y = expected_cy - h_scaled // 2
+                synth_y = max(0, min(synth_y, target.shape[0] - h_scaled))
+                results[name] = {
+                    "x": int(best_mass["x"]),
+                    "y": int(synth_y),
+                    "w": int(scaled.shape[1]),
+                    "h": int(scaled.shape[0]),
+                    # Keep the REAL (low) NCC score so downstream
+                    # consumers can tell this was geometry-derived,
+                    # not template-confirmed.
+                    "score": float(score),
+                    "scale": float(best_mass["scale"]),
+                    "synthesized": True,
+                }
+                log.info(
+                    "label_match: %s NCC=%.2f below %.2f but MASS "
+                    "confident (%.2f >= %.2f) — synthesizing position "
+                    "from rigid 3-row geometry at expected_cy=%d "
+                    "(skew-degraded wide template, position is "
+                    "layout-guaranteed)",
+                    name, score, _MIN_MATCH_SCORE, best_mass["score"],
+                    _SYNTH_MASS_FLOOR, expected_cy,
+                )
+                continue
             log.debug(
                 "label_match: %s rejected score=%.2f (expected_cy=%d, "
                 "window=[%d,%d])",
@@ -351,7 +607,8 @@ def find_label_positions(
             name, m["x"], m["y"], m["w"], m["h"], m["score"], m["scale"],
         )
 
-    _LAST_CALL_CACHE = (cache_key[0], cache_key[1], cache_key[2], results)
+    _LAST_CALL_CACHE = (*cache_key, results)
+    _LAST_FULL_FRAME_MATCHES = dict(results)
     return results
 
 
@@ -359,6 +616,7 @@ def reset_template_cache() -> None:
     """Clear the in-memory template cache. Call after rebuilding the
     templates file so the new templates are picked up without a
     process restart."""
-    global _templates_cache, _LAST_CALL_CACHE
+    global _templates_cache, _LAST_CALL_CACHE, _LAST_FULL_FRAME_MATCHES
     _templates_cache = None
     _LAST_CALL_CACHE = None
+    _LAST_FULL_FRAME_MATCHES = {}

@@ -1,0 +1,42 @@
+{
+  "scan_results": {
+    "count": 1,
+    "shape_h": 32,
+    "shape_w": 207
+  },
+  "top_line": {
+    "count": 1,
+    "shape_h": 8,
+    "shape_w": 356
+  },
+  "resource": {
+    "count": 1,
+    "shape_h": 41,
+    "shape_w": 200
+  },
+  "mass_row": {
+    "count": 1,
+    "shape_h": 41,
+    "shape_w": 248
+  },
+  "resistance_row": {
+    "count": 1,
+    "shape_h": 32,
+    "shape_w": 252
+  },
+  "instability_row": {
+    "count": 1,
+    "shape_h": 55,
+    "shape_w": 254
+  },
+  "outcome": {
+    "count": 1,
+    "shape_h": 41,
+    "shape_w": 346
+  },
+  "bot_line": {
+    "count": 1,
+    "shape_h": 22,
+    "shape_w": 336
+  }
+}

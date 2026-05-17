@@ -1,0 +1,14 @@
+{
+  "stamp": "20260417_002114",
+  "val_string_acc": 0.5029468372607876,
+  "epochs": 10,
+  "n_samples": 20000,
+  "lr": 0.0003,
+  "batch_size": 128,
+  "seed": 1337,
+  "real_aug_multiplier": 40,
+  "init_from": null,
+  "charClasses": "0123456789.-% ()ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz",
+  "numTokens": 69,
+  "inputHeight": 32
+}

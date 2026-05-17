@@ -1,0 +1,10 @@
+{
+  "charClasses": "0123456789.-% ()ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz",
+  "blankIdx": 68,
+  "numTokens": 69,
+  "inputHeight": 32,
+  "valStringAcc": 0.8055,
+  "modelKind": "crnn",
+  "note": "ensemble partner to primary (82.82% on 31K corpus)",
+  "sourcePt": "model_crnn_20260417_011352_val81.pt"
+}

@@ -1,0 +1,53 @@
+{
+  "version": 1,
+  "source": "C:\\Users\\prjgn\\AppData\\Roaming\\ShipBit\\WingmanAI\\custom_skills\\SC_Toolbox_Beta_V1.2\\tools\\Mining_Signals\\training_data_panels\\user_20260418_154408\\region1",
+  "n_captures": 2,
+  "n_total_samples": 22295,
+  "cyan_band": {
+    "h_min": 100,
+    "h_max": 171,
+    "_n_samples": 10159
+  },
+  "green_band": {
+    "h_min": 12,
+    "h_max": 76,
+    "_n_samples": 7473
+  },
+  "sat_min": 123,
+  "val_min": 141,
+  "min_area_px": 1500,
+  "min_bbox_aspect": 0.4,
+  "max_bbox_aspect": 1.5,
+  "bbox_aspect_peak": 1.0,
+  "min_extent": 0.05,
+  "morph_seed_iterations": 2,
+  "morph_vert_close_px": 30,
+  "morph_horiz_close_px": 8,
+  "_per_capture_summary": [
+    {
+      "image": "cap_20260418_155705_329.png",
+      "n_samples": 11933,
+      "features_used": [
+        "top_line",
+        "bot_line",
+        "scan_results",
+        "mass_row",
+        "resistance_row",
+        "instability_row"
+      ]
+    },
+    {
+      "image": "cap_20260418_155707_070.png",
+      "n_samples": 10362,
+      "features_used": [
+        "top_line",
+        "bot_line",
+        "scan_results",
+        "mass_row",
+        "resistance_row",
+        "instability_row"
+      ]
+    }
+  ],
+  "_doc": "Calibration with a small labeled set. Numbers are approximate and should be re-derived as more captures are labeled. PIL HSV scale: H, S, V each in 0-255."
+}

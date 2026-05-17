@@ -710,20 +710,24 @@ def scan_region(region: dict) -> Optional[int]:
     animation (see ``capture_region_averaged`` docstring). Falls
     back to a single capture if averaging fails.
 
-    Two-stage OCR strategy:
+    Pipeline (v2.2.7+): SC_OCR ONLY. The legacy 3-engine fallback
+    (Tesseract A + B + Paddle) was removed because:
+      * SC_OCR's voter set is a strict superset of legacy's
+        (CRNN + dual-polarity CNN + multi-PSM/scale Tesseract vs.
+        legacy's Tesseract A + B + Paddle), so legacy could never
+        recover a value SC_OCR couldn't.
+      * The Paddle daemon's startup blocks for up to 60 s on
+        _STARTUP_TIMEOUT when its model loader fails (paddleocr's
+        official_models path uses a literal '<USER>' placeholder
+        that never resolves on Windows). Every scan that fell to
+        legacy stalled the entire OCR loop for ~minute+.
+      * Stage 2 was leftover from the pre-SC_OCR architecture and
+        was never cleaned up when SC_OCR shipped.
 
-      1. **PRIMARY**: ``sc_ocr.api._signal_recognize_pil`` — icon-
-         anchored NCC + Tesseract. ~30 ms when it works, ~80%
-         accuracy on real captures, returns None when unsure.
-      2. **FALLBACK**: legacy 3-engine vote (Tesseract A + B +
-         Paddle) — ~700 ms but ~95% accuracy. Runs only when stage 1
-         returns None.
-
-    Net effect: most scans return in ~30 ms with sc_ocr; the slower
-    legacy path only fires for the captures sc_ocr can't anchor or
-    Tesseract can't read confidently.
-
-    Returns the extracted integer or None. Entirely in-memory.
+    Returns the extracted integer or None. None means SC_OCR
+    couldn't produce a confident read on this frame — caller treats
+    that as "no data this scan" rather than retrying with a weaker
+    engine. Entirely in-memory.
     """
     global _last_capture
     img = capture_region_averaged(region)
@@ -733,23 +737,12 @@ def scan_region(region: dict) -> Optional[int]:
         return None
     _last_capture = img
 
-    # ── STAGE 1: sc_ocr icon-anchored pipeline (primary) ──
+    # SC_OCR ensemble — CRNN primary, multi-PSM/scale Tesseract,
+    # dual-polarity CNN cross-validator. Returns None when no voter
+    # produced a 4-5 digit value in [1000, 35000].
     try:
         from .sc_ocr.api import _signal_recognize_pil
-        sc_val = _signal_recognize_pil(img)
-        if sc_val is not None:
-            log.debug(
-                "scan_region: sc_ocr returned %d (skipping legacy fallback)",
-                sc_val,
-            )
-            return sc_val
-        log.debug(
-            "scan_region: sc_ocr returned None, falling back to legacy"
-        )
+        return _signal_recognize_pil(img, region=region)
     except Exception as exc:
-        log.debug(
-            "scan_region: sc_ocr raised %s, falling back to legacy", exc,
-        )
-
-    # ── STAGE 2: legacy 3-engine vote (fallback) ──
-    return extract_number(img)
+        log.debug("scan_region: sc_ocr raised %s", exc)
+        return None

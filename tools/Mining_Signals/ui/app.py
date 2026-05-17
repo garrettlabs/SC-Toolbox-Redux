@@ -131,10 +131,40 @@ _CLOSE_BTN_STYLE = """
         color: #ffffff;
     }
 """
-_CONFIG_FILE = os.path.join(
+# ── Config file location (v2.2.7+: moved to persistent storage) ──
+# Old location: tools/Mining_Signals/mining_signals_config.json (inside the
+# install dir). Velopack swaps the install dir on every upgrade, so any user
+# settings stored there were wiped on every release. Users had to re-set the
+# HUD region, ship loadouts, etc. after every patch.
+#
+# New location: %LOCALAPPDATA%\SC_Toolbox\mining_signals\config.json. This
+# lives OUTSIDE the Velopack-managed current\ subtree so it survives
+# upgrades. The legacy path is kept as a one-shot migration source — if the
+# new path doesn't exist but the legacy one does, we read the legacy file on
+# first load and the next save lands at the persistent path.
+def _persistent_config_dir() -> str:
+    """Return the directory where the cross-upgrade config lives.
+    Creates it if needed. Falls back to the legacy in-app dir if
+    LOCALAPPDATA can't be resolved (extremely rare — e.g. embedded
+    installs without standard env)."""
+    base = os.environ.get("LOCALAPPDATA")
+    if not base:
+        base = os.path.join(os.path.expanduser("~"), "AppData", "Local")
+    target = os.path.join(base, "SC_Toolbox", "mining_signals")
+    try:
+        os.makedirs(target, exist_ok=True)
+        return target
+    except OSError:
+        # Fallback: in-app dir. Settings won't survive upgrades but the
+        # app at least keeps working.
+        return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+_LEGACY_CONFIG_FILE = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     "mining_signals_config.json",
 )
+_CONFIG_FILE = os.path.join(_persistent_config_dir(), "config.json")
 
 # Ship slots available in the Mining Ships tab. Keys are the internal
 # ids stored in config; values are display labels.
@@ -273,9 +303,23 @@ def _load_config() -> dict:
             os.path.expanduser("~"), "Documents", "SC Loadouts", "mining_roster.json",
         ),
     }
+    # Resolve which file to actually read from. Persistent path is
+    # canonical; legacy in-app path is used as a one-shot migration source
+    # when the persistent file doesn't exist yet (first run after the
+    # v2.2.7 upgrade that introduced this split).
+    read_path: Optional[str] = None
+    if os.path.isfile(_CONFIG_FILE):
+        read_path = _CONFIG_FILE
+    elif os.path.isfile(_LEGACY_CONFIG_FILE):
+        read_path = _LEGACY_CONFIG_FILE
+        log.info(
+            "config: migrating from legacy in-app path %s to persistent "
+            "path %s on next save", _LEGACY_CONFIG_FILE, _CONFIG_FILE,
+        )
+
     try:
-        if os.path.isfile(_CONFIG_FILE):
-            with open(_CONFIG_FILE, "r", encoding="utf-8") as f:
+        if read_path is not None:
+            with open(read_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             if isinstance(data, dict):
                 cfg.update(data)
@@ -293,6 +337,15 @@ def _load_config() -> dict:
                         os.path.expanduser("~"), "Documents", "SC Loadouts",
                         "mining_roster.json",
                     )
+            # If we read from the legacy path, eagerly persist to the
+            # new location so subsequent loads find it there. This makes
+            # the migration sticky even if the user never changes a
+            # setting before the next upgrade.
+            if read_path == _LEGACY_CONFIG_FILE:
+                try:
+                    _save_config(cfg)
+                except Exception as exc:
+                    log.debug("config: eager migration save failed: %s", exc)
     except (OSError, json.JSONDecodeError):
         pass
     return cfg
@@ -3131,6 +3184,24 @@ class MiningSignalsApp(SCWindow):
         self._status_label.setText(f"{len(rows)} resources loaded")
         log.info("UI: loaded %d resources", len(rows))
 
+        # Pre-warm ONNX sessions in the background so the user's first
+        # "Start Scan" doesn't pay the 10-20 s cold-start hit on
+        # InferenceSession + first inference (CRNN v1 is the slow one).
+        # Best-effort, daemonized — failures are logged inside
+        # prewarm_models() and the existing lazy-load fallbacks in
+        # _ensure_* still cover us if anything goes wrong here.
+        # Internal _prewarm_started gate makes this safe to call again
+        # if _on_data_loaded fires for a manual refresh.
+        try:
+            from ocr.onnx_hud_reader import prewarm_models as _prewarm_onnx
+            threading.Thread(
+                target=_prewarm_onnx,
+                name="onnx_prewarm",
+                daemon=True,
+            ).start()
+        except Exception as exc:
+            log.debug("UI: ONNX prewarm dispatch failed: %s", exc)
+
     def _on_data_error(self, msg: str) -> None:
         self._status_label.setText(f"Error: {msg}")
         log.warning("UI: data load error: %s", msg)
@@ -3480,10 +3551,14 @@ class MiningSignalsApp(SCWindow):
             # un-shadow it.
             from mining_shared.single_instance import SingleInstance
 
+            ocr_region = self._config.get("ocr_region")
             dlg = CalibrationDialog(
                 region=dict(hud_region),
                 scan_callback=scan_hud_onnx,
                 parent=self,
+                signature_region=(
+                    dict(ocr_region) if ocr_region else None
+                ),
             )
 
             # Cross-process raise: another app instance may already
@@ -3669,7 +3744,19 @@ class MiningSignalsApp(SCWindow):
 
             self.setMinimumHeight(300)
             if hasattr(self, "_expanded_size"):
-                self.resize(*self._expanded_size)
+                # Clamp the restored geometry to sane bounds. Without
+                # this, repeated collapse/expand cycles can compound
+                # frame-inclusive vs frame-exclusive geometry drift
+                # (Qt + Windows quirk) plus child widget sizeHint growth
+                # — at minute 108 of one user's session the main window
+                # ballooned 1.5x per resize until createDIB failed at
+                # 32768x32768 and the process crashed. 1600x1200 is
+                # plenty for the expanded view; if a real wider screen
+                # ever wants more, this constant can be relaxed.
+                ew, eh = self._expanded_size
+                ew = min(max(ew, 400), 1600)
+                eh = min(max(eh, 300), 1200)
+                self.resize(ew, eh)
 
     # ── Rolling-window consensus for HUD reads ─────────────
     # Each per-scan raw value is pushed into a deque. The
@@ -3678,6 +3765,65 @@ class MiningSignalsApp(SCWindow):
     # single-digit drift caused by the HUD wiggle animation:
     # static mass 6805 read as 6805/6815/6845/6855 across
     # scans → the window picks the mode (most frequent = 6805).
+
+    def reset_consensus_state(self) -> None:
+        """Manual escape hatch — wipe every rolling window, last-value
+        cache, and module-level lock so the next scan starts fresh.
+
+        Wired to the "Reset consensus" button in the Calibrate Mining
+        Crops dialog. The stable-swap logic is sticky by design (it
+        takes 4-of-6 agreement to swap a signal value, all-of-5 to
+        swap a HUD field, and once locked the cached value persists
+        until the panel disappears). When the OCR misfires and locks
+        onto a wrong value (e.g. always reads a leading "1"), there
+        was previously no way to break it without closing the panel
+        in-game and waiting for the buffers to time out.
+
+        This clears:
+          * Per-app HUD rolling windows (mass / resistance /
+            instability / mineral)
+          * Per-app last-displayed HUD values
+          * Per-app last/confirmed signal-scanner OCR values
+          * Module-level consensus and lock caches in
+            ``ocr.sc_ocr.api`` (covers _RECENT_READS, _STABLE_VALUE,
+            _RECENT_SIGNAL_READS, _STABLE_SIGNAL, _field_lock_cache,
+            _difficulty_cache, etc.)
+
+        Safe to call mid-scan: the in-flight scan finishes against
+        empty buffers and the next-completing scan repopulates them.
+        """
+        # Per-app HUD rolling windows + last-shown values.
+        try:
+            self._hud_mass_window.clear()
+            self._hud_resistance_window.clear()
+            self._hud_instability_window.clear()
+            self._hud_mineral_window.clear()
+        except Exception as exc:
+            log.debug("reset_consensus_state: HUD window clear: %s", exc)
+        self._last_hud_mass = None
+        self._last_hud_resistance = None
+        self._last_hud_instability = None
+        self._last_hud_mineral = None
+        self._prev_hud_mass = None
+        self._prev_hud_resistance = None
+
+        # Per-app signal-scanner consensus.
+        self._last_ocr_value = None
+        self._confirmed_value = None
+
+        # Module-level state inside the SC-OCR engine: deques + locked
+        # values for both the HUD value buffers and the signal buffer,
+        # plus per-region field-lock and difficulty caches.
+        try:
+            from ocr.sc_ocr import api as _sc_api
+            _sc_api.reset_all_consensus()
+        except Exception as exc:
+            log.warning(
+                "reset_consensus_state: sc_ocr.api reset failed: %s",
+                exc,
+            )
+
+        log.info("reset_consensus_state: all consensus state cleared")
 
     def _push_hud_read(
         self,
@@ -3963,7 +4109,21 @@ class MiningSignalsApp(SCWindow):
                             #     consecutive sub-strict ticks, which
                             #     rides out wobble while still catching
                             #     "user moved off the panel".
-                            _SIG_STRICT = 0.74
+                            # NOTE: STRICT was 0.74 originally to keep
+                            # empty screens (which score up to 0.72) from
+                            # false-positiving the gate. But chromatic
+                            # aberration on real-game frames pins the
+                            # icon's NCC score in the 0.55-0.70 band, so
+                            # the strict floor created a chicken-and-egg:
+                            # the gate could never enter hysteresis from
+                            # cold, signature scanning never started, the
+                            # bubble stayed on "Scanning Please Wait"
+                            # forever. Lowered to 0.55 (same as relaxed)
+                            # — false positives just dispatch a no-op
+                            # scan that produces no value, vs. previous
+                            # behavior of permanently gating off real
+                            # signatures. See user report on v2.2.8.
+                            _SIG_STRICT = 0.55
                             _SIG_RELAXED = 0.55
                             _SIG_STICK_TICKS = 3
                             _floor = (
@@ -3971,8 +4131,16 @@ class MiningSignalsApp(SCWindow):
                                 if self._sig_recent_hits > 0
                                 else _SIG_STRICT
                             )
+                            # Pass RGB so signal_anchor can run the
+                            # geometric structural validator on each
+                            # CNN-validated candidate. Rejects digit
+                            # clusters that the CNN re-rank misclassified
+                            # as ``@`` (the failure mode where one icon
+                            # template + 600 augmentations leaks the
+                            # `@` class onto digit silhouettes at small
+                            # crop scales).
                             _sig_match = _find_signal_icon(
-                                _gray, min_score=_floor,
+                                _gray, min_score=_floor, rgb_image=_rgb,
                             )
                             if _sig_match is not None:
                                 sig_present = True
@@ -4132,7 +4300,7 @@ class MiningSignalsApp(SCWindow):
                             # scans typically finish in <5 s anyway
                             # so the higher budget only costs time on
                             # actual light panels.
-                            hud_result = hud_future.result(timeout=3)
+                            hud_result = hud_future.result(timeout=14)
                             hud_mass = hud_result.get("mass")
                             hud_res = hud_result.get("resistance")
                             hud_inst = hud_result.get("instability")
@@ -4213,7 +4381,7 @@ class MiningSignalsApp(SCWindow):
                                 )
                         except Exception as exc:
                             log.info(
-                                "HUD ONNX scan timed out/failed after 3s: %r",
+                                "HUD ONNX scan timed out/failed after 14s: %r",
                                 exc,
                             )
 
@@ -4275,6 +4443,62 @@ class MiningSignalsApp(SCWindow):
                 self._scan_in_progress = False
 
         threading.Thread(target=_run, daemon=True).start()
+
+    def force_one_scan(self) -> None:
+        """Fire a single user-initiated scan tick immediately.
+
+        Used by the calibration dialog's "Scan now" button so the user
+        can verify a freshly-saved manual crop without leaving the
+        dialog. Behaviour:
+
+        * Does NOT touch the Start/Stop scan toggle. If the user has
+          scanning paused, this remains a one-shot — no auto-resume.
+        * If the periodic scan loop is already running (timer active),
+          this is a no-op: the next tick is at most ~500 ms away and
+          firing on top of it would just race the in-flight scan.
+        * Bypasses the ``_scan_in_progress`` "previous scan still in
+          flight" guard. The guard exists for the periodic timer to
+          avoid pile-up; for a user-initiated request we want fresh
+          data even if a scan is mid-flight, so we reset the flag and
+          let ``_do_scan`` re-arm itself.
+        * Re-reads config from disk before firing so the just-saved
+          manual crop / calibration are honoured by ``_do_scan`` (which
+          reads ``self._config`` for ``ocr_region`` / ``hud_region``).
+        * Fire-and-forget: ``_do_scan`` already dispatches the heavy
+          work onto a daemon ``threading.Thread``, so the UI thread
+          returns immediately.
+        """
+        # If the periodic loop is active, leave it alone — racing it
+        # would only serve to violate the in-flight guard for no win.
+        if self._scan_timer is not None:
+            log.info("force_one_scan: scan loop already active — no-op")
+            return
+
+        # Pull fresh config so the freshly-saved calibration / region
+        # in the dialog is what _do_scan picks up.
+        try:
+            self._config = _load_config()
+        except Exception as exc:
+            log.warning("force_one_scan: config reload failed: %r", exc)
+
+        # Bypass the in-flight guard. The guard's purpose is to keep
+        # the periodic timer from queueing scans on top of a slow OCR
+        # pass; a user clicking "Scan now" is explicitly asking for
+        # fresh data, so clearing the flag is the correct trade-off.
+        # Worst case: two threads briefly run the OCR pipeline in
+        # parallel — both write to per-tick state, the later one wins,
+        # nothing corrupts (the pipeline functions are reentrant).
+        if self._scan_in_progress:
+            log.info(
+                "force_one_scan: bypassing in-flight guard (user-initiated)",
+            )
+            self._scan_in_progress = False
+
+        log.info("force_one_scan: firing one-shot scan tick")
+        try:
+            self._do_scan()
+        except Exception as exc:
+            log.warning("force_one_scan: _do_scan raised: %r", exc)
 
     @Slot(int)
     def _on_scan_result(self, value: int) -> None:

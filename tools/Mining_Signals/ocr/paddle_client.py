@@ -43,16 +43,29 @@ log = logging.getLogger(__name__)
 # Configuration
 # ─────────────────────────────────────────────────────────────
 
-# Default location of the py313 embed (set by the install-time script).
-# Can be overridden by setting MINING_SIGNALS_PADDLE_PYTHON environment
-# variable to the absolute path of a python.exe that has paddlepaddle
-# + paddleocr installed.
-_DEFAULT_EMBED_PYTHON = os.path.join(
-    os.environ.get("LOCALAPPDATA", ""),
-    "SC_Toolbox",
-    "py313_paddleocr",
-    "python.exe",
-)
+# Default locations of the py313 embed, tried in order:
+#   1. MINING_SIGNALS_PADDLE_PYTHON env var (explicit override)
+#   2. <module_dir>\..\py313_paddleocr\python.exe — sidecar lives next to
+#      the OCR module. Matches local dev (tools/Mining_Signals/py313_paddleocr/)
+#      AND Velopack installs (current\tools\Mining_Signals\py313_paddleocr\).
+#   3. %LOCALAPPDATA%\SC_Toolbox\py313_paddleocr\python.exe — legacy Inno
+#      deployment path. Kept so existing Inno installs continue to work
+#      after this code change ships.
+# First match wins.
+_MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
+_TOOL_DIR = os.path.dirname(_MODULE_DIR)  # tools\Mining_Signals
+_SIDECAR_NAME = os.path.join("py313_paddleocr", "python.exe")
+
+_EMBED_CANDIDATES = [
+    os.path.join(_TOOL_DIR, _SIDECAR_NAME),
+    os.path.join(
+        os.environ.get("LOCALAPPDATA", ""),
+        "SC_Toolbox",
+        _SIDECAR_NAME,
+    ),
+]
+# First candidate is the primary one we report in not-found logs.
+_DEFAULT_EMBED_PYTHON = _EMBED_CANDIDATES[0]
 
 _DAEMON_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "paddle_daemon.py")
 
@@ -72,12 +85,18 @@ _stderr_thread: Optional[threading.Thread] = None
 
 
 def _get_embed_python() -> Optional[str]:
-    """Return path to the Python 3.13 embed's python.exe, or None."""
+    """Return path to the Python 3.13 embed's python.exe, or None.
+
+    Probes the candidate list defined above in order. First existing path
+    wins. Returns None if none of them exist (caller falls back to non-
+    paddle OCR engines).
+    """
     override = os.environ.get("MINING_SIGNALS_PADDLE_PYTHON")
     if override and os.path.isfile(override):
         return override
-    if os.path.isfile(_DEFAULT_EMBED_PYTHON):
-        return _DEFAULT_EMBED_PYTHON
+    for cand in _EMBED_CANDIDATES:
+        if cand and os.path.isfile(cand):
+            return cand
     return None
 
 

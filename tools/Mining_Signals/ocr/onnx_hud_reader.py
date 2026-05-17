@@ -81,8 +81,20 @@ def _ensure_model() -> bool:
                 meta = json.load(f)
                 _char_classes = meta.get("charClasses", _char_classes)
 
+        # CRITICAL: cap ONNX threading. Default behaviour spawns one
+        # worker per CPU core, which on multi-core systems pegs every
+        # core during inference and starves the Qt GUI thread → all
+        # app windows go "Not Responding" while a scan is in flight.
+        # 1 intra + 1 inter is plenty for these tiny (28×28 / 32×128)
+        # crops; the cost saved on thread coordination outweighs any
+        # parallelism gain at this input size.
+        opts = ort.SessionOptions()
+        opts.intra_op_num_threads = 1
+        opts.inter_op_num_threads = 1
         _session = ort.InferenceSession(
-            model_path, providers=["CPUExecutionProvider"],
+            model_path,
+            sess_options=opts,
+            providers=["CPUExecutionProvider"],
         )
         log.info("onnx_hud_reader: model loaded from %s (%d classes)",
                  os.path.basename(model_path), len(_char_classes))
@@ -101,8 +113,15 @@ def hot_swap_model(new_model_path: str) -> bool:
     global _session
     try:
         import onnxruntime as ort
+        # Same thread-cap rationale as the initial session above —
+        # don't let the hot-swapped session run unbounded.
+        opts = ort.SessionOptions()
+        opts.intra_op_num_threads = 1
+        opts.inter_op_num_threads = 1
         new_session = ort.InferenceSession(
-            new_model_path, providers=["CPUExecutionProvider"],
+            new_model_path,
+            sess_options=opts,
+            providers=["CPUExecutionProvider"],
         )
         old = _session
         _session = new_session
@@ -120,6 +139,192 @@ def is_available() -> bool:
 
 
 # ─────────────────────────────────────────────────────────────
+# Startup pre-warm
+# ─────────────────────────────────────────────────────────────
+
+# Guard against double pre-warm (e.g. _on_data_loaded firing twice
+# on a forced refresh). The first call does the work, every later
+# call short-circuits.
+_prewarm_started: bool = False
+_prewarm_lock = threading.Lock()
+
+
+def prewarm_models() -> None:
+    """Eagerly load every ONNX session used by the HUD scan path.
+
+    Cold-starting ``onnxruntime.InferenceSession`` plus the first
+    inference takes 10-20 s on Windows for the CRNN models, so doing
+    this lazily on the user's first "Start Scan" click meant the
+    initial scan stalled for ~20 s before producing a result.
+
+    Pre-warm is BEST-EFFORT: any failure is logged and swallowed so
+    the existing lazy-load fallbacks in ``_ensure_*`` still run on
+    the first real scan as before. Safe to call from a background
+    daemon thread; concurrent scan-path calls of ``_ensure_*`` are
+    fine because each function gates on its module-global ``is None``
+    check and Python's GIL makes the assignment atomic — at worst we
+    create a session twice and discard one.
+
+    Calling this function more than once is a no-op (gated by
+    ``_prewarm_started``), so the caller doesn't need to worry about
+    re-firing it from ``_on_data_loaded`` on a manual refresh.
+    """
+    global _prewarm_started
+    with _prewarm_lock:
+        if _prewarm_started:
+            return
+        _prewarm_started = True
+
+    log.info("prewarm: starting ONNX session pre-warm")
+    t_total = time.time()
+
+    # 1) Legacy 28x28 HUD CNN in this module.
+    t0 = time.time()
+    try:
+        loaded = _ensure_model()
+        elapsed = time.time() - t0
+        if loaded and _session is not None:
+            log.info("prewarm: model_cnn (legacy) loaded in %.1fs", elapsed)
+            # Dummy inference: shape (1, 1, 28, 28) float32 in [0, 1].
+            try:
+                dummy = np.zeros((1, 1, 28, 28), dtype=np.float32)
+                inp_name = _session.get_inputs()[0].name
+                _session.run(None, {inp_name: dummy})
+                log.info(
+                    "prewarm: model_cnn (legacy) first-inference warmed in %.1fs",
+                    time.time() - t0,
+                )
+            except Exception as exc:
+                log.warning("prewarm: model_cnn dummy inference failed: %s", exc)
+        else:
+            log.info(
+                "prewarm: model_cnn (legacy) unavailable (skipped, %.1fs)",
+                elapsed,
+            )
+    except Exception as exc:
+        log.warning("prewarm: model_cnn load failed: %s", exc)
+
+    # 2) sc_ocr fallback models — primary CNN, inverted CNN, CRNN v1, CRNN v2.
+    try:
+        from .sc_ocr import fallback as _fb
+    except Exception as exc:
+        log.warning("prewarm: could not import sc_ocr.fallback: %s", exc)
+        _fb = None
+
+    if _fb is not None:
+        # Primary 28x28 CNN
+        t0 = time.time()
+        try:
+            if _fb._ensure_model() and _fb._session is not None:
+                log.info(
+                    "prewarm: sc_ocr CNN loaded in %.1fs", time.time() - t0,
+                )
+                try:
+                    dummy = np.zeros((1, 1, 28, 28), dtype=np.float32)
+                    inp_name = _fb._session.get_inputs()[0].name
+                    _fb._session.run(None, {inp_name: dummy})
+                    log.info(
+                        "prewarm: sc_ocr CNN first-inference warmed in %.1fs",
+                        time.time() - t0,
+                    )
+                except Exception as exc:
+                    log.warning(
+                        "prewarm: sc_ocr CNN dummy inference failed: %s", exc,
+                    )
+            else:
+                log.debug("prewarm: sc_ocr CNN unavailable (skipped)")
+        except Exception as exc:
+            log.warning("prewarm: sc_ocr CNN load failed: %s", exc)
+
+        # Inverted 28x28 CNN (optional)
+        t0 = time.time()
+        try:
+            if _fb._ensure_model_inv() and _fb._session_inv is not None:
+                log.info(
+                    "prewarm: sc_ocr CNN-inv loaded in %.1fs",
+                    time.time() - t0,
+                )
+                try:
+                    dummy = np.zeros((1, 1, 28, 28), dtype=np.float32)
+                    inp_name = _fb._session_inv.get_inputs()[0].name
+                    _fb._session_inv.run(None, {inp_name: dummy})
+                    log.info(
+                        "prewarm: sc_ocr CNN-inv first-inference warmed in %.1fs",
+                        time.time() - t0,
+                    )
+                except Exception as exc:
+                    log.warning(
+                        "prewarm: sc_ocr CNN-inv dummy inference failed: %s",
+                        exc,
+                    )
+            else:
+                log.debug("prewarm: sc_ocr CNN-inv unavailable (skipped)")
+        except Exception as exc:
+            log.warning("prewarm: sc_ocr CNN-inv load failed: %s", exc)
+
+        # CRNN v1 (the big one — ~10–20 s on first load)
+        t0 = time.time()
+        try:
+            if _fb._ensure_crnn_model() and _fb._crnn_session is not None:
+                log.info(
+                    "prewarm: sc_ocr CRNN v1 loaded in %.1fs",
+                    time.time() - t0,
+                )
+                try:
+                    h = int(_fb._crnn_input_height)
+                    # CRNN expects (N, 1, H, W) with W dynamic; use a
+                    # reasonable warm-up width so the kernels JIT.
+                    dummy = np.zeros((1, 1, h, 64), dtype=np.float32)
+                    inp_name = _fb._crnn_session.get_inputs()[0].name
+                    _fb._crnn_session.run(None, {inp_name: dummy})
+                    log.info(
+                        "prewarm: sc_ocr CRNN v1 first-inference warmed in %.1fs",
+                        time.time() - t0,
+                    )
+                except Exception as exc:
+                    log.warning(
+                        "prewarm: sc_ocr CRNN v1 dummy inference failed: %s",
+                        exc,
+                    )
+            else:
+                log.debug("prewarm: sc_ocr CRNN v1 unavailable (skipped)")
+        except Exception as exc:
+            log.warning("prewarm: sc_ocr CRNN v1 load failed: %s", exc)
+
+        # CRNN v2 (optional ensemble partner)
+        t0 = time.time()
+        try:
+            if _fb._ensure_crnn2_model() and _fb._crnn2_session is not None:
+                log.info(
+                    "prewarm: sc_ocr CRNN v2 loaded in %.1fs",
+                    time.time() - t0,
+                )
+                try:
+                    h = int(_fb._crnn2_input_height)
+                    dummy = np.zeros((1, 1, h, 64), dtype=np.float32)
+                    inp_name = _fb._crnn2_session.get_inputs()[0].name
+                    _fb._crnn2_session.run(None, {inp_name: dummy})
+                    log.info(
+                        "prewarm: sc_ocr CRNN v2 first-inference warmed in %.1fs",
+                        time.time() - t0,
+                    )
+                except Exception as exc:
+                    log.warning(
+                        "prewarm: sc_ocr CRNN v2 dummy inference failed: %s",
+                        exc,
+                    )
+            else:
+                log.debug("prewarm: sc_ocr CRNN v2 unavailable (skipped)")
+        except Exception as exc:
+            log.warning("prewarm: sc_ocr CRNN v2 load failed: %s", exc)
+
+    log.info(
+        "prewarm: all ONNX sessions ready in %.1fs total",
+        time.time() - t_total,
+    )
+
+
+# ─────────────────────────────────────────────────────────────
 # Row detection
 # ─────────────────────────────────────────────────────────────
 
@@ -127,6 +332,8 @@ def _find_panel_lines(
     gray: np.ndarray,
     min_width_frac: float = 0.18,
     max_thickness: int = 3,
+    *,
+    y_range: Optional[tuple[int, int]] = None,
 ) -> list[tuple[int, int, int]]:
     """Detect horizontal HUD separator lines.
 
@@ -144,7 +351,17 @@ def _find_panel_lines(
 
     Returns a list of ``(y_center, x_left, x_right)`` tuples, sorted
     top-to-bottom. Each tuple gives the line's middle row and its
-    horizontal endpoints.
+    horizontal endpoints. Y values are always IMAGE-ABSOLUTE,
+    regardless of whether ``y_range`` was used.
+
+    Local search mode
+    -----------------
+    If ``y_range=(y_lo, y_hi)`` is provided, only rows in
+    ``[y_lo, y_hi)`` are scanned. This lets the rigid-body tracker
+    say "I know the lines live in this band — don't bother scanning
+    the rest". Returned y-centers are still image-absolute. ``y_lo``
+    and ``y_hi`` are clamped to ``[0, h]``; if the resulting range is
+    empty, the function returns ``[]``.
 
     Notes:
       - Multiple consecutive bright rows are coalesced into one line.
@@ -157,16 +374,27 @@ def _find_panel_lines(
     if h == 0 or w == 0:
         return []
 
+    # Clamp the search band to the image. Default is full-image.
+    if y_range is not None:
+        y_lo = max(0, int(y_range[0]))
+        y_hi = min(h, int(y_range[1]))
+    else:
+        y_lo, y_hi = 0, h
+    if y_hi <= y_lo:
+        return []
+
     mask = _build_text_mask(gray)
     row_density = mask.sum(axis=1)
     min_width = int(w * min_width_frac)
 
-    # Find consecutive runs of high-density rows.
+    # Find consecutive runs of high-density rows within [y_lo, y_hi).
+    # We iterate one row past the end so a run that touches y_hi-1
+    # gets closed off correctly.
     in_run = False
     run_start = 0
     runs: list[tuple[int, int]] = []
-    for y in range(h + 1):
-        d = row_density[y] if y < h else 0
+    for y in range(y_lo, y_hi + 1):
+        d = row_density[y] if y < y_hi else 0
         is_hot = d >= min_width
         if is_hot and not in_run:
             in_run = True
@@ -210,25 +438,101 @@ def _find_panel_lines(
 
 
 # Per-scan cache for _find_panel_lines results. Keyed by id(gray) +
-# shape so that the three-way row call (mass, resist, instab) inside
-# a single scan only pays the detection cost once.
-_panel_lines_cache: tuple[int, tuple[int, int], list[tuple[int, int, int]]] | None = None
+# shape + y_range so that the three-way row call (mass, resist,
+# instab) inside a single scan only pays the detection cost once,
+# AND local-search and full-frame requests for the same gray do not
+# stomp each other's cache entries.
+_panel_lines_cache: tuple[
+    int,                                          # id(gray)
+    tuple[int, int],                              # gray.shape
+    Optional[tuple[int, int]],                    # y_range
+    list[tuple[int, int, int]],                   # lines
+] | None = None
 
 
-def _get_panel_lines_cached(gray: np.ndarray) -> list[tuple[int, int, int]]:
-    """Return _find_panel_lines(gray), cached per gray-array identity.
+def _get_panel_lines_cached(
+    gray: np.ndarray,
+    *,
+    y_range: Optional[tuple[int, int]] = None,
+) -> list[tuple[int, int, int]]:
+    """Return panel lines for ``gray``, cached per gray-array identity.
 
     Three rows in a single scan share the same gray; cache hits keep
     repeated calls free.
+
+    Detection hierarchy:
+      PRIMARY  — ``hud_tracker.anchors.chrome_lines.find_chrome_lines``,
+                 the structural detector with vertical-isolation +
+                 inter-candidate gap discriminators that reject the
+                 COMPOSITION-pair lines (the legacy detector's known
+                 failure mode). Returns top_line / bot_line dicts; we
+                 fold them into the legacy ``(y_center, x_left,
+                 x_right)`` tuple shape.
+      FALLBACK — legacy ``_find_panel_lines`` for any case where the
+                 chrome_lines detector returns nothing (defensive — we
+                 never want to return zero lines just because the
+                 primary went home empty).
+
+    Local search mode
+    -----------------
+    When ``y_range=(y_lo, y_hi)`` is provided, results are restricted
+    to lines whose y-center lies within that band. The primary
+    ``find_chrome_lines`` detector is run full-frame as today and
+    then post-filtered (it doesn't expose a y-range parameter
+    itself, but it's fast and runs through its own internal caches).
+    The fallback ``_find_panel_lines`` receives ``y_range`` directly
+    and skips scanning outside the band entirely.
+
+    Returned y-centers are always image-absolute. Cache key is
+    extended with ``y_range`` so a local-search call cannot return a
+    stale full-frame cached list (or vice-versa).
     """
     global _panel_lines_cache
-    key = (id(gray), gray.shape)
+    yr_norm: Optional[tuple[int, int]] = (
+        (int(y_range[0]), int(y_range[1])) if y_range is not None else None
+    )
+    key = (id(gray), gray.shape, yr_norm)
     if _panel_lines_cache is not None:
-        cid, cshape, clines = _panel_lines_cache
-        if cid == key[0] and cshape == key[1]:
+        cid, cshape, cyr, clines = _panel_lines_cache
+        if cid == key[0] and cshape == key[1] and cyr == key[2]:
             return clines
-    lines = _find_panel_lines(gray)
-    _panel_lines_cache = (key[0], key[1], lines)
+
+    lines: list[tuple[int, int, int]] = []
+    try:
+        from hud_tracker.anchors.chrome_lines import find_chrome_lines
+        cl = find_chrome_lines(gray)
+        for key_name in ("top_line", "bot_line"):
+            entry = cl.get(key_name)
+            if entry is None:
+                continue
+            y_center = int(entry["y"]) + int(entry["h"]) // 2
+            x_left = int(entry["x"])
+            x_right = int(entry["x"]) + int(entry["w"])
+            lines.append((y_center, x_left, x_right))
+        # Make sure they're top-to-bottom (caller relies on this).
+        lines.sort(key=lambda t: t[0])
+    except Exception as exc:
+        log.debug(
+            "_get_panel_lines_cached: find_chrome_lines failed (%s); "
+            "falling back to legacy _find_panel_lines", exc,
+        )
+        lines = []
+
+    if not lines:
+        # Legacy fallback. Keep this path intact so any case the
+        # primary missed (and there are several known: very dim
+        # captures, partial occlusion) still produces SOMETHING.
+        # Pass y_range through so the legacy detector skips work
+        # outside the requested band in local-search mode.
+        lines = _find_panel_lines(gray, y_range=yr_norm)
+
+    # Final y_range filter (covers the primary-detector path too,
+    # since find_chrome_lines doesn't accept y_range directly).
+    if yr_norm is not None:
+        y_lo, y_hi = yr_norm
+        lines = [t for t in lines if y_lo <= t[0] < y_hi]
+
+    _panel_lines_cache = (key[0], key[1], key[2], lines)
     return lines
 
 
@@ -257,6 +561,146 @@ def _build_text_mask(gray: np.ndarray, deviation: int = 35) -> np.ndarray:
         )
         local_contrast = np.abs(gray.astype(np.float32) - blurred)
         return local_contrast > 15
+
+
+def _find_hud_digit_cluster(
+    gray: "np.ndarray",
+    y1: int,
+    y2: int,
+    x_min: int = 0,
+    x_max: Optional[int] = None,
+) -> "Optional[tuple[int, int, int, int]]":
+    """Locate the digit cluster on a single HUD row by structural pattern.
+
+    HUD counterpart of ``signal_anchor.find_digit_cluster``. Where the
+    signature panel uses a two-anchor COMBO-AGREE (location-pin icon +
+    digit-cluster), the HUD currently only anchors on label templates
+    (MASS: / RESISTANCE: / INSTABILITY:). When any of those label
+    matches fails (score below threshold) the row's value-column
+    bounds fall back to whichever row DID match — producing oversized
+    value crops of mostly background that the CRNN reads as "0".
+
+    This function is the content-based fallback: ignore labels, find
+    where the digits actually are. Runs the same row-projection +
+    column-segmentation + digit-shape-filter + adjacency-clustering
+    pipeline as the signature finder, but constrained to a single
+    pre-computed row band and restricted to the right of ``x_min``
+    (past the row's label, when known). Returns a tight bbox around
+    the digit cluster in original-image coords, or None when no
+    valid cluster is detected.
+
+    Used by ``_find_label_rows`` to:
+      * VERIFY a label-anchored row found real digits (COMBO-AGREE).
+      * RECOVER a value crop when the label match failed but digits
+        are still rendered (most common: instability/resistance
+        labels mis-detected on bright-sand-background panels).
+      * REJECT degenerate row bands that contain no digits at all
+        (the 0/0/0 flicker failure mode).
+    """
+    if gray.size == 0:
+        return None
+    H, W = gray.shape
+    y1 = max(0, int(y1))
+    y2 = min(H, int(y2))
+    if y2 - y1 < 6:
+        return None
+    x_lo = max(0, int(x_min))
+    x_hi = W if x_max is None else min(W, int(x_max))
+    if x_hi - x_lo < 8:
+        return None
+
+    try:
+        from .sc_ocr.api import _canonicalize_polarity, _adaptive_binarize
+    except Exception as exc:
+        log.debug("_find_hud_digit_cluster: import failed: %s", exc)
+        return None
+    band = gray[y1:y2, x_lo:x_hi]
+    try:
+        canon = _canonicalize_polarity(band.astype(np.uint8))
+        binary = _adaptive_binarize(canon)
+    except Exception as exc:
+        log.debug("_find_hud_digit_cluster: canon/binarize failed: %s", exc)
+        return None
+    if binary.size == 0 or int(binary.max()) == 0:
+        return None
+
+    # Column projection of the band — find segments where columns have ink.
+    col_proj = np.sum(binary > 0, axis=0).astype(np.int32)
+    if int(col_proj.max()) == 0:
+        return None
+    col_active = col_proj > 0
+    spans: list[tuple[int, int]] = []
+    in_span = False
+    span_start = 0
+    bw = col_active.shape[0]
+    for x in range(bw + 1):
+        is_active = bool(col_active[x]) if x < bw else False
+        if is_active and not in_span:
+            in_span = True
+            span_start = x
+        elif (not is_active) and in_span:
+            in_span = False
+            if x - span_start >= 1:
+                spans.append((span_start, x))
+    if not spans:
+        return None
+
+    # Compute each span's actual bbox.
+    span_bboxes: list[tuple[int, int, int, int]] = []
+    for sx1, sx2 in spans:
+        col_slice = binary[:, sx1:sx2]
+        if int(col_slice.max()) == 0:
+            continue
+        rows_with_ink = np.where(col_slice.sum(axis=1) > 0)[0]
+        if rows_with_ink.size == 0:
+            continue
+        sy1 = int(rows_with_ink[0])
+        sy2 = int(rows_with_ink[-1] + 1)
+        # Lift to original-image coords.
+        span_bboxes.append(
+            (x_lo + sx1, y1 + sy1, x_lo + sx2, y1 + sy2)
+        )
+
+    # Filter to digit-typical dimensions. HUD values render at the same
+    # font height as the labels (~16-22 px) at native scale; widths run
+    # 2-18 px (narrow "1" / "." through wide "0" / "8"). Bounds are
+    # deliberately wider than the signature version's 8-25 × 2-16 so
+    # we catch both small "." in instability and the leading "1" that
+    # the signature finder's stricter width filter sometimes drops.
+    digit_spans = []
+    for x1c, y1c, x2c, y2c in span_bboxes:
+        sw = x2c - x1c
+        sh = y2c - y1c
+        if 6 <= sh <= 32 and 1 <= sw <= 22:
+            digit_spans.append((x1c, y1c, x2c, y2c))
+    if not digit_spans:
+        return None
+    digit_spans.sort(key=lambda b: b[0])
+
+    # Cluster by horizontal adjacency. HUD row values are 1-6 digits.
+    median_h = int(np.median([b[3] - b[1] for b in digit_spans]))
+    max_gap = max(6, median_h)
+    clusters: list[list[tuple[int, int, int, int]]] = [[digit_spans[0]]]
+    for i in range(1, len(digit_spans)):
+        prev_x2 = clusters[-1][-1][2]
+        cur_x1 = digit_spans[i][0]
+        if cur_x1 - prev_x2 <= max_gap:
+            clusters[-1].append(digit_spans[i])
+        else:
+            clusters.append([digit_spans[i]])
+
+    # Pick the leftmost cluster of 1-7 members. "1" is valid (e.g.
+    # resistance=0 or just-spawned mass=0). 7 is the upper bound for
+    # 6-digit mass values with decimal (e.g. 100,000.5).
+    for cluster in clusters:
+        n = len(cluster)
+        if 1 <= n <= 7:
+            cx1 = min(s[0] for s in cluster)
+            cy1 = min(s[1] for s in cluster)
+            cx2 = max(s[2] for s in cluster)
+            cy2 = max(s[3] for s in cluster)
+            return (cx1, cy1, cx2, cy2)
+    return None
 
 
 def _find_value_crop(
@@ -394,6 +838,23 @@ def _find_value_crop(
 
     # LEFT edge = 0 (which maps to x_lo in image coords) — preserves
     # the user's "start at green line" anchor.
+    #
+    # NOTE: A signature-style content-based digit-cluster refinement
+    # using ``_find_hud_digit_cluster`` was attempted here. It works
+    # cleanly on signature panels (small fixed crop, dark backgrounds,
+    # well-separated digits) but on HUD value rows the binarization
+    # frequently fuses adjacent digits into a single wide mega-span
+    # that gets filtered out, leaving only the LEADING isolated digit
+    # as the "cluster" — so a value like mass=27265 would crop to
+    # just "2", dropping benchmark accuracy ~4 pp. The signature pipe
+    # gets around this with ``_strip_pill_outline_bridges`` and
+    # comma-masking preprocessing that breaks fused regions; that
+    # preprocessing assumes the signature's pill-shaped numeric
+    # capsule and doesn't transfer cleanly. The cluster function is
+    # kept for future use (e.g. as a SECOND signal in a COMBO-AGREE
+    # check that only refines when ALL clusters across rows agree),
+    # but isn't wired into the value-crop path until that two-signal
+    # design is fleshed out.
     return img.crop((x_lo, y1, x_lo + v_right_local, y2))
 
 
@@ -510,6 +971,125 @@ def _find_mineral_row(img: Image.Image) -> Optional[tuple[int, int]]:
 _scan_results_anchor_cache: dict[tuple[int, int], tuple[float, dict]] = {}
 
 
+# Rigid-body HUD panel tracker — one per region. The tracker keeps the
+# last accepted panel pose (panel_x, panel_y, scale) and, on subsequent
+# frames, predicts each anchor's position then verifies with local-
+# search detectors. Result: cross-frame stability that the prior
+# full-image-search detector pipeline could not provide. See
+# ocr/sc_ocr/hud_panel_tracker.py for the state machine.
+#
+# Keyed on the same region-tuple that the rest of this module uses,
+# so each capture region gets its own independent tracker. Module-
+# level mutable dict is OK here because each entry is itself a
+# HudPanelTracker whose methods are thread-safe (the only state is
+# last_pose / rejection_count, both updated under the GIL during a
+# single track() call).
+_hud_trackers: dict[str, "object"] = {}
+
+
+def _get_or_create_tracker():
+    """Return the HudPanelTracker singleton for the current region.
+
+    Lazily imports the tracker class + offset table so a startup that
+    happens before the package is fully wired up still succeeds. If
+    Agent A's ``DEFAULT_OFFSETS`` import isn't available yet, fall
+    back to the tracker module's own local default offsets table —
+    the tracker still functions end-to-end during the integration
+    window.
+    """
+    region = _get_current_region()
+    if region is None:
+        key = "default"
+    else:
+        try:
+            key = (
+                f"{int(region.get('x', 0))}_{int(region.get('y', 0))}_"
+                f"{int(region.get('w', 0))}_{int(region.get('h', 0))}"
+            )
+        except Exception:
+            key = "default"
+
+    tracker = _hud_trackers.get(key)
+    if tracker is not None:
+        return tracker
+
+    try:
+        from .sc_ocr.hud_panel_tracker import (
+            HudPanelTracker,
+            DEFAULT_OFFSETS as _LOCAL_OFFSETS,
+        )
+    except Exception as exc:
+        log.debug("HudPanelTracker import failed: %s", exc)
+        return None
+
+    # NOTE: ``hud_tracker.rigid_body.DEFAULT_OFFSETS`` is the canonical
+    # offset table (in title-height units), but its label_* and colon_*
+    # entries have ``None`` X-offsets because the existing codebase only
+    # stores per-row bbox geometry — there's no per-glyph X calibration
+    # anywhere yet. Feeding ``None`` offsets to the solver makes it skip
+    # those anchors, leaving the tracker with too few measurements to
+    # lock. The local table here uses pixel-unit offsets with X=0 (the
+    # title's left edge) for the label rows, which lets the tracker use
+    # them as Y-only constraints — enough to lock. When per-glyph X
+    # calibration lands, the canonical table will become usable and we
+    # can drop the local one.
+    tracker = HudPanelTracker(offsets=_LOCAL_OFFSETS)
+    _hud_trackers[key] = tracker
+    return tracker
+
+
+# ── HudPanelStabilizer singleton ───────────────────────────────────
+# Same per-region keying as the tracker: one stabilizer per calibrated
+# region so different capture configs don't share lock state.
+_hud_stabilizers: dict[str, "object"] = {}
+
+
+def _get_or_create_stabilizer():
+    """Return the HudPanelStabilizer singleton for the current region.
+
+    The stabilizer uses phase correlation between consecutive frames'
+    panel regions for sub-millisecond inter-frame tracking, and falls
+    back to the rigid-body tracker for cold-start and periodic
+    re-anchor.
+    """
+    region = _get_current_region()
+    if region is None:
+        key = "default"
+    else:
+        try:
+            key = (
+                f"{int(region.get('x', 0))}_{int(region.get('y', 0))}_"
+                f"{int(region.get('w', 0))}_{int(region.get('h', 0))}"
+            )
+        except Exception:
+            key = "default"
+
+    stab = _hud_stabilizers.get(key)
+    if stab is not None:
+        return stab
+
+    try:
+        from .sc_ocr.hud_panel_stabilizer import HudPanelStabilizer
+    except Exception as exc:
+        log.debug("HudPanelStabilizer import failed: %s", exc)
+        return None
+
+    # Tracker factory: the stabilizer needs access to the (already-
+    # singleton'd) HudPanelTracker for its region. Wrap the existing
+    # accessor so each cold-start / re-anchor uses the same tracker
+    # instance (preserves the tracker's own lock state in case the
+    # caller flips back to the tracker tier later).
+    def _tracker_factory():
+        t = _get_or_create_tracker()
+        if t is None:
+            raise RuntimeError("HudPanelTracker unavailable")
+        return t
+
+    stab = HudPanelStabilizer(tracker_factory=_tracker_factory)
+    _hud_stabilizers[key] = stab
+    return stab
+
+
 def _find_scan_results_anchor(img: Image.Image) -> Optional[dict]:
     """Find the SCAN RESULTS title via Tesseract and return geometry.
 
@@ -553,6 +1133,13 @@ def _find_scan_results_anchor(img: Image.Image) -> Optional[dict]:
         np.where(gray < thr, 0, 255).astype(np.uint8),
     ]
     best: Optional[tuple[int, int, int, int]] = None
+    # Tesseract subprocess timeout: bound the worst-case hang at 8 s.
+    # pytesseract supports timeout= since v0.3.6 and raises
+    # RuntimeError if exceeded. Without this, a hung Tesseract child
+    # could block the calling thread indefinitely (we've seen logs
+    # where _find_label_rows reported 47 s elapsed for ~340 ms of
+    # actual visible work — likely candidates include this exact call).
+    _TESS_ANCHOR_TIMEOUT_S = 8
     for binary in variants:
         binary_pil = Image.fromarray(binary)
         try:
@@ -563,6 +1150,7 @@ def _find_scan_results_anchor(img: Image.Image) -> Optional[dict]:
                     "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
                 ),
                 output_type=pytesseract.Output.DICT,
+                timeout=_TESS_ANCHOR_TIMEOUT_S,
             )
         except Exception:
             continue
@@ -617,6 +1205,15 @@ def _find_scan_results_anchor(img: Image.Image) -> Optional[dict]:
 #   resist row center  ≈ title bottom + 4.4 * title_h
 #   instab row center  ≈ title bottom + 5.8 * title_h
 #   outcome bar center ≈ title bottom + 7.4 * title_h
+# Could be promoted to use ``hud_tracker/world_model.json`` (region1
+# proportions) when that file has been calibrated against ≥ 30 captures.
+# As of 2026-05, world_model.json has only 2 captures' worth of data so
+# the static multipliers below — measured against the 397x541 reference
+# fixture — remain authoritative for Tier C. See
+# ``ocr/sc_ocr/api.py::_load_region2_world_model_for_api`` for how the
+# region2 equivalent (``world_model_region2.json``) is loaded; an
+# analogous lookup function could be added for region1 once enough
+# captures have been labeled.
 _ROW_OFFSET_MULTS = {
     "_mineral_row": 1.6,
     "mass":         3.0,
@@ -669,262 +1266,305 @@ def _label_rows_from_anchor(
     # ── Tier A: pure NCC for each row (constrained to below title) ──
     # Crop to below the title, run NCC label-template matching, take
     # each match's pixel position as that row's location. Compute
-    # label_right per row via GAP-DETECTION (not "rightmost text
-    # column") because the matched template region can extend into
-    # the value column's leading digit, and a rightmost-text scan
-    # would land on the digit's edge instead of the colon.
+    # label_right per row directly from the matched bbox's right edge
+    # (``m["x"] + m["w"]``).
     #
-    # Gap detection finds the colon by looking for the first wide
-    # low-density region after the label text. The colon is the
-    # right edge of the contiguous label-text run; whatever's past
-    # the gap is the value, not the colon.
+    # Why the bbox right edge and not a column-density / gap-detection
+    # scan? The previous gap-detection / value-column-find code was
+    # brittle in two distinct ways that both caused per-row
+    # ``label_right`` values to drift wildly across scans of the same
+    # panel:
+    #
+    #   1. Gap detection (used for ``per_match_lr`` diagnostic) relied
+    #      on a fixed ``_INTRA_LABEL_GAP=5 px`` threshold to merge
+    #      inter-letter runs. At larger NCC scales (e.g. scale=2.00),
+    #      the rendered intra-letter spacing in the SC HUD font crosses
+    #      that threshold, so the "first coalesced run" terminated
+    #      mid-label — yielding ``mass: 88`` when the actual label
+    #      ``MASS:`` ended near x=168.
+    #   2. Value-column-find (used for ``shared_lr``) depended on Otsu
+    #      thresholds and a 50% row-height density floor that varied
+    #      with image lighting, panel polarity, and NCC scale; the
+    #      candidate often disagreed with the MASS-bbox fallback by
+    #      enough to trigger the fallback, but the fallback itself
+    #      was a heuristic (``mass.w * 0.93``) only correct when the
+    #      MASS template was scale-matched.
+    #
+    # The matched bbox's right edge is THE deterministic, well-defined
+    # right edge of where the label was found. ``_find_value_crop``
+    # downstream does its OWN sophisticated value-finding from
+    # ``x_min = lr + 6`` rightward (binary mask, two-tier density,
+    # adjacency dilation, RTL span scan), so we don't need ``lr`` to
+    # land precisely on the colon — we just need it past the label
+    # and not so far right that we miss the value. ``match.x + match.w``
+    # satisfies both constraints.
+    #
+    # Shared anchor: the HUD left-aligns all three values to a single
+    # column whose left edge is past the LONGEST label (typically
+    # INSTABILITY:). Taking ``max(per_match_lr.values())`` gives the
+    # rightmost label-end across rows, which is the right anchor for
+    # all rows' value crops. Matches the documented rule in
+    # ``_find_label_rows_by_ncc`` (line ~1800).
     try:
         from .sc_ocr import label_match as _lm_rows
         if (img.height - search_origin) >= 60:
             below = img.crop((0, search_origin, img.width, img.height))
             matches = _lm_rows.find_label_positions(below)
             if matches and "mass" in matches:
-                # Build a polarity-canonical text mask of the below-title
-                # region (used by label_right gap detection per row).
-                _below_gray = np.array(below.convert("L"), dtype=np.uint8)
-                _below_rgb = np.array(below.convert("RGB"), dtype=np.uint8)
-                _below_detect = _below_rgb.max(axis=2).astype(np.uint8)
-
-                def _label_right_via_gap(m: dict) -> int:
-                    """Find the colon's right edge by run-coalescing.
-
-                    Procedure:
-                      1. Take a Y strip at the matched row's y-range,
-                         scan the FULL image width.
-                      2. Build a per-column text-density profile.
-                      3. Find every "text run" (consecutive above-floor
-                         columns).
-                      4. Coalesce runs separated by < ``_INTRA_LABEL_GAP``
-                         px — that merges inter-letter spaces in MASS /
-                         RESISTANCE / INSTABILITY into one continuous
-                         label run, but keeps the bigger colon-to-value
-                         gap as a separator.
-                      5. The FIRST coalesced run is the label (e.g.
-                         ``MASS:``). Its right edge is the colon's right
-                         edge.
-
-                    The intra-label gap threshold matters: SC's HUD font
-                    has 1-3 px between letters, but 8-15 px after the
-                    colon before the value. ``_INTRA_LABEL_GAP=5`` sits
-                    cleanly between those.
-                    """
-                    H, W = _below_detect.shape
-                    y1 = max(0, m["y"])
-                    y2 = min(H, m["y"] + m["h"])
-                    if y2 <= y1:
-                        return m["x"] + m["w"]
-                    region = _below_detect[y1:y2, :]
-                    thr = _otsu(region)
-                    bright = int((region > thr).sum())
-                    if (region.size - bright) < bright:
-                        canon = (255 - region).astype(np.uint8)
-                    else:
-                        canon = region
-                    thr2 = _otsu(canon)
-                    col_density = (canon > thr2).sum(axis=0)
-                    # Density floor: 15% of row height (lower than 25%
-                    # so the colon's two dots count as text).
-                    floor = max(2, int((y2 - y1) * 0.15))
-                    hot = col_density >= floor
-                    # Find all hot runs.
-                    runs: list[tuple[int, int]] = []
-                    in_run = False
-                    rs = 0
-                    for x in range(W):
-                        if hot[x] and not in_run:
-                            in_run = True
-                            rs = x
-                        elif not hot[x] and in_run:
-                            in_run = False
-                            runs.append((rs, x))
-                    if in_run:
-                        runs.append((rs, W))
-                    if not runs:
-                        return m["x"] + m["w"]
-                    # Restrict to runs starting at or after the matched
-                    # bbox's left edge — the label can't be left of the
-                    # match. (Avoids picking up unrelated text far to
-                    # the left.)
-                    runs = [r for r in runs if r[0] >= max(0, m["x"] - 4)]
-                    if not runs:
-                        return m["x"] + m["w"]
-                    # Coalesce runs separated by small gaps (inter-letter
-                    # spaces). 5 px sits between SC's intra-letter gap
-                    # (~2 px) and post-colon gap (~10 px).
-                    _INTRA_LABEL_GAP = 5
-                    coalesced: list[tuple[int, int]] = [runs[0]]
-                    for cur_rs, cur_re in runs[1:]:
-                        prev_rs, prev_re = coalesced[-1]
-                        if (cur_rs - prev_re) <= _INTRA_LABEL_GAP:
-                            coalesced[-1] = (prev_rs, cur_re)
-                        else:
-                            coalesced.append((cur_rs, cur_re))
-                    # The first coalesced run is the label. Its right
-                    # edge is the colon's right edge.
-                    label_end = coalesced[0][1]
-                    return int(label_end) + 2
-
-                # ── Compute label_right by finding the VALUE COLUMN ──
-                # The HUD left-aligns all 3 values (MASS/RESIST/INSTAB)
-                # to a single column. We can find that column's left
-                # edge directly by scanning each matched row right-to-
-                # left for the rightmost text run — that's the value.
-                # The min across rows gives the value column's leftmost
-                # x; label_right sits just before it.
+                # ── Auto-calibration hook ──
+                # Feed the observed (title_y, title_h, label_y_top,
+                # label_h) tuple into the tracker's calibration learner.
+                # The learner accumulates per-field label-top-to-title
+                # ratios and, once stable, publishes them as the
+                # tracker's offset/row-mult tables — overriding the
+                # hardcoded defaults that don't match this user's HUD.
                 #
-                # This avoids depending on template width fitting the
-                # actual rendered text (templates can be over-wide when
-                # NCC matches at a sub-optimal scale, particularly for
-                # the longer RESISTANCE / INSTABILITY templates whose
-                # NCC scores are weaker).
-                def _value_left_for_row(m: dict) -> Optional[int]:
-                    H, W = _below_detect.shape
-                    y1 = max(0, m["y"])
-                    y2 = min(H, m["y"] + m["h"])
-                    if y2 <= y1:
-                        return None
-                    region = _below_detect[y1:y2, :]
-                    thr = _otsu(region)
-                    bright = int((region > thr).sum())
-                    if (region.size - bright) < bright:
-                        canon = (255 - region).astype(np.uint8)
-                    else:
-                        canon = region
-                    thr2 = _otsu(canon)
-                    col_density = (canon > thr2).sum(axis=0)
-                    # "Solid" letter/digit threshold — much higher than
-                    # the floor used for label-text detection. Values
-                    # render as solid digits with d ≈ 20-30 in a 32 px
-                    # row. Setting threshold to 50% of row height lets
-                    # us reliably find digit columns (and ignore the
-                    # sparse colon dots, which we DON'T want to mistake
-                    # for the value).
-                    solid = max(6, int((y2 - y1) * 0.50))
-                    is_solid = col_density >= solid
-                    # Find the rightmost solid run.
-                    runs: list[tuple[int, int]] = []
-                    in_run = False
-                    rs = 0
-                    for x in range(W):
-                        if is_solid[x] and not in_run:
-                            in_run = True
-                            rs = x
-                        elif not is_solid[x] and in_run:
-                            in_run = False
-                            runs.append((rs, x))
-                    if in_run:
-                        runs.append((rs, W))
-                    if not runs:
-                        return None
-                    # Coalesce runs separated by < 12 px. This merges
-                    # multi-digit value clusters (where digits sit ~3-8 px
-                    # apart, plus the "." in "32.17"-style values) but
-                    # not the larger label-to-value gap (≥15 px on rows
-                    # with short labels like MASS).
-                    coalesced: list[tuple[int, int]] = [runs[0]]
-                    for cur_rs, cur_re in runs[1:]:
-                        prev_rs, prev_re = coalesced[-1]
-                        if (cur_rs - prev_re) <= 12:
-                            coalesced[-1] = (prev_rs, cur_re)
-                        else:
-                            coalesced.append((cur_rs, cur_re))
-                    # The value is the RIGHTMOST coalesced run. Label
-                    # text and the value are always separated by a gap
-                    # large enough that they don't coalesce, so the
-                    # rightmost run IS the value.
-                    if not coalesced:
-                        return None
-                    return int(coalesced[-1][0])
+                # The `below` crop is at y=search_origin; matches['y']
+                # is below-relative, so we add search_origin to get
+                # image-absolute. The calibration learner needs the
+                # same coordinate frame as title_y.
+                try:
+                    from .sc_ocr import hud_panel_tracker as _hpt
+                    _abs_matches: dict[str, dict] = {}
+                    for _fld in ("mass", "resistance", "instability"):
+                        _m = matches.get(_fld)
+                        if not _m:
+                            continue
+                        _abs_matches[_fld] = {
+                            "x": int(_m["x"]),
+                            "y": int(_m["y"]) + int(search_origin),
+                            "w": int(_m["w"]),
+                            "h": int(_m["h"]),
+                        }
+                    _hpt.observe_calibration_sample(
+                        title_y=anchor["title_y"],
+                        title_h=anchor["title_h"],
+                        label_matches=_abs_matches,
+                    )
+                except Exception as _cal_exc:  # pragma: no cover
+                    log.debug(
+                        "auto-calibration observe failed: %s", _cal_exc,
+                    )
 
-                value_lefts = [
-                    v for v in (
-                        _value_left_for_row(m) for m in matches.values()
-                    ) if v is not None
-                ]
-                # Compute the MASS-derived fallback up front so we can
-                # cross-check the value-column-find result.
-                mass = matches["mass"]
-                _MASS_FALLBACK = mass["x"] + int(mass["w"] * 0.93)
-                if value_lefts:
-                    # Take the MIN — leftmost across rows is where the
-                    # value column starts. Subtract a margin so the
-                    # value crop starts safely BEFORE the leading
-                    # digit. 14 px chosen because narrow digits like
-                    # "1" have lower-density serifs that don't cross
-                    # the "solid" detection threshold; the actual
-                    # leftmost pixel of a "1" can be 4-6 px to the
-                    # LEFT of where ``_value_left_for_row`` reports
-                    # the run starts, AND every caller in api.py adds
-                    # ``+6`` to the returned label_right when computing
-                    # ``x_min`` for ``_find_value_crop``. Net effective
-                    # headroom = 14 − 6 = 8 px, matching the original
-                    # design intent and capturing narrow "1"s
-                    # consistently. (Was 8 → effective 2 px → chopped
-                    # the leading "1" of MASS=11569 / INSTAB=10.82.)
-                    candidate = max(0, min(value_lefts) - 14)
-                    # Sanity check: a healthy candidate should sit
-                    # near the MASS colon. The leading-digit headroom
-                    # margin (14 px above) plus a typical 4 px serif
-                    # gap can put the candidate up to ~14 px LEFT of
-                    # the MASS_FALLBACK colon estimate, so allow a
-                    # generous tolerance. Only fall back when the
-                    # candidate lands implausibly early (> 16 px left
-                    # of MASS_FALLBACK), which suggests the rightmost-
-                    # run approach picked up label text instead of
-                    # value text (panel too narrow / unusual rendering
-                    # / NCC matched poorly).
-                    if candidate >= _MASS_FALLBACK - 16:
-                        label_right = candidate
-                    else:
-                        log.debug(
-                            "label_rows_from_anchor: value-column-find "
-                            "yielded suspicious label_right=%d (< MASS "
-                            "fallback %d) — using MASS fallback",
-                            candidate, _MASS_FALLBACK,
+                # Per-row label_right = matched label bbox's right edge.
+                # Coordinates here are in ``below``'s frame, which equals
+                # ``img``'s frame (we crop only on Y, not X).
+                per_match_lr = {
+                    k: int(m["x"]) + int(m["w"]) for k, m in matches.items()
+                }
+                # ── Tier-D: colon-anchor fallback for unmatched rows ──
+                # When Tier A matched < 3 rows, the rows that DIDN'T match
+                # would otherwise fall back to a synthesized Y position
+                # AND share label_right with the matched rows. The shared
+                # label_right is whichever match's right edge was widest —
+                # if only MASS matched, that anchor is far too short for
+                # the (longer) RESISTANCE/INSTABILITY labels, so the
+                # downstream value crop bleeds into the label area of the
+                # unmatched rows and the CRNN reads spurious "0"s.
+                #
+                # Run a SECOND, INDEPENDENT anchor over the same y-band:
+                # NCC against the canonical colon glyph (mirrors the
+                # signature pipeline's icon+content two-anchor pattern).
+                # For each unmatched row we use the nearest colon's Y
+                # for that row's position and its (x + w) as its
+                # label_right. Then the shared label_right is the max
+                # across BOTH match-derived and colon-derived right edges.
+                colon_lr_by_row: dict[str, int] = {}
+                colon_y_by_row: dict[str, int] = {}
+                colon_dets: list[dict] = []
+                needed = {"mass", "resistance", "instability"}
+                missing = needed - set(matches.keys())
+                if missing:
+                    try:
+                        from .sc_ocr import colon_anchor as _ca
+                        # Y-band: from search_origin downward enough to
+                        # cover all three value rows (~200 px is generous
+                        # at all observed HUD scales).
+                        ca_y_top = search_origin
+                        ca_y_bot = min(img.height, search_origin + 200)
+                        # X-range: past the leftmost matched-label start
+                        # (so we ignore mineral-row punctuation and any
+                        # chrome on the left) but well clear of the value
+                        # column (so we don't false-fire on decimal dots
+                        # in values like "8.01"). The matched MASS bbox
+                        # gives us a solid leftmost-start; we widen by
+                        # 20 px in case a missing label's start is
+                        # slightly left of MASS's.
+                        ca_x_left = max(0, int(matches["mass"]["x"]) - 20)
+                        ca_x_right = min(
+                            img.width, int(img.width * 0.65),
                         )
-                        label_right = _MASS_FALLBACK
-                else:
-                    label_right = _MASS_FALLBACK
+                        colon_dets = _ca.find_colons(
+                            img,
+                            y_band=(ca_y_top, ca_y_bot),
+                            x_range=(ca_x_left, ca_x_right),
+                        )
+                        # Predict each missing row's center Y from the
+                        # matched MASS row using template-height-based
+                        # pitch (same heuristic as the synthesized-row
+                        # path below), then snap to the nearest detected
+                        # colon within tolerance.
+                        #
+                        # Tolerance (±20 px) accounts for the inherent
+                        # error in the mass*1.4 pitch heuristic
+                        # (empirically the true pitch is mass*1.21-1.40
+                        # across the labelled set; for the 2nd row down
+                        # the prediction can be 10-15 px off). The
+                        # all-or-nothing gate below is what actually
+                        # defends against snapping to non-colon glyphs.
+                        mass_y_below = int(matches["mass"]["y"])
+                        mass_h_pred = int(matches["mass"]["h"])
+                        pitch_pred = max(20, int(round(mass_h_pred * 1.4)))
+                        row_offsets = {
+                            "mass": 0,
+                            "resistance": pitch_pred,
+                            "instability": 2 * pitch_pred,
+                        }
+                        mass_cy_img = (
+                            search_origin + mass_y_below + mass_h_pred // 2
+                        )
+                        _SNAP_TOL = 20
+                        used_colon_idxs: set[int] = set()
+                        for row in missing:
+                            target_cy = mass_cy_img + row_offsets[row]
+                            best_idx = -1
+                            best_d = 10 ** 9
+                            for idx, c in enumerate(colon_dets):
+                                if idx in used_colon_idxs:
+                                    continue
+                                cy = int(c["y"]) + int(c["h"]) // 2
+                                d = abs(cy - target_cy)
+                                if d < best_d:
+                                    best_d = d
+                                    best_idx = idx
+                            if best_idx >= 0 and best_d <= _SNAP_TOL:
+                                used_colon_idxs.add(best_idx)
+                                c = colon_dets[best_idx]
+                                colon_lr_by_row[row] = (
+                                    int(c["x"]) + int(c["w"])
+                                )
+                                colon_y_by_row[row] = (
+                                    int(c["y"]) + int(c["h"]) // 2
+                                )
+                        # All-or-nothing gate: only trust Tier-D when
+                        # every missing row got a tight-snap colon.
+                        # Partial Tier-D (some rows filled, others not)
+                        # is unreliable — typically means the underlying
+                        # MASS-anchor is degenerate (incorrect pitch
+                        # prediction), so the synthesized fallback is
+                        # likely BETTER than the half-corrected colon
+                        # positions. Empirically: on the labeled
+                        # benchmark, partial Tier-D introduced one
+                        # regression (capture _160347_045) while
+                        # contributing zero recoveries.
+                        if colon_lr_by_row and len(colon_lr_by_row) < len(missing):
+                            log.info(
+                                "label_rows_from_anchor: TIER-D "
+                                "partial fill (%d/%d rows) discarded — "
+                                "filled=%s missing=%s (avoids snapping "
+                                "to non-colon glyphs)",
+                                len(colon_lr_by_row), len(missing),
+                                sorted(colon_lr_by_row.keys()),
+                                sorted(missing),
+                            )
+                            colon_lr_by_row.clear()
+                            colon_y_by_row.clear()
+                        elif colon_lr_by_row:
+                            log.info(
+                                "label_rows_from_anchor: TIER-D colon "
+                                "fallback filled rows=%s colons=%s "
+                                "(matched_rows=%s)",
+                                sorted(colon_lr_by_row.keys()),
+                                [
+                                    (int(c["x"]), int(c["y"]))
+                                    for c in colon_dets
+                                ],
+                                sorted(matches.keys()),
+                            )
+                    except Exception as ca_exc:
+                        log.debug(
+                            "label_rows_from_anchor: TIER-D colon "
+                            "fallback failed (%s) — proceeding with "
+                            "tier-A matches only", ca_exc,
+                        )
+
+                # Shared anchor across rows = rightmost label end across
+                # both Tier-A matches and Tier-D colon detections.
+                # The HUD aligns all values to a single column past the
+                # longest label, so max-of-right-edges is the correct
+                # value-column-left anchor.
+                combined_rights = list(per_match_lr.values())
+                combined_rights.extend(colon_lr_by_row.values())
+                label_right = max(combined_rights)
                 # Sanity floor: never let label_right exceed 75% of image
                 # width — values column always has ≥25% of the panel.
                 label_right = min(label_right, int(img.width * 0.75))
-                # Per-match diagnostic for the debug log.
-                per_match_lr = {
-                    k: _label_right_via_gap(m) for k, m in matches.items()
-                }
 
                 # Build the result dict. Use NCC matches for Y, synthesize
                 # missing rows from MASS using template-height-based pitch.
-                _PAD_Y = 4
+                #
+                # Asymmetric padding: _PAD_Y_TOP > _PAD_Y_BOT. The NCC
+                # bbox is tight to the label letters, but value digits
+                # render slightly taller than the label letters in
+                # the SC HUD font — the digits' tops extend a few
+                # pixels above the label baseline. Extending the top
+                # by more than the bottom clears those digit tops
+                # without bleeding into the next row.
+                #
+                # Constraint: TOP + BOT must stay below (pitch - m.h)
+                # to avoid overlap between adjacent rows' y-bands.
+                # For typical m.h=32, pitch=45 → gap=13 → TOP+BOT<13.
+                # 8+4=12 leaves 1 px buffer.
+                _PAD_Y_TOP = 8
+                _PAD_Y_BOT = 4
                 mass_match = matches["mass"]
                 mass_y_full = search_origin + int(mass_match["y"])
                 mass_h = int(mass_match["h"])
                 pitch = max(20, int(round(mass_h * 1.4)))
 
-                def _row_box(m: Optional[dict], offset_pitch: int) -> tuple[int, int]:
+                def _row_box(
+                    m: Optional[dict],
+                    offset_pitch: int,
+                    colon_cy: Optional[int] = None,
+                ) -> tuple[int, int]:
+                    """Compute Y-box for a row.
+
+                    Preference order:
+                      1. NCC label match (Tier A) — use its bbox.
+                      2. Tier-D colon Y — center the row on the colon
+                         and use the MASS template height for the box.
+                      3. Synthesize from MASS using pitch.
+                    """
                     if m is not None:
-                        y1 = max(0, search_origin + int(m["y"]) - _PAD_Y)
+                        y1 = max(0, search_origin + int(m["y"]) - _PAD_Y_TOP)
                         y2 = min(
                             img.height,
-                            search_origin + int(m["y"]) + int(m["h"]) + _PAD_Y,
+                            search_origin + int(m["y"]) + int(m["h"]) + _PAD_Y_BOT,
+                        )
+                    elif colon_cy is not None:
+                        y1 = max(0, colon_cy - mass_h // 2 - _PAD_Y_TOP)
+                        y2 = min(
+                            img.height,
+                            colon_cy + mass_h // 2 + _PAD_Y_BOT,
                         )
                     else:
                         cy = mass_y_full + (mass_h // 2) + offset_pitch
-                        y1 = max(0, cy - mass_h // 2 - _PAD_Y)
-                        y2 = min(img.height, cy + mass_h // 2 + _PAD_Y)
+                        y1 = max(0, cy - mass_h // 2 - _PAD_Y_TOP)
+                        y2 = min(img.height, cy + mass_h // 2 + _PAD_Y_BOT)
                     return y1, y2
 
                 result: dict[str, tuple[int, int, int]] = {}
                 y1, y2 = _row_box(mass_match, 0)
                 result["mass"] = (y1, y2, label_right)
-                y1, y2 = _row_box(matches.get("resistance"), pitch)
+                y1, y2 = _row_box(
+                    matches.get("resistance"), pitch,
+                    colon_cy=colon_y_by_row.get("resistance"),
+                )
                 result["resistance"] = (y1, y2, label_right)
-                y1, y2 = _row_box(matches.get("instability"), 2 * pitch)
+                y1, y2 = _row_box(
+                    matches.get("instability"), 2 * pitch,
+                    colon_cy=colon_y_by_row.get("instability"),
+                )
                 result["instability"] = (y1, y2, label_right)
                 y1, y2 = _row_box(None, -pitch)  # mineral synthesized
                 # Don't let mineral row land above the title bottom.
@@ -935,10 +1575,10 @@ def _label_rows_from_anchor(
 
                 log.debug(
                     "label_rows_from_anchor: NCC tier (search_origin=%d, "
-                    "matched=%s, per_match_lr=%s, shared_lr=%d)",
+                    "matched=%s, per_match_lr=%s, colon_lr=%s, shared_lr=%d)",
                     search_origin,
                     sorted(matches.keys()),
-                    per_match_lr, label_right,
+                    per_match_lr, colon_lr_by_row, label_right,
                 )
                 return result
     except Exception as exc:
@@ -1182,6 +1822,7 @@ def _find_label_rows_by_hud_grid(
             pitch=int(span * 0.18),
             bot_line_y=bot_y,
             source="hud_grid",
+            title_box=_get_cached_title_box(),
         )
     except Exception:
         pass
@@ -1567,10 +2208,238 @@ def _find_label_rows_by_position(
             pitch=pitch,
             bot_line_y=bot_line_y,
             source="by_position",
+            title_box=_get_cached_title_box(),
         )
     except Exception:
         pass
     return result
+
+
+def _row_ink_profile(
+    detect_full: Optional[np.ndarray],
+    row_y1: int,
+    row_y2: int,
+    x_limit: Optional[int],
+) -> tuple[Optional[np.ndarray], int]:
+    """Polarity-canonicalised per-column ink density for a row strip.
+
+    Returns ``(col_density, band_h)`` where ``col_density[x]`` is the
+    count of bright (text) pixels in column ``x`` of the strip, or
+    ``(None, 0)`` if the strip is unusable. ``x_limit`` caps the scan
+    width (``None`` → 60 % of image width). Shared by the label-end
+    and value-column scanners below.
+    """
+    if detect_full is None or detect_full.size == 0:
+        return None, 0
+    ry1 = max(0, int(row_y1))
+    ry2 = min(detect_full.shape[0], int(row_y2))
+    band_h = ry2 - ry1
+    if band_h < 4:
+        return None, 0
+    if x_limit is None:
+        rx2 = int(detect_full.shape[1] * 0.60)
+    else:
+        rx2 = max(8, min(int(x_limit), int(detect_full.shape[1])))
+    region = detect_full[ry1:ry2, :rx2]
+    if region.size == 0:
+        return None, 0
+    # Polarity-canonicalize so text reads BRIGHT regardless of source.
+    thr = _otsu(region)
+    bright = int((region > thr).sum())
+    if (region.size - bright) < bright:
+        region_canon = (255 - region).astype(np.uint8)
+    else:
+        region_canon = region
+    thr2 = _otsu(region_canon)
+    col_d = (region_canon > thr2).sum(axis=0)
+    return col_d, band_h
+
+
+def _scan_label_end_x(
+    detect_full: Optional[np.ndarray],
+    row_y1: int,
+    row_y2: int,
+    *,
+    x_limit: Optional[int] = None,
+) -> Optional[int]:
+    """Scan a row strip for the image-X where the LABEL text ends.
+
+    The SC mining HUD renders ``LABEL:`` on the left of each row, a
+    wide background gap, then the value. This locates the rightmost
+    column of the FIRST contiguous bright text cluster from the left —
+    i.e. the colon / label end, where the value column begins.
+
+    Why a pixel scan rather than ``label_x + label_w`` from an NCC
+    match: the label templates carry baked-in padding, so ``x + w``
+    already overshoots the real colon by 30-50 px even for a clean
+    match. Worse, ``RESISTANCE:`` / ``INSTABILITY:`` are often
+    *synthesized* on skewed panels (their wide templates fail NCC) —
+    a synthesized label's ``w`` is the full padded template width at
+    the MASS scale, so a template-width-derived ``label_right`` lands
+    the value crop in empty space PAST the digits and OCR reads
+    nothing. Reading the actual ink is immune to both problems and
+    works regardless of perspective skew (a rotated label still has
+    its leftmost ink cluster = the label, with a clean gap before the
+    value).
+
+    Returns the image-absolute X of the label end, or ``None`` if no
+    label ink is found in the strip.
+    """
+    col_d, band_h = _row_ink_profile(detect_full, row_y1, row_y2, x_limit)
+    if col_d is None:
+        return None
+    # ── Ink floor ──
+    # A column carries "ink" if at least a thin sliver of it is bright.
+    # Keep this LOW: the HUD font's 'M' has a narrow centre V-notch
+    # where the column density drops to ~30% of band height, and the
+    # colon ':' is only two dots (~15-25% of band height). The
+    # historical 0.25*band_h floor classed both as background, so the
+    # scan false-broke INSIDE the first letter ('M' of 'MASS:').
+    # 8% of band height keeps glyph internals and the colon as ink
+    # while still rejecting 1-2 px dust.
+    ink_floor = max(3, int(band_h * 0.08))
+    ink = col_d >= ink_floor
+    if not ink.any():
+        return None
+    # ── Gap threshold ──
+    # The label→value gap is the widest horizontal gap in the row by
+    # far. Inter-letter gaps are 1-3 px and a glyph's internal notch is
+    # narrower still. 18% of band height sits comfortably between the
+    # two and tracks capture resolution.
+    gap_min = max(6, int(band_h * 0.18))
+    # The label is a long contiguous ink run; stray dust specks are a
+    # few px. An accepted run must clear this width so a leading speck
+    # can't be mistaken for the label.
+    min_label_w = max(12, int(band_h * 0.45))
+    n_cols = int(ink.size)
+    run_start: Optional[int] = None
+    last_ink = -1
+    gap = 0
+    x = 0
+    while x < n_cols:
+        if ink[x]:
+            if run_start is None:
+                run_start = x
+            last_ink = x
+            gap = 0
+        elif run_start is not None:
+            gap += 1
+            if gap >= gap_min:
+                # Run ended at a wide gap. Accept it as the label only
+                # if it is wide enough; otherwise it was speckle —
+                # discard and keep scanning for the real label.
+                if last_ink - run_start + 1 >= min_label_w:
+                    return int(last_ink) + 2  # +2 px anti-alias halo
+                run_start = None
+                last_ink = -1
+                gap = 0
+        x += 1
+    # Reached the scan limit without a trailing wide gap — the value
+    # column is past x_limit. The current run, if substantial, is the
+    # label.
+    if (
+        run_start is not None
+        and last_ink - run_start + 1 >= min_label_w
+    ):
+        return int(last_ink) + 2
+    return None
+
+
+def _scan_value_column_x(
+    detect_full: Optional[np.ndarray],
+    row_y1: int,
+    row_y2: int,
+    *,
+    x_limit: Optional[int] = None,
+) -> Optional[int]:
+    """Find the image-X where the VALUE column begins in a row strip.
+
+    A HUD row is ``[label]  …wide gap…  [value]``. This returns the X
+    of the first column of the *value* cluster — what a value crop
+    should start at.
+
+    Why this exists alongside ``_scan_label_end_x``: when the row band
+    is shorter than the rendered glyphs (large-scale / zoomed-in
+    captures), the band slices through the *tops* of the letters and
+    each glyph fragments into disconnected pieces. A left-to-right
+    "first contiguous run" scan then stops after the first letter and
+    reports a label end ~1 glyph in — far short of the colon — so the
+    value crop starts deep inside the label and drags the (long)
+    label tail into the digits, fusing them.
+
+    This scanner is fragmentation-proof: it first applies a horizontal
+    morphological *closing* that bridges every inter-letter / inter-
+    digit gap (those scale with glyph size) but NOT the much wider
+    label→value gap. After closing the row collapses to two blobs —
+    label, value — and the value's left edge is returned.
+
+    Returns the image-absolute X, or ``None`` when no clean two-blob
+    (label + value) structure is found (caller falls back).
+    """
+    if x_limit is None and detect_full is not None:
+        # The value column sits around mid-panel; scan wide enough to
+        # include it but not the far-right chrome.
+        x_limit = int(detect_full.shape[1] * 0.80)
+    col_d, band_h = _row_ink_profile(detect_full, row_y1, row_y2, x_limit)
+    if col_d is None:
+        return None
+    ink_floor = max(3, int(band_h * 0.08))
+    ink = col_d >= ink_floor
+    idxs = np.where(ink)[0]
+    if idxs.size == 0:
+        return None
+    # ── Closing radius ──
+    # Bridge inter-letter / inter-digit gaps (which scale with glyph
+    # size, ~0.2-0.4 * band height) so each word collapses to a single
+    # blob, but stay well under the label→value gap so that gap
+    # survives. ``max(24, band_h)`` clears inter-glyph gaps at every
+    # capture scale; the HUD's label→value gap is always far larger.
+    close_r = max(24, band_h)
+    closed = ink.copy()
+    for k in range(idxs.size - 1):
+        gap = int(idxs[k + 1] - idxs[k] - 1)
+        if 0 < gap <= close_r:
+            closed[idxs[k] + 1: idxs[k + 1]] = True
+    # Maximal True runs in the closed mask.
+    runs: list[tuple[int, int]] = []
+    run_start: Optional[int] = None
+    for x in range(int(closed.size)):
+        if closed[x]:
+            if run_start is None:
+                run_start = x
+        elif run_start is not None:
+            runs.append((run_start, x - 1))
+            run_start = None
+    if run_start is not None:
+        runs.append((run_start, int(closed.size) - 1))
+    # The label is the first blob at least ~2× the band height wide
+    # (a single fragmented glyph is only ~1× — this excludes the case
+    # where closing failed to merge the label). The value is the next
+    # blob wide enough to be at least one digit.
+    min_label_w = max(20, int(band_h * 2.0))
+    min_value_w = max(4, int(band_h * 0.25))
+    label_idx: Optional[int] = None
+    for i, (s, e) in enumerate(runs):
+        if e - s + 1 >= min_label_w:
+            label_idx = i
+            break
+    if label_idx is None:
+        return None
+    _label_end_x = int(runs[label_idx][1])
+    for (s, e) in runs[label_idx + 1:]:
+        if e - s + 1 >= min_value_w:
+            # Back the value-column X off the value blob's first ink
+            # column by a small margin. The leading digit's left edge
+            # is often AA-thinned / skew-degraded below the ink floor,
+            # so the raw blob start lands a few px INSIDE the glyph —
+            # the crop boundary then clips it and a left-clipped digit
+            # mis-classifies (a "6" with its loop's left side cut off
+            # reads as "5"). The margin restores those columns. It is
+            # clamped to stay clear of the label blob, so the crop
+            # never bleeds back into label text.
+            _margin = max(8, int(band_h * 0.20))
+            return max(_label_end_x + 4, int(s) - _margin)
+    return None
 
 
 def _find_label_rows_by_ncc(
@@ -1608,7 +2477,15 @@ def _find_label_rows_by_ncc(
         )
         return {}
 
-    _PAD_Y = 4
+    # Asymmetric padding: see the matching comment ~line 996 above.
+    # NCC bbox is tight to label letters; value digits render slightly
+    # above the label baseline so the top needs more room than the
+    # bottom. TOP+BOT must stay below (pitch - m.h) to avoid adjacent-
+    # row overlap; 8+4=12 fits in the typical 13 px gap.
+    _PAD_Y_TOP = 8
+    _PAD_Y_BOT = 4
+    _PAD_Y = _PAD_Y_BOT  # legacy symmetric var, kept for callers that
+                         # still reference _PAD_Y (rough_half_h below)
 
     # Compute shared_label_right = rightmost ACTUAL text column across
     # all matched label regions. Don't trust the template's reported
@@ -1759,56 +2636,12 @@ def _find_label_rows_by_ncc(
     #   4. The rightmost column of that cluster = the colon
     # shared_label_right = max across all rows
     def _row_label_end(row_y1: int, row_y2: int) -> Optional[int]:
-        if detect_full is None:
-            return None
-        ry1 = max(0, row_y1)
-        ry2 = min(detect_full.shape[0], row_y2)
-        if ry2 - ry1 < 4:
-            return None
-        # Use only the LEFT 60% of the image — the value column lives
-        # in the right 40% and we don't want to scan into it for the
-        # label end.
-        rx2 = int(detect_full.shape[1] * 0.60)
-        region = detect_full[ry1:ry2, :rx2]
-        if region.size == 0:
-            return None
-        # Polarity-canonicalize so text is BRIGHT
-        thr = _otsu(region)
-        bright = int((region > thr).sum())
-        if (region.size - bright) < bright:
-            region_canon = (255 - region).astype(np.uint8)
-        else:
-            region_canon = region
-        thr2 = _otsu(region_canon)
-        col_d = (region_canon > thr2).sum(axis=0)
-        floor = max(3, int((ry2 - ry1) * 0.25))
-        hot = col_d >= floor
-        if not hot.any():
-            return None
-        # Find FIRST contiguous bright run (the label).
-        idxs = np.where(hot)[0]
-        first_hot = int(idxs[0])
-        # Walk right from first_hot, allowing small inter-letter gaps
-        # but breaking on the BIG gap between label and value.
-        # ``gap >= 5`` matches ``_INTRA_LABEL_GAP`` in the Tier A NCC
-        # path: SC's HUD has 1-3 px between letters but 8-15 px after
-        # the colon, so 5 cleanly stops at the colon. Using 12 (the
-        # historical value) BRIDGED into the leading "1" of values
-        # like 11569 / 10.82, chopping the digit off the value crop
-        # downstream. See _label_rows_from_anchor for the same pattern.
-        last_hot = first_hot
-        gap = 0
-        i = first_hot
-        while i < hot.size:
-            if hot[i]:
-                last_hot = i
-                gap = 0
-            else:
-                gap += 1
-                if gap >= 5:
-                    break
-            i += 1
-        return int(last_hot) + 2  # small margin for anti-alias halo
+        # Thin wrapper over the module-level pixel scan (shared with
+        # the EARLY-DIRECT path in _find_label_rows, which derives its
+        # value-column X the same way). Default x_limit = 60% of image
+        # width: the value column lives in the right ~40% and must not
+        # be scanned for the label end.
+        return _scan_label_end_x(detect_full, row_y1, row_y2)
 
     # Predict approximate row positions from MASS anchor + pitch
     # (not yet finalized — that's done in the row_offsets loop below,
@@ -1868,6 +2701,7 @@ def _find_label_rows_by_ncc(
             pitch=pitch,
             bot_line_y=None,
             source="ncc_label_match",
+            title_box=_get_cached_title_box(),
         )
     except Exception:
         pass
@@ -1891,6 +2725,100 @@ def _set_current_region(region: Optional[dict]) -> None:
 
 def _get_current_region() -> Optional[dict]:
     return getattr(_thread_local, "current_region", None)
+
+
+# Per-thread cached SCAN RESULTS title bounding box. _find_label_rows
+# detects the title once at the top of the function and stashes the
+# (x, y, w, h) tuple here so EVERY downstream _dbg.set_panel_finder
+# call (including those inside _find_label_rows_by_position,
+# _find_label_rows_by_ncc, _find_label_rows_by_hud_grid) can pass it
+# through to the overlay — the gold "SCAN RESULTS" box should always
+# be drawn when the anchor is found, regardless of which path
+# eventually produced the row positions. ThreadPoolExecutor(64) means
+# we MUST keep this per-thread; module-level mutable state would
+# cross-contaminate scans.
+def _set_cached_title_box(box: Optional[tuple[int, int, int, int]]) -> None:
+    _thread_local.cached_title_box = box
+
+
+def _get_cached_title_box() -> Optional[tuple[int, int, int, int]]:
+    return getattr(_thread_local, "cached_title_box", None)
+
+
+def _emit_anchor_only_overlay() -> None:
+    """Push a final ``set_panel_finder`` with the cached title_box so the
+    overlay viewer STILL shows the gold SCAN RESULTS box even when every
+    detection path failed.
+
+    This is the diagnostic "we found the title but couldn't lay out the
+    rows" state — without this hook, every failed scan would leave the
+    overlay completely blank and the user couldn't tell whether the
+    anchor matched at all. Best-effort: any exception inside is swallowed.
+    """
+    try:
+        _box = _get_cached_title_box()
+        if _box is None:
+            return
+        from .sc_ocr import debug_overlay as _dbg
+        _dbg.set_panel_finder(
+            top_y=_box[1],
+            mineral_y_top=None,
+            mineral_y_bot=None,
+            mineral_center=None,
+            pitch=None,
+            bot_line_y=None,
+            source="anchor_only",
+            title_box=_box,
+        )
+    except Exception:
+        pass
+
+
+def _emit_label_rows_overlay(result: Optional[dict]) -> None:
+    """Push ``set_label_rows`` from any path that successfully produced
+    row positions, so the overlay state has the cyan row-band boxes
+    regardless of which caller invoked ``_find_label_rows``.
+
+    Without this hook, only ``scan_hud_onnx`` calls ``_dbg.set_label_rows``
+    after the function returns — the calibration dialog's
+    ``cal_live_refresh`` worker calls ``_find_label_rows`` directly,
+    finds rows, but never publishes them. So the overlay would show
+    only the title box and no row bands even on a successful detection.
+
+    ``result`` is the dict returned by a detection path; keys we
+    publish are ``mass`` / ``resistance`` / ``instability``, each a
+    ``(y1, y2, label_right)`` tuple. Other keys (``_mineral_row``,
+    ``mineral``, etc.) are ignored — ``set_label_rows`` only expects
+    the three numeric-value rows.
+
+    Best-effort: any exception inside is swallowed; this MUST never
+    affect OCR correctness.
+    """
+    try:
+        if not result or not isinstance(result, dict):
+            return
+        rows = {
+            k: v for k, v in result.items()
+            if k in ("mass", "resistance", "instability") and v is not None
+        }
+        if not rows:
+            return
+        from .sc_ocr import debug_overlay as _dbg
+        # INFO log so the user can grep this and confirm what rows are
+        # actually being pushed to the overlay state per-call. If the
+        # overlay shows only mass-cyan but this log shows all three keys,
+        # the merge in set_label_rows or the TTL gate at render time is
+        # the next place to look. Demote to DEBUG once stable.
+        try:
+            log.info(
+                "_emit_label_rows_overlay: pushing fields=%s",
+                sorted(rows.keys()),
+            )
+        except Exception:
+            pass
+        _dbg.set_label_rows(rows)
+    except Exception:
+        pass
 
 
 # Rate-limit calibration-state logging so we don't spam the log on every
@@ -1945,10 +2873,53 @@ def _log_calibration_state(region: dict, cal_result) -> None:
         )
 
 
+def _build_manual_override_label_rows(
+    region: dict, img_w: int, img_h: int,
+) -> dict[str, tuple[int, int, int]]:
+    """Assemble a ``{field: (y_s, y_e, x_v_start)}`` dict directly
+    from the user's manual-override boxes.
+
+    Used when ``calibration.get_manual_override_mode(region)`` is True.
+    Skips ``_find_label_rows`` / ``label_match`` / scan_results_anchor
+    entirely — the user's drawn rectangles ARE the ground truth.
+
+    Defensive: if a field has no manual box stored, it's silently
+    skipped (the row stays uncalibrated, downstream OCR returns None
+    for it). This keeps the pipeline alive even when the user
+    enables manual mode without populating every field.
+    """
+    from .sc_ocr import calibration as _cal_local
+    out: dict[str, tuple[int, int, int]] = {}
+    for _field in ("_mineral_row", "mass", "resistance", "instability"):
+        box = _cal_local.get_manual_override_box(region, _field)
+        if box is None:
+            continue
+        try:
+            _x = max(0, int(box["x"]))
+            _y = max(0, int(box["y"]))
+            _w = max(1, int(box["w"]))
+            _h = max(1, int(box["h"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+        y_s = min(img_h, _y)
+        y_e = min(img_h, _y + _h)
+        if y_e - y_s < 4:
+            continue
+        # x_v_start is the x where the value crop begins. The manual
+        # box is the user-defined value rectangle, so its left edge
+        # IS the value column.
+        x_v_start = min(img_w, _x)
+        out[_field] = (y_s, y_e, x_v_start)
+    return out
+
+
 def _find_label_rows(img: Image.Image) -> dict[str, tuple[int, int, int]]:
     """Find MASS / RESIST / INSTAB rows.
 
     Strategy:
+      -1. MANUAL OVERRIDE MODE: if the user has flipped the override
+          flag for this region, build label_rows from their drawn
+          boxes ONLY — no detection, no anchor, no NCC.
       0. CALIBRATION: if the user has saved per-row calibration via
          the Calibration Dialog, return those coordinates DIRECTLY.
          No detection, no drift. This is the steady-state path
@@ -1957,12 +2928,658 @@ def _find_label_rows(img: Image.Image) -> dict[str, tuple[int, int, int]]:
       2. Position-based 5-band scan
       3. HUD-grid fractional fallback
       4. Tesseract per-label search (deepest fallback)
+
+    Budget caps (each path is wall-clock bounded so a single slow
+    detector can't stall the scan for minutes — the user previously saw
+    275 s scans because a no-result NCC pass kept invoking the next
+    fallback, each of which spawned its own Tesseract subprocess).
     """
+    # Per-path wall-clock budgets (ms). When a path runs over, log a
+    # WARNING (so the user sees it in the normal log file, not just at
+    # DEBUG level) and ONLY use the budget to decide whether to ATTEMPT
+    # the next fallback — never to throw away a result a path already
+    # produced. The result-first ordering rule is enforced below.
+    #
+    # Generous values: the previous tight budgets (600/2500 ms) were
+    # killing legit slow scans. Real successful scans on cold caches
+    # have been observed to take ~50 s end-to-end yet still produce a
+    # complete result with all three rows matched. The old code threw
+    # those away. Now we only block the NEXT path if budget is gone.
+    _BUDGET_PRIMARY_MS = 10000
+    _BUDGET_SECONDARY_MS = 5000
+    _BUDGET_TERTIARY_MS = 3000
+    _BUDGET_QUATERNARY_MS = 2000
+    _BUDGET_TESS_PER_LABEL_MS = 5000
+    _BUDGET_TOTAL_MS = 30000
+
+    # Master clock for the whole _find_label_rows call. Used to enforce
+    # the total budget cap (only as a fallback gate — never to discard
+    # successful results).
+    _t_total_start = time.monotonic()
+
+    def _total_elapsed_ms() -> float:
+        return (time.monotonic() - _t_total_start) * 1000.0
+
+    def _total_budget_exhausted() -> bool:
+        return _total_elapsed_ms() > _BUDGET_TOTAL_MS
+
+    # Helper: a result is "usable" (worth keeping) when it has at least
+    # one row position OR a _mineral_row anchor. Empty dicts and dicts
+    # with no useful keys are treated as "no result" so we fall through.
+    def _result_is_usable(r: Optional[dict]) -> bool:
+        if not r:
+            return False
+        return bool(
+            "_mineral_row" in r
+            or "mass" in r
+            or "resistance" in r
+            or "instability" in r
+        )
+
+    # Reset the per-thread cached title_box at function entry so a
+    # previous scan's value (different image, possibly on a re-used
+    # ThreadPoolExecutor worker) can't leak into this one. Populated
+    # below when the SCAN RESULTS anchor is detected. Eager reset (not
+    # lazy) is required because the 64-worker pool reuses threads.
+    _set_cached_title_box(None)
+
+    # Diagnostic: log function entry with image dimensions and any
+    # available region info. INFO level so it's visible without DEBUG.
+    try:
+        _entry_w, _entry_h = img.size
+    except Exception:
+        _entry_w = _entry_h = -1
+    _entry_region = _get_current_region()
+    log.info(
+        "_find_label_rows: entry img.size=(%d,%d) region=%s",
+        _entry_w, _entry_h,
+        _entry_region if _entry_region else "<none>",
+    )
+
+    # ── Title-box detection (before any sub-path runs) ──
+    # The SCAN RESULTS title is the most-stable feature of the panel.
+    # We try to find it ONCE, up front, and cache the bounding box in
+    # the thread-local stash. EVERY downstream _dbg.set_panel_finder
+    # call (in this function and in callees within this file) reads
+    # the cache and passes it through, so the gold "SCAN RESULTS" box
+    # is drawn on the overlay regardless of which detection path
+    # eventually produces row positions — even if all of them fail.
+    #
+    # Wrapped in budget protection because the NCC anchor itself has
+    # a fast/slow path: NCC template (~5 ms) usually hits, but the
+    # Tesseract fallback can spawn a subprocess if the template path
+    # fails. We give the whole anchor-find operation 250 ms — well
+    # under the PRIMARY budget so even if it eats the full slice,
+    # PRIMARY still has 350 ms to compute rows.
+    try:
+        log.debug(
+            "_find_label_rows: PRE-ANCHOR starting at %.0fms",
+            _total_elapsed_ms(),
+        )
+        _t_anchor_pre = time.monotonic()
+        try:
+            from .sc_ocr import scan_results_match as _srm_pre
+            _t_srm_import = time.monotonic()
+            _pre_anchor = _srm_pre.find_scan_results_anchor(img)
+            log.debug(
+                "_find_label_rows: PRE-ANCHOR srm.find_scan_results_anchor "
+                "took %.0fms (result=%s)",
+                (time.monotonic() - _t_srm_import) * 1000.0,
+                "OK" if _pre_anchor is not None else "None",
+            )
+        except Exception as _pre_inner_exc:
+            _pre_anchor = None
+            log.debug(
+                "_find_label_rows: PRE-ANCHOR srm import/call failed: %s",
+                _pre_inner_exc,
+            )
+        _pre_anchor_elapsed = (time.monotonic() - _t_anchor_pre) * 1000.0
+        log.debug(
+            "_find_label_rows: PRE-ANCHOR completed in %.0fms (result=%s)",
+            _pre_anchor_elapsed,
+            "OK" if _pre_anchor is not None else "empty",
+        )
+        if _pre_anchor_elapsed > 250:
+            log.warning(
+                "_find_label_rows: pre-anchor exceeded 250ms (took %.0fms) "
+                "— title_box may be unavailable for overlay",
+                _pre_anchor_elapsed,
+            )
+        if _pre_anchor is not None:
+            _set_cached_title_box((
+                int(_pre_anchor["title_x"]),
+                int(_pre_anchor["title_y"]),
+                int(_pre_anchor["title_w"]),
+                int(_pre_anchor["title_h"]),
+            ))
+            # Push the title_box and the predicted row centers IMMEDIATELY
+            # so the overlay viewer can render the gold SCAN RESULTS box
+            # even if nothing else succeeds. _ROW_OFFSET_MULTS encodes the
+            # known proportional offsets from title height to each row's
+            # center.
+            try:
+                from .sc_ocr import debug_overlay as _dbg_pre
+                _t_y = int(_pre_anchor["title_y"])
+                _t_h = int(_pre_anchor["title_h"])
+                _t_bot = _t_y + _t_h
+                _expected_centers: dict[str, int] = {}
+                for _key, _mult in _ROW_OFFSET_MULTS.items():
+                    if _key.startswith("_"):
+                        continue
+                    _expected_centers[_key] = _t_bot + int(_t_h * (_mult - 1.0))
+                _dbg_pre.set_expected_rows(
+                    _expected_centers,
+                    half_h=max(8, int(_t_h * _ROW_HEIGHT_MULT * 0.6)),
+                )
+                _dbg_pre.set_panel_finder(
+                    top_y=_t_y,
+                    mineral_y_top=None,
+                    mineral_y_bot=None,
+                    mineral_center=None,
+                    pitch=int(_t_h * 1.4),
+                    bot_line_y=None,
+                    source="anchor_only",
+                    title_box=_get_cached_title_box(),
+                )
+            except Exception:
+                pass
+
+            # ── EARLY-DIRECT row finder ──
+            # Run label_match against a "below the title" crop. If it
+            # finds all three numeric labels (mass / resistance /
+            # instability), build label_rows directly from those
+            # observed positions and RETURN EARLY — bypassing
+            # STABILIZER, TRACKER, and PRIMARY entirely.
+            #
+            # The label_match results are DIRECT OBSERVATIONS of where
+            # the rows actually are. Going through STABILIZER's phase
+            # correlation (which carries forward a possibly-stale
+            # cold-start pose) or the calibration learner (which
+            # learns multipliers and applies them with potentially
+            # wrong scale) just adds opportunities for drift on top of
+            # this clean signal. Earlier scans showed bands ending up
+            # at default-multiplier positions even though label_match
+            # had cleanly identified all three rows — the architecture
+            # was discarding the answer it already had.
+            #
+            # Why crop below the title?
+            #   Full-frame label_match has been observed to false-match
+            #   the MASS template against pieces of "SCAN RESULTS" or
+            #   the mineral-name row ("IRON (ORE)"). Cropping to
+            #   ``[title_bottom+4, img_height]`` eliminates those.
+            #
+            # We also feed the observations into the calibration
+            # learner. Calibration is still useful for the fallback
+            # tiers (STABILIZER's _pose_to_label_rows, TRACKER's solver)
+            # when label_match itself fails — e.g. if the panel scrolls
+            # off-screen briefly and only the title is detectable.
+            #
+            # Cost: ~80-150ms for the multi-scale NCC sweep. When the
+            # EARLY-DIRECT path returns, the downstream tiers skip
+            # entirely so the total scan time goes DOWN despite this
+            # added work.
+            try:
+                from .sc_ocr import (
+                    hud_panel_tracker as _hpt_cal,
+                    label_match as _lm_cal,
+                )
+                _title_y_int = int(_pre_anchor["title_y"])
+                _title_h_int = int(_pre_anchor["title_h"])
+                _search_origin_cal = min(
+                    img.height, _title_y_int + _title_h_int + 4,
+                )
+                _early_direct_result: Optional[dict] = None
+                if (img.height - _search_origin_cal) >= 60:
+                    _below_cal = img.crop(
+                        (0, _search_origin_cal, img.width, img.height),
+                    )
+                    _cal_matches = _lm_cal.find_label_positions(_below_cal)
+                    if _cal_matches:
+                        _abs_matches: dict[str, dict] = {}
+                        for _fld in ("mass", "resistance", "instability"):
+                            _m = _cal_matches.get(_fld)
+                            if not _m:
+                                continue
+                            # Add the crop offset back so the y is
+                            # image-absolute (matches title_y's frame).
+                            _abs_matches[_fld] = {
+                                "x": int(_m["x"]),
+                                "y": int(_m["y"]) + _search_origin_cal,
+                                "w": int(_m["w"]),
+                                "h": int(_m["h"]),
+                            }
+                        # Always feed calibration; it serves the
+                        # fallback tiers when label_match fails on a
+                        # future scan.
+                        if len(_abs_matches) >= 2:
+                            _hpt_cal.observe_calibration_sample(
+                                title_y=_pre_anchor["title_y"],
+                                title_h=_pre_anchor["title_h"],
+                                label_matches=_abs_matches,
+                            )
+                            log.debug(
+                                "PRE-ANCHOR auto-cal: observed "
+                                "title=(y=%d,h=%d) labels=%s",
+                                _title_y_int, _title_h_int,
+                                {
+                                    f: (
+                                        _abs_matches[f]["y"],
+                                        _abs_matches[f]["h"],
+                                    )
+                                    for f in _abs_matches
+                                },
+                            )
+                        # Sanity-gate the (title, labels) geometry
+                        # before trusting it. ``_pre_anchor`` and the
+                        # NCC label sweep can independently latch onto
+                        # DIFFERENT scales of the same panel — most
+                        # commonly the title matches the short "SCAN"
+                        # substring (h≈17, 1× scale of the run-in word)
+                        # while the label sweep matches at the proper
+                        # 2× scale (h≈56). The label-to-title ratio
+                        # explodes (e.g. 10.8 for mass on a 2.0-7.5
+                        # bound) and the geometry is internally
+                        # inconsistent — every row band built from it
+                        # would be the wrong size.
+                        #
+                        # The calibration learner above already rejects
+                        # each field silently on this mismatch (visible
+                        # as ``calibration sample REJECT field=… ratio=…
+                        # outside bounds`` at DEBUG). We now consult the
+                        # SAME plausibility predicate to decide whether
+                        # EARLY-DIRECT can proceed at all. When it can't,
+                        # we fall through to STABILIZER/TRACKER/PRIMARY
+                        # — those tiers run their own pose validation
+                        # and can recover from a partial title detect.
+                        _cal_ok, _cal_reason = (
+                            _hpt_cal.check_calibration_consistency(
+                                title_y=_pre_anchor["title_y"],
+                                title_h=_pre_anchor["title_h"],
+                                label_matches=_abs_matches,
+                            )
+                        )
+                        # Build label_rows directly when ALL THREE
+                        # numeric labels matched — that's the
+                        # high-confidence case where we can trust the
+                        # observation. If only 2 matched we fall
+                        # through to STABILIZER/PRIMARY which can
+                        # synthesize the missing row via pitch or
+                        # colon anchors.
+                        _required = ("mass", "resistance", "instability")
+                        _have_all_labels = all(
+                            f in _abs_matches for f in _required
+                        )
+                        # ── Geometry-source selection ──
+                        # Two paths can produce a usable ``_half_h_direct``:
+                        #
+                        #   A. ``_cal_ok == True``: title-label ratios are
+                        #      in bounds. Use ``title_h * 0.5`` for the
+                        #      half-band — this is the original behavior
+                        #      and produces a band ≈ title_h tall (well
+                        #      under the 50-px oversized-crop threshold
+                        #      for typical title_h≈45 captures).
+                        #
+                        #   B. ``_cal_ok == False`` BUT label heights /
+                        #      gaps are internally consistent: title
+                        #      detector matched the wrong instance (e.g.
+                        #      the small "SCAN RESULTS" button at the
+                        #      top-right corner at 1× scale, h=17, while
+                        #      the actual labels matched at 2× scale,
+                        #      h=56). Fall back to label-derived geometry
+                        #      using ``label_h * 0.4`` (≈ what
+                        #      ``title_h * 0.5`` would give us if title
+                        #      had matched at the correct scale, since
+                        #      ``title_h ≈ label_h * 0.8`` on good
+                        #      captures).
+                        #
+                        # Path B unblocks the failure mode where STABILIZER
+                        # otherwise returns a stale-pose lock at low
+                        # phase-corr response (~0.13), positioning row
+                        # bands ~75-100 px above the real labels and
+                        # producing garbage live reads (mass='5555555',
+                        # instability='Faese', etc.) while label_match
+                        # had clean direct observations all along.
+                        _half_h_direct: Optional[int] = None
+                        _geometry_source = "none"
+                        if _have_all_labels:
+                            _label_h_list = [
+                                int(_abs_matches[f]["h"]) for f in _required
+                            ]
+                            _label_h_max = max(_label_h_list)
+                            _label_h_min = min(_label_h_list)
+                            if _cal_ok:
+                                _half_h_direct = max(
+                                    8, int(_title_h_int * 0.5),
+                                )
+                                _geometry_source = "title"
+                            else:
+                                # Independent label-consistency gate. We
+                                # require height-uniformity (within 15%),
+                                # gap-uniformity (within 30% of each
+                                # other), and gap-plausibility (≥ 0.7×
+                                # label_h, well below the typical ~1.3×
+                                # label_h HUD pitch but enough to reject
+                                # samples where two labels accidentally
+                                # collided at the same Y).
+                                _label_y_sorted = sorted(
+                                    int(_abs_matches[f]["y"])
+                                    for f in _required
+                                )
+                                _gaps = [
+                                    _label_y_sorted[i + 1]
+                                    - _label_y_sorted[i]
+                                    for i in range(2)
+                                ]
+                                _gap_max = max(_gaps)
+                                _gap_min = min(_gaps)
+                                _h_uniform = (
+                                    _label_h_max > 0
+                                    and (
+                                        _label_h_max - _label_h_min
+                                    ) / _label_h_max <= 0.15
+                                )
+                                _gap_uniform = (
+                                    _gap_max > 0
+                                    and (
+                                        _gap_max - _gap_min
+                                    ) / _gap_max <= 0.30
+                                )
+                                _gap_plausible = (
+                                    _gap_min >= int(_label_h_max * 0.7)
+                                )
+                                if (
+                                    _h_uniform
+                                    and _gap_uniform
+                                    and _gap_plausible
+                                ):
+                                    _half_h_direct = max(
+                                        8, int(_label_h_max * 0.4),
+                                    )
+                                    _geometry_source = "label-only"
+                                    log.info(
+                                        "_find_label_rows: EARLY-DIRECT "
+                                        "label-only fallback (title: %s; "
+                                        "labels are independently "
+                                        "consistent h_max=%d gaps=%s) — "
+                                        "using label_h-derived half_h=%d",
+                                        _cal_reason, _label_h_max,
+                                        _gaps, _half_h_direct,
+                                    )
+                                else:
+                                    log.info(
+                                        "_find_label_rows: EARLY-DIRECT "
+                                        "refusing geometry (title: %s; "
+                                        "label-only fallback also "
+                                        "failed: h_uniform=%s "
+                                        "gap_uniform=%s "
+                                        "gap_plausible=%s) — falling "
+                                        "through to STABILIZER/TRACKER/"
+                                        "PRIMARY",
+                                        _cal_reason, _h_uniform,
+                                        _gap_uniform, _gap_plausible,
+                                    )
+                        elif not _cal_ok:
+                            log.info(
+                                "_find_label_rows: EARLY-DIRECT "
+                                "refusing inconsistent geometry "
+                                "(%s, title=(y=%d,h=%d)) — falling "
+                                "through to STABILIZER/TRACKER/"
+                                "PRIMARY",
+                                _cal_reason,
+                                _title_y_int, _title_h_int,
+                            )
+                        if _have_all_labels and _half_h_direct is not None:
+                            # ── Row Y-bands from observed label
+                            # centers. MASS is NCC-matched; RESISTANCE
+                            # / INSTABILITY may be synthesized from the
+                            # rigid 3-row geometry. ──
+                            _row_bands: dict[
+                                str, tuple[int, int]
+                            ] = {}
+                            for _fld in _required:
+                                _m_abs = _abs_matches[_fld]
+                                _lc = (
+                                    int(_m_abs["y"])
+                                    + int(_m_abs["h"]) // 2
+                                )
+                                _y1 = max(0, _lc - _half_h_direct)
+                                _y2 = min(
+                                    img.height, _lc + _half_h_direct,
+                                )
+                                if _y2 - _y1 >= 4:
+                                    _row_bands[_fld] = (_y1, _y2)
+                            # ── Value-column X (label_right) ──
+                            # Every field's value crop starts at this
+                            # X. Derive it from where the VALUE INK
+                            # begins — never from ``label_x + label_w``
+                            # (a synthesized label's ``w`` is a full
+                            # padded template at a possibly-wrong MASS
+                            # scale; ``max(x+w)`` overshoots the digits
+                            # and the crop comes back empty).
+                            #
+                            # _scan_value_column_x locates the label→
+                            # value gap directly and is immune to the
+                            # row band slicing tall glyphs into
+                            # fragments. The three values are left-
+                            # aligned to one column, so scan every row
+                            # and take the MEDIAN — robust if one row's
+                            # label→value gap is too tight to resolve
+                            # (e.g. INSTABILITY:, the longest label,
+                            # leaves the smallest gap). _scan_label_end
+                            # _x is the fallback when no row yields a
+                            # clean label+value two-blob structure.
+                            _label_right: Optional[int] = None
+                            _value_starts: list[int] = []
+                            _label_ends: list[int] = []
+                            try:
+                                _detect_ed = (
+                                    np.array(
+                                        img.convert("RGB"),
+                                        dtype=np.uint8,
+                                    )
+                                    .max(axis=2)
+                                    .astype(np.uint8)
+                                )
+                                for _fld in _required:
+                                    _bnd = _row_bands.get(_fld)
+                                    if _bnd is None:
+                                        continue
+                                    _vs = _scan_value_column_x(
+                                        _detect_ed, _bnd[0], _bnd[1],
+                                    )
+                                    if _vs is not None:
+                                        _value_starts.append(_vs)
+                                    _le = _scan_label_end_x(
+                                        _detect_ed, _bnd[0], _bnd[1],
+                                    )
+                                    if _le is not None:
+                                        _label_ends.append(_le)
+                                if _value_starts:
+                                    # Left-aligned column — median is
+                                    # robust to one mis-resolved row.
+                                    _value_starts.sort()
+                                    _label_right = _value_starts[
+                                        len(_value_starts) // 2
+                                    ]
+                                elif _label_ends:
+                                    # No clean two-blob row; fall back
+                                    # to the rightmost label end.
+                                    _label_right = max(_label_ends)
+                            except Exception as _lr_exc:
+                                log.debug(
+                                    "EARLY-DIRECT value-column scan "
+                                    "failed: %s", _lr_exc,
+                                )
+                            if _label_right is None:
+                                # Nothing resolved — fall back to the
+                                # template-width estimate so the path
+                                # still produces a result.
+                                _label_right = max(
+                                    int(_abs_matches[f]["x"])
+                                    + int(_abs_matches[f]["w"])
+                                    for f in _required
+                                )
+                                log.debug(
+                                    "EARLY-DIRECT value-column scan "
+                                    "empty — template-width "
+                                    "fallback=%d", _label_right,
+                                )
+                            # Clamp: the value column never starts left
+                            # of 20% of the width (labels are always at
+                            # least that long) nor right of 75% (the
+                            # HUD reserves the right ~25% for values).
+                            _label_right = max(
+                                int(img.width * 0.20),
+                                min(
+                                    int(_label_right),
+                                    int(img.width * 0.75),
+                                ),
+                            )
+                            log.info(
+                                "_find_label_rows: EARLY-DIRECT "
+                                "value-column X=%d (value-starts=%s "
+                                "label-ends=%s img.width=%d)",
+                                _label_right,
+                                sorted(_value_starts),
+                                sorted(_label_ends),
+                                img.width,
+                            )
+                            _direct: dict[str, tuple[int, int, int]] = {}
+                            for _fld in _required:
+                                _bnd = _row_bands.get(_fld)
+                                if _bnd is None:
+                                    continue
+                                _direct[_fld] = (
+                                    _bnd[0], _bnd[1], _label_right,
+                                )
+                            # Mineral row sits between the title and
+                            # the mass label. In ``title`` mode we use
+                            # the detected title bottom; in ``label-
+                            # only`` mode the title position is also
+                            # suspect (it was the source of the
+                            # inconsistency), so we synthesize the
+                            # mineral-row top by stepping one label-
+                            # pitch UP from mass — same spacing the
+                            # HUD itself uses between rows.
+                            _mass_top = int(_abs_matches["mass"]["y"])
+                            if _geometry_source == "title":
+                                _mineral_y1 = max(
+                                    0,
+                                    _title_y_int + _title_h_int + 4,
+                                )
+                            else:
+                                _label_pitch = (
+                                    int(
+                                        (
+                                            int(_abs_matches[
+                                                "instability"
+                                            ]["y"])
+                                            - int(_abs_matches[
+                                                "mass"
+                                            ]["y"])
+                                        ) / 2
+                                    )
+                                )
+                                _mineral_y1 = max(
+                                    0, _mass_top - _label_pitch,
+                                )
+                            _mineral_y2 = min(img.height, _mass_top - 4)
+                            if _mineral_y2 - _mineral_y1 >= 8:
+                                _direct["_mineral_row"] = (
+                                    _mineral_y1, _mineral_y2, _label_right,
+                                )
+                            if all(f in _direct for f in _required):
+                                _early_direct_result = _direct
+
+                if (
+                    _early_direct_result is not None
+                    and _result_is_usable(_early_direct_result)
+                ):
+                    log.info(
+                        "_find_label_rows: EARLY-DIRECT returning result "
+                        "(title y=%d h=%d, used 3 label_match observations, "
+                        "skipping STABILIZER/TRACKER/PRIMARY)",
+                        _title_y_int, _title_h_int,
+                    )
+                    try:
+                        from .sc_ocr import debug_overlay as _dbg_early
+                        _mineral_band = _early_direct_result.get(
+                            "_mineral_row", (0, 0, 0),
+                        )
+                        _dbg_early.set_panel_finder(
+                            top_y=_title_y_int,
+                            mineral_y_top=_mineral_band[0] or None,
+                            mineral_y_bot=_mineral_band[1] or None,
+                            mineral_center=(
+                                (_mineral_band[0] + _mineral_band[1]) // 2
+                                if _mineral_band[0] and _mineral_band[1]
+                                else None
+                            ),
+                            pitch=int(_title_h_int * 1.4),
+                            bot_line_y=None,
+                            source="early_direct_label_match",
+                            title_box=_get_cached_title_box(),
+                        )
+                    except Exception:
+                        pass
+                    _emit_label_rows_overlay(_early_direct_result)
+                    return _early_direct_result
+            except Exception as _cal_pre_exc:  # pragma: no cover
+                log.debug(
+                    "PRE-ANCHOR EARLY-DIRECT / auto-calibration failed: %s",
+                    _cal_pre_exc,
+                )
+    except Exception as _pre_exc:
+        log.debug("pre-anchor detection failed: %s", _pre_exc)
+
+    # ── MANUAL OVERRIDE MODE ──
+    # When the user flips manual-override on for this region, every
+    # auto-detect path is bypassed. The user's drawn rectangles ARE
+    # the answer; we just translate them into the standard label_rows
+    # tuple shape so downstream OCR consumes them like any other source.
+    _region = _get_current_region()
+    if _region is not None:
+        try:
+            from .sc_ocr import calibration as _cal_mo
+            if _cal_mo.get_manual_override_mode(_region):
+                log.info(
+                    "hud: manual override mode active — bypassing auto-detect"
+                )
+                manual_rows = _build_manual_override_label_rows(
+                    _region, img.width, img.height,
+                )
+                # Telemetry: push the user's boxes into the debug overlay
+                # so the live viewer shows them just like any other
+                # detection path.
+                try:
+                    from .sc_ocr import debug_overlay as _dbg
+                    _mineral = manual_rows.get("_mineral_row")
+                    if _mineral:
+                        _dbg.set_panel_finder(
+                            top_y=None,
+                            mineral_y_top=_mineral[0],
+                            mineral_y_bot=_mineral[1],
+                            mineral_center=(_mineral[0] + _mineral[1]) // 2,
+                            pitch=None,
+                            bot_line_y=None,
+                            source="manual_override",
+                            title_box=_get_cached_title_box(),
+                        )
+                except Exception:
+                    pass
+                return manual_rows
+        except Exception as _mo_exc:
+            log.debug("manual override lookup failed: %s", _mo_exc)
+
     # ── ZEROTH: persistent calibration ──
     # If the user has saved calibration for the current region, use it
     # and skip ALL detection.
-    _region = _get_current_region()
     if _region is not None:
+        log.debug(
+            "_find_label_rows: ZEROTH (calibration) starting at %.0fms",
+            _total_elapsed_ms(),
+        )
+        _t_zeroth = time.monotonic()
         try:
             from .sc_ocr import calibration as _cal
             cal_result = _cal.to_label_rows(
@@ -1975,31 +3592,20 @@ def _find_label_rows(img: Image.Image) -> dict[str, tuple[int, int, int]]:
                 _log_calibration_state(_region, cal_result)
             except Exception:
                 pass
+            log.debug(
+                "_find_label_rows: ZEROTH completed in %.0fms (result=%s)",
+                (time.monotonic() - _t_zeroth) * 1000.0,
+                "OK" if cal_result else "empty",
+            )
             if cal_result:
-                # Push telemetry to debug overlay
+                # Push telemetry to debug overlay. The title_box was
+                # already detected at the top of this function and
+                # stashed in the per-thread cache; reuse it instead of
+                # re-running find_scan_results_anchor (which would
+                # double the anchor-detection cost on the calibration
+                # short-circuit path).
                 try:
                     from .sc_ocr import debug_overlay as _dbg
-                    # Diagnostic-only: try to also locate the SCAN
-                    # RESULTS title via NCC so the gold box is drawn
-                    # even when calibration short-circuits the
-                    # detection cascade. Lets the user visually check
-                    # whether the saved row positions agree with the
-                    # live anchor — if the gold box is high above the
-                    # cyan rows, the calibration is stale and needs
-                    # to be re-locked.
-                    _diag_title_box: Optional[tuple[int, int, int, int]] = None
-                    try:
-                        from .sc_ocr import scan_results_match as _srm_diag
-                        _diag_anchor = _srm_diag.find_scan_results_anchor(img)
-                        if _diag_anchor is not None:
-                            _diag_title_box = (
-                                int(_diag_anchor["title_x"]),
-                                int(_diag_anchor["title_y"]),
-                                int(_diag_anchor["title_w"]),
-                                int(_diag_anchor["title_h"]),
-                            )
-                    except Exception:
-                        pass
                     _dbg.set_panel_finder(
                         top_y=None,
                         mineral_y_top=cal_result.get("_mineral_row", (0, 0, 0))[0],
@@ -2008,7 +3614,7 @@ def _find_label_rows(img: Image.Image) -> dict[str, tuple[int, int, int]]:
                         pitch=None,
                         bot_line_y=None,
                         source="calibration",
-                        title_box=_diag_title_box,
+                        title_box=_get_cached_title_box(),
                     )
                 except Exception:
                     pass
@@ -2016,9 +3622,139 @@ def _find_label_rows(img: Image.Image) -> dict[str, tuple[int, int, int]]:
                     "label_rows from calibration: %s",
                     {k: v for k, v in cal_result.items()},
                 )
+                # Publish rows to debug overlay so any caller (cal_live_refresh
+                # worker, scan_hud_onnx, etc.) gets the cyan band boxes painted.
+                _emit_label_rows_overlay(cal_result)
                 return cal_result
         except Exception as exc:
             log.debug("calibration lookup failed: %s", exc)
+
+    # ── STABILIZER: phase-correlation panel tracking ──
+    # Once an absolute panel position has been established (via the
+    # rigid-body TRACKER tier below), the stabilizer caches a 256x64
+    # patch of the panel region and computes frame-to-frame motion
+    # via phase correlation of consecutive frames' patches. This is
+    # sub-millisecond per frame, structurally immune to the
+    # template-NCC false-match problem (correlation between two
+    # consecutive frames has a unique peak at the true motion vector
+    # — the panel can't be in two places at once), and accumulates
+    # smooth motion trajectories naturally.
+    #
+    # The stabilizer falls back to the rigid-body TRACKER for cold
+    # start and periodic re-anchor (every 30 frames) to correct any
+    # sub-pixel drift. A failed stabilize() call falls through to
+    # TRACKER unchanged, so this tier is strictly an optimization —
+    # never makes the system worse than the legacy behaviour.
+    log.debug(
+        "_find_label_rows: STABILIZER (phase correlation) starting at %.0fms",
+        _total_elapsed_ms(),
+    )
+    _t_stab_start = time.monotonic()
+    try:
+        stabilizer = _get_or_create_stabilizer()
+        if stabilizer is not None:
+            stab_result = stabilizer.stabilize(img)
+            _stab_elapsed = (
+                time.monotonic() - _t_stab_start
+            ) * 1000.0
+            _stab_usable = _result_is_usable(stab_result)
+            log.debug(
+                "_find_label_rows: STABILIZER completed in %.0fms "
+                "(locked=%s pose=%s result=%s)",
+                _stab_elapsed,
+                stabilizer.is_locked,
+                stabilizer.pose,
+                "OK" if _stab_usable else "empty",
+            )
+            if _stab_usable:
+                log.info(
+                    "_find_label_rows: STABILIZER returned lock "
+                    "(pose=%s total elapsed=%.0fms)",
+                    stabilizer.pose, _total_elapsed_ms(),
+                )
+                _emit_label_rows_overlay(stab_result)
+                return stab_result
+            # Surface the failure reason at WARNING level. This logger
+            # (onnx_hud_reader) is already in the debug-viewer whitelist
+            # so the user sees it regardless of how hud_panel_stabilizer
+            # is configured. Critical for diagnosing why the lock isn't
+            # holding.
+            _stab_reason = getattr(stabilizer, "last_failure_reason", None)
+            if _stab_reason:
+                log.warning(
+                    "_find_label_rows: STABILIZER did not lock — %s",
+                    _stab_reason,
+                )
+    except Exception as _stab_exc:
+        log.warning(
+            "HudPanelStabilizer tier raised exception: %s",
+            _stab_exc, exc_info=True,
+        )
+
+    # ── TRACKER: rigid-body panel pose ──
+    # The HUD panel is a rigid body that moves predictably (≤30 px
+    # between frames in normal gameplay). A frame-by-frame tracker
+    # solves for (panel_x, panel_y, scale) from a pool of anchor
+    # measurements and re-uses the previous frame's pose to do local
+    # search in the next, eliminating the cross-frame jitter that the
+    # prior full-image-search pipeline produced.
+    #
+    # On cold start (no prior pose) the tracker falls back to full-
+    # frame anchor search internally. If it can't establish a lock —
+    # too few anchors, residuals too high, or a velocity violation —
+    # it returns None and the existing PRIMARY/SECONDARY/.../TESSERACT
+    # fallback tiers below run unchanged. This is a strict opt-in
+    # layer: a failed tracker call never makes the system worse than
+    # the legacy behaviour.
+    #
+    # Note: when STABILIZER above succeeds, this tier is skipped
+    # (early return). When STABILIZER fails (cold-start, lost lock),
+    # it internally invokes this TRACKER to re-acquire — so the
+    # tracker tier here mainly serves as a backup when STABILIZER
+    # itself is unavailable / disabled.
+    log.debug(
+        "_find_label_rows: TRACKER (rigid-body pose) starting at %.0fms",
+        _total_elapsed_ms(),
+    )
+    _t_tracker_start = time.monotonic()
+    try:
+        tracker = _get_or_create_tracker()
+        if tracker is not None:
+            tracker_result = tracker.track(img)
+            _tracker_elapsed = (
+                time.monotonic() - _t_tracker_start
+            ) * 1000.0
+            _tracker_usable = _result_is_usable(tracker_result)
+            log.debug(
+                "_find_label_rows: TRACKER completed in %.0fms "
+                "(locked=%s pose=%s result=%s)",
+                _tracker_elapsed,
+                tracker.is_locked,
+                tracker.last_pose,
+                "OK" if _tracker_usable else "empty",
+            )
+            if _tracker_usable:
+                log.info(
+                    "_find_label_rows: TRACKER returned lock "
+                    "(pose=%s total elapsed=%.0fms)",
+                    tracker.last_pose, _total_elapsed_ms(),
+                )
+                _emit_label_rows_overlay(tracker_result)
+                return tracker_result
+            # Surface the failure reason at WARNING level so the user
+            # can see WHY the lock isn't holding regardless of any
+            # debug-viewer logger whitelist filtering.
+            _tracker_reason = getattr(tracker, "last_failure_reason", None)
+            if _tracker_reason:
+                log.warning(
+                    "_find_label_rows: TRACKER did not lock — %s",
+                    _tracker_reason,
+                )
+    except Exception as _tracker_exc:
+        log.warning(
+            "HudPanelTracker tier raised exception: %s",
+            _tracker_exc, exc_info=True,
+        )
 
     # ── PRIMARY: SCAN RESULTS title anchor ──
     # The "SCAN RESULTS" title is the most stable feature of the rock-
@@ -2035,40 +3771,107 @@ def _find_label_rows(img: Image.Image) -> dict[str, tuple[int, int, int]]:
     # that NCC-correlate against MASS/RESIST/INSTAB templates and
     # produce convincing-but-wrong row positions).
     #
-    # Cache the anchor for 5 s per (image-size) so we only pay the
-    # Tesseract cost when the panel first appears or after a position
-    # shift. Re-detection on cache expiry handles slow drift; abrupt
-    # position changes are caught by the row-validation step
-    # downstream (a wildly mis-aligned anchor produces no readable
-    # values, which clears the lock cache and re-detects).
+    # Cache the anchor for 1 s per (image-size) — shortened from 5 s.
+    # The original 5-s TTL was sized for the Tesseract anchor path
+    # (200-500 ms per call); the NCC path is ~5 ms so cross-scan
+    # caching saves little. More importantly, the longer TTL FROZE the
+    # anchor through cross-frame jitter, and the cache-expiry boundary
+    # then surfaced as a 10-25 px JUMP every 5 seconds in production
+    # logs (see scan_results_match._smooth_anchor). With a 1-s TTL the
+    # anchor tracker in scan_results_match sees nearly every scan and
+    # smooths frame-to-frame jitter EMA-style instead of hiding it
+    # behind a stale-cache freeze. The tracker also handles the slow-
+    # drift / panel-disappear cases that the long TTL used to absorb.
+    log.debug(
+        "_find_label_rows: PRIMARY (SCAN RESULTS anchor) starting at %.0fms",
+        _total_elapsed_ms(),
+    )
+    _t_primary_start = time.monotonic()
     try:
         import time as _t_anchor
         _anchor_key = (img.width, img.height)
         _now = _t_anchor.monotonic()
         _cached = _scan_results_anchor_cache.get(_anchor_key)
         anchor: Optional[dict] = None
-        if _cached is not None and (_now - _cached[0]) < 5.0:
+        if _cached is not None and (_now - _cached[0]) < 1.0:
             anchor = _cached[1]
+            log.debug(
+                "_find_label_rows: PRIMARY cache HIT for key=%s",
+                _anchor_key,
+            )
         else:
             # Try NCC anchor first (template-based, ~5 ms, tilt-tolerant).
             # Fall through to Tesseract if the NCC template is missing
             # or no scale crosses the confidence threshold.
             try:
+                _t_ncc_anchor = time.monotonic()
                 from .sc_ocr import scan_results_match as _srm
                 anchor = _srm.find_scan_results_anchor(img)
+                log.debug(
+                    "_find_label_rows: PRIMARY NCC anchor took %.0fms "
+                    "(result=%s)",
+                    (time.monotonic() - _t_ncc_anchor) * 1000.0,
+                    "OK" if anchor is not None else "None",
+                )
             except Exception as _srm_exc:
                 log.debug(
                     "scan_results_match unavailable, falling back to "
                     "Tesseract anchor: %s", _srm_exc,
                 )
                 anchor = None
-            if anchor is None:
+            # Skip the slow Tesseract anchor fallback when we're
+            # already over budget — the next path will pick up.
+            if anchor is None and (
+                (time.monotonic() - _t_primary_start) * 1000.0
+                < _BUDGET_PRIMARY_MS - 1000
+            ):
+                _t_tess_anchor = time.monotonic()
                 anchor = _find_scan_results_anchor(img)
+                log.debug(
+                    "_find_label_rows: PRIMARY Tesseract anchor took %.0fms "
+                    "(result=%s)",
+                    (time.monotonic() - _t_tess_anchor) * 1000.0,
+                    "OK" if anchor is not None else "None",
+                )
             if anchor is not None:
                 _scan_results_anchor_cache[_anchor_key] = (_now, anchor)
         if anchor is not None:
+            # Refresh the cached title_box if the anchor we just found
+            # disagrees with what the pre-anchor pass produced (different
+            # detection variant).
+            _set_cached_title_box((
+                int(anchor["title_x"]),
+                int(anchor["title_y"]),
+                int(anchor["title_w"]),
+                int(anchor["title_h"]),
+            ))
+            # ────────────────────────────────────────────────────────────
+            # RESULT-FIRST ORDERING (the key fix):
+            # Run the anchor-driven row finder, and if it produces a
+            # usable result, RETURN IT regardless of how long the work
+            # took. Budget exhaustion only blocks the NEXT path, never
+            # discards a completed dict. The previous code did the
+            # opposite — and the user's logs showed legit ~50 s scans
+            # that produced all 3 rows getting thrown away because the
+            # budget had elapsed by the time the result was ready.
+            # ────────────────────────────────────────────────────────────
             anchor_result = _label_rows_from_anchor(img, anchor)
-            if anchor_result:
+            _primary_path_elapsed = (
+                time.monotonic() - _t_primary_start
+            ) * 1000.0
+            log.debug(
+                "_find_label_rows: PRIMARY completed in %.0fms (result=%s)",
+                _primary_path_elapsed,
+                "OK" if _result_is_usable(anchor_result) else "empty",
+            )
+            if _primary_path_elapsed > _BUDGET_PRIMARY_MS:
+                log.warning(
+                    "_find_label_rows: PRIMARY exceeded %dms budget "
+                    "(took %.0fms) — but result will still be returned "
+                    "if usable",
+                    _BUDGET_PRIMARY_MS, _primary_path_elapsed,
+                )
+            if _result_is_usable(anchor_result):
                 # Push telemetry to the debug overlay so the panel
                 # finder shows where SCAN RESULTS was located.
                 try:
@@ -2096,26 +3899,35 @@ def _find_label_rows(img: Image.Image) -> dict[str, tuple[int, int, int]]:
                         pitch=_measured_pitch,
                         bot_line_y=None,
                         source="scan_results_anchor",
-                        title_box=(
-                            int(anchor["title_x"]),
-                            int(anchor["title_y"]),
-                            int(anchor["title_w"]),
-                            int(anchor["title_h"]),
-                        ),
+                        title_box=_get_cached_title_box(),
                     )
                 except Exception:
                     pass
-                log.debug(
-                    "label_rows from SCAN RESULTS anchor "
-                    "(title @ x=%d y=%d w=%d h=%d): %s",
+                log.info(
+                    "_find_label_rows: PRIMARY returning result "
+                    "(title @ x=%d y=%d w=%d h=%d, total elapsed=%.0fms)",
                     anchor["title_x"], anchor["title_y"],
                     anchor["title_w"], anchor["title_h"],
-                    {k: v for k, v in anchor_result.items()
-                     if not k.startswith("_")},
+                    _total_elapsed_ms(),
                 )
+                # Publish rows to debug overlay so any caller (cal_live_refresh
+                # worker, scan_hud_onnx, etc.) gets the cyan band boxes painted.
+                _emit_label_rows_overlay(anchor_result)
                 return anchor_result
     except Exception as exc:
         log.debug("SCAN RESULTS anchor path failed: %s", exc)
+
+    # Budget gate: only blocks the NEXT path. If PRIMARY produced a
+    # result we already returned above — this gate never throws away
+    # successful work.
+    if _total_budget_exhausted():
+        log.warning(
+            "_find_label_rows: total %dms budget exhausted after PRIMARY — "
+            "skipping remaining fallbacks (elapsed=%.0fms)",
+            _BUDGET_TOTAL_MS, _total_elapsed_ms(),
+        )
+        _emit_anchor_only_overlay()
+        return {}
 
     # ── SECONDARY: NCC label template matching ──
     # Concrete per-row pixel positions from matching the rendered
@@ -2123,27 +3935,130 @@ def _find_label_rows(img: Image.Image) -> dict[str, tuple[int, int, int]]:
     # panel image. No geometry inference, no Tesseract subprocess —
     # just NumPy correlation against canonicalized templates.
     # Cached per region in the caller.
+    log.debug(
+        "_find_label_rows: SECONDARY (NCC labels) starting at %.0fms",
+        _total_elapsed_ms(),
+    )
+    _t_secondary_start = time.monotonic()
     ncc_result = _find_label_rows_by_ncc(img)
-    if ncc_result:
+    _secondary_elapsed = (time.monotonic() - _t_secondary_start) * 1000.0
+    log.debug(
+        "_find_label_rows: SECONDARY completed in %.0fms (result=%s)",
+        _secondary_elapsed,
+        "OK" if _result_is_usable(ncc_result) else "empty",
+    )
+    if _secondary_elapsed > _BUDGET_SECONDARY_MS:
+        log.warning(
+            "_find_label_rows: SECONDARY exceeded %dms budget "
+            "(took %.0fms) — but result will still be returned if usable",
+            _BUDGET_SECONDARY_MS, _secondary_elapsed,
+        )
+    # Result-first: a usable SECONDARY result is returned regardless of
+    # budget. The budget only governs the next-path gate below.
+    if _result_is_usable(ncc_result):
+        # Publish rows to debug overlay so any caller (cal_live_refresh
+        # worker, scan_hud_onnx, etc.) gets the cyan band boxes painted.
+        _emit_label_rows_overlay(ncc_result)
         return ncc_result
 
+    if _total_budget_exhausted():
+        log.warning(
+            "_find_label_rows: total %dms budget exhausted after SECONDARY — "
+            "skipping remaining fallbacks (elapsed=%.0fms)",
+            _BUDGET_TOTAL_MS, _total_elapsed_ms(),
+        )
+        _emit_anchor_only_overlay()
+        return {}
+
     # ── TERTIARY: position-based finder (5-band scan from actual text) ──
+    log.debug(
+        "_find_label_rows: TERTIARY (position bands) starting at %.0fms",
+        _total_elapsed_ms(),
+    )
+    _t_tertiary_start = time.monotonic()
     pos_result = _find_label_rows_by_position(img)
-    if pos_result:
+    _tertiary_elapsed = (time.monotonic() - _t_tertiary_start) * 1000.0
+    log.debug(
+        "_find_label_rows: TERTIARY completed in %.0fms (result=%s)",
+        _tertiary_elapsed,
+        "OK" if _result_is_usable(pos_result) else "empty",
+    )
+    if _tertiary_elapsed > _BUDGET_TERTIARY_MS:
+        log.warning(
+            "_find_label_rows: TERTIARY exceeded %dms budget "
+            "(took %.0fms) — but result will still be returned if usable",
+            _BUDGET_TERTIARY_MS, _tertiary_elapsed,
+        )
+    if _result_is_usable(pos_result):
+        # Publish rows to debug overlay so any caller (cal_live_refresh
+        # worker, scan_hud_onnx, etc.) gets the cyan band boxes painted.
+        _emit_label_rows_overlay(pos_result)
         return pos_result
 
+    if _total_budget_exhausted():
+        log.warning(
+            "_find_label_rows: total %dms budget exhausted after TERTIARY — "
+            "skipping remaining fallbacks (elapsed=%.0fms)",
+            _BUDGET_TOTAL_MS, _total_elapsed_ms(),
+        )
+        _emit_anchor_only_overlay()
+        return {}
+
     # ── QUATERNARY: HUD-line-bracketed grid + fixed fractions ──
+    log.debug(
+        "_find_label_rows: QUATERNARY (HUD grid) starting at %.0fms",
+        _total_elapsed_ms(),
+    )
+    _t_quaternary_start = time.monotonic()
     grid_result = _find_label_rows_by_hud_grid(img)
-    if grid_result:
+    _quaternary_elapsed = (time.monotonic() - _t_quaternary_start) * 1000.0
+    log.debug(
+        "_find_label_rows: QUATERNARY completed in %.0fms (result=%s)",
+        _quaternary_elapsed,
+        "OK" if _result_is_usable(grid_result) else "empty",
+    )
+    if _quaternary_elapsed > _BUDGET_QUATERNARY_MS:
+        log.warning(
+            "_find_label_rows: QUATERNARY exceeded %dms budget "
+            "(took %.0fms) — but result will still be returned if usable",
+            _BUDGET_QUATERNARY_MS, _quaternary_elapsed,
+        )
+    if _result_is_usable(grid_result):
+        # Publish rows to debug overlay so any caller (cal_live_refresh
+        # worker, scan_hud_onnx, etc.) gets the cyan band boxes painted.
+        _emit_label_rows_overlay(grid_result)
         return grid_result
 
+    if _total_budget_exhausted():
+        log.warning(
+            "_find_label_rows: total %dms budget exhausted after QUATERNARY — "
+            "skipping Tesseract fallback (elapsed=%.0fms)",
+            _BUDGET_TOTAL_MS, _total_elapsed_ms(),
+        )
+        _emit_anchor_only_overlay()
+        return {}
+
     # ── Tesseract per-label fallback (deepest) ──
+    log.debug(
+        "_find_label_rows: TESSERACT (per-label fallback) starting at %.0fms",
+        _total_elapsed_ms(),
+    )
     if not _check_tesseract():
+        _emit_anchor_only_overlay()
         return {}
     try:
         import pytesseract
     except ImportError:
+        _emit_anchor_only_overlay()
         return {}
+
+    _t_tess_start = time.monotonic()
+    # pytesseract's timeout= kwarg is enforced via SIGTERM on the
+    # tesseract child process. Pass our per-label budget (in seconds)
+    # so a hung subprocess can't block the caller for tens of seconds.
+    # Add a 1-second safety margin so the python-side timeout fires
+    # AFTER any pytesseract-internal timeout, not before.
+    _TESS_LABEL_TIMEOUT_S = max(1, _BUDGET_TESS_PER_LABEL_MS // 1000)
 
     w_img, h_img = img.size
     left = img.crop((0, 0, int(w_img * 0.55), h_img))
@@ -2182,6 +4097,25 @@ def _find_label_rows(img: Image.Image) -> dict[str, tuple[int, int, int]]:
 
     best: dict[str, tuple[int, int, int, int]] = {}  # key -> (y1,y2,lbl_left,score)
     for _name, binary in candidates:
+        # Per-label budget cap: each Tesseract invocation can spawn a
+        # subprocess that occasionally hangs for tens of seconds. If we
+        # blow the per-label budget OR the total budget while inside
+        # this loop, abandon any remaining variants and use whatever
+        # we already collected.
+        if (time.monotonic() - _t_tess_start) * 1000.0 > _BUDGET_TESS_PER_LABEL_MS:
+            log.warning(
+                "_find_label_rows: TESSERACT exceeded %dms per-label budget "
+                "— moving on (variants tried before abort)",
+                _BUDGET_TESS_PER_LABEL_MS,
+            )
+            break
+        if _total_budget_exhausted():
+            log.warning(
+                "_find_label_rows: total %dms budget exhausted inside "
+                "Tesseract loop — aborting (elapsed=%.0fms)",
+                _BUDGET_TOTAL_MS, _total_elapsed_ms(),
+            )
+            break
         binary_pil = Image.fromarray(binary)
         try:
             data = pytesseract.image_to_data(
@@ -2191,6 +4125,7 @@ def _find_label_rows(img: Image.Image) -> dict[str, tuple[int, int, int]]:
                     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz:"
                 ),
                 output_type=pytesseract.Output.DICT,
+                timeout=_TESS_LABEL_TIMEOUT_S,
             )
         except Exception:
             continue
@@ -2216,6 +4151,7 @@ def _find_label_rows(img: Image.Image) -> dict[str, tuple[int, int, int]]:
                     break
 
     if not best:
+        _emit_anchor_only_overlay()
         return {}
 
     # ─── Anchor-based row reconciliation ───
@@ -2337,6 +4273,7 @@ def _find_label_rows(img: Image.Image) -> dict[str, tuple[int, int, int]]:
         # All rows were rejected as outliers — return empty so the
         # caller falls back to mineral-row offset estimation.
         log.debug("onnx_hud_reader: all rows rejected as outliers")
+        _emit_anchor_only_overlay()
         return {}
 
     anchor_y, anchor_y2, anchor_left, _ = best[anchor_key]

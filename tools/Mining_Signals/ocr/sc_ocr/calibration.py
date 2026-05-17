@@ -53,11 +53,28 @@ SCHEMA_VERSION = 1
 # Field names recognized by the calibration system. Order matters for
 # UI display; "_mineral_row" is optional and prefixed underscore so
 # downstream code that iterates label_rows for value OCR skips it.
+#
+# "signature" is the signature-scanner digit cluster (4-5 digit signal
+# value). It lives in a SEPARATE on-screen region from the HUD label
+# rows (the dialog stores it under the ocr_region key, not the
+# hud_region key), so it never collides with HUD iteration even when
+# the user has both regions calibrated. HUD-OCR loops in
+# ``onnx_hud_reader`` / ``sc_ocr.api`` / ``debug_overlay`` are
+# hardcoded to ``("mass","resistance","instability")`` rather than
+# iterating FIELD_NAMES, so adding it here doesn't leak into HUD code.
 FIELD_NAMES: tuple[str, ...] = (
     "_mineral_row",
     "mass",
     "resistance",
     "instability",
+    "signature",
+    # ``needle`` calibrates the EASY/MEDIUM/HARD/EXTREME/IMPOSSIBLE
+    # difficulty bar at the bottom of the SCAN RESULTS panel. Stored
+    # alongside HUD rows under the HUD region key. ``to_label_rows``
+    # below skips it (HUD value-OCR loop only iterates mass/resistance/
+    # instability — same reason it skips ``signature``); the difficulty
+    # detector in ``api.scan_hud_onnx`` reads it via ``get_row`` directly.
+    "needle",
 )
 
 # Field names that are user-facing (drop the underscore prefix).
@@ -66,6 +83,8 @@ DISPLAY_NAMES: dict[str, str] = {
     "mass":          "Mass",
     "resistance":    "Resistance",
     "instability":   "Instability",
+    "signature":     "Signature / Signal Value",
+    "needle":        "Needle (difficulty)",
 }
 
 
@@ -79,30 +98,129 @@ def _region_key(region: dict) -> str:
     )
 
 
+# ── mtime-keyed cache ──
+# Public callers (``_find_label_rows`` runs ``to_label_rows`` once per
+# scan, plus ``get_row`` for each locked field — typically 4-5 calls per
+# scan tick) used to re-parse calibration.json on every invocation.
+# That's ~1-5 ms of wasted JSON work per scan. Cache the parsed dict
+# keyed on the file's mtime so the first call per scan parses, and the
+# remaining calls hit memory.
+#
+# Invalidation is automatic: every ``save_row`` / ``remove_row`` /
+# ``clear_region`` writes the file via ``_save_all``, which bumps mtime,
+# which the next ``_load_all`` notices. This means a Lock-click in the
+# Calibration Dialog is observed by the very next scan tick — no need
+# to manually clear the cache from the save path. mtime granularity on
+# Windows NTFS is 100 ns; on most filesystems it's >= 1 ms — both far
+# finer than typical scan-tick spacing (100 ms+), so we won't miss a
+# write even if save and load happen back-to-back.
+_CACHED_DATA: Optional[dict] = None
+_CACHED_MTIME_NS: Optional[int] = None
+
+
+def _file_mtime_ns() -> Optional[int]:
+    """Return current mtime_ns of the calibration file, or None if it
+    doesn't exist (or stat fails for any reason)."""
+    try:
+        return CALIBRATION_PATH.stat().st_mtime_ns
+    except (OSError, FileNotFoundError):
+        return None
+
+
 def _load_all() -> dict:
     """Read the whole calibration file. Returns an empty schema if
-    the file doesn't exist or is corrupt."""
-    if not CALIBRATION_PATH.is_file():
+    the file doesn't exist or is corrupt.
+
+    mtime-keyed cache: returns the previously-parsed dict when the
+    file's mtime hasn't changed since last read. The cached dict is
+    returned by reference, so callers MUST NOT mutate it in place —
+    use ``copy.deepcopy`` if mutation is needed (the only mutating
+    callers are ``save_row`` / ``remove_row`` / ``clear_region``,
+    which each call ``_save_all`` to rewrite the file, and that
+    naturally invalidates the cache for everyone else).
+    """
+    global _CACHED_DATA, _CACHED_MTIME_NS
+
+    cur_mtime = _file_mtime_ns()
+
+    # Cache miss case 1: file doesn't exist (or stat failed).
+    if cur_mtime is None:
+        # If it disappeared since the last cached read, drop the cache.
+        if _CACHED_MTIME_NS is not None:
+            log.debug(
+                "calibration: file gone (was mtime_ns=%s) — clearing cache",
+                _CACHED_MTIME_NS,
+            )
+            _CACHED_DATA = None
+            _CACHED_MTIME_NS = None
         return {"version": SCHEMA_VERSION, "calibrations": {}}
+
+    # Cache hit: same mtime as the in-memory snapshot.
+    if (
+        _CACHED_DATA is not None
+        and _CACHED_MTIME_NS is not None
+        and cur_mtime == _CACHED_MTIME_NS
+    ):
+        return _CACHED_DATA
+
+    # Cache miss case 2: file exists but mtime has advanced (or this
+    # is the first read). Parse and cache.
     try:
         data = json.loads(CALIBRATION_PATH.read_text(encoding="utf-8"))
         if not isinstance(data, dict):
             raise ValueError("not a dict")
         data.setdefault("version", SCHEMA_VERSION)
         data.setdefault("calibrations", {})
+        _CACHED_DATA = data
+        _CACHED_MTIME_NS = cur_mtime
+        # One-line debug breadcrumb so users / devs can see in logs
+        # whether a freshly-saved Lock landed on disk and was picked
+        # up. Sample (logged once per write):
+        #   calibration: re-loaded mtime_ns=1733... regions=2 keys=['1920,...']
+        try:
+            _regions = sorted((data.get("calibrations") or {}).keys())
+            log.debug(
+                "calibration: re-loaded mtime_ns=%s regions=%d keys=%s",
+                cur_mtime, len(_regions), _regions,
+            )
+        except Exception:
+            pass
         return data
     except Exception as exc:
         log.warning("calibration.json load failed: %s — using empty schema", exc)
-        return {"version": SCHEMA_VERSION, "calibrations": {}}
+        # Don't poison the cache with the empty fallback — leave the
+        # previous good snapshot in place if we have one. Only clear
+        # if we've never read successfully.
+        if _CACHED_DATA is None:
+            return {"version": SCHEMA_VERSION, "calibrations": {}}
+        return _CACHED_DATA
 
 
 def _save_all(data: dict) -> None:
-    """Atomic write of the calibration file (tmp + rename)."""
+    """Atomic write of the calibration file (tmp + rename).
+
+    On success, refresh the cache directly so the very next ``_load_all``
+    call sees this exact dict without re-reading from disk. mtime-based
+    invalidation alone would also work (the rename bumps mtime, the next
+    read parses the file again), but populating the cache here avoids
+    one redundant parse and removes any race with mtime granularity on
+    exotic filesystems where mtime updates lag the rename.
+    """
+    global _CACHED_DATA, _CACHED_MTIME_NS
     try:
         CALIBRATION_DIR.mkdir(parents=True, exist_ok=True)
         tmp = CALIBRATION_PATH.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
         os.replace(tmp, CALIBRATION_PATH)
+        # Refresh cache with the just-written dict + its new mtime.
+        try:
+            _CACHED_DATA = data
+            _CACHED_MTIME_NS = _file_mtime_ns()
+        except Exception:
+            # If stat fails after a successful write, just clear the
+            # cache so the next read does a fresh parse.
+            _CACHED_DATA = None
+            _CACHED_MTIME_NS = None
     except Exception as exc:
         log.warning("calibration.json write failed: %s", exc)
 
@@ -307,6 +425,225 @@ def clear_region(region: dict) -> None:
     _save_all(data)
 
 
+# ── Reserved per-region keys (v2.2.6.1) ──
+# Inside ``data["calibrations"][region_key]`` we add three new keys
+# under a ``$`` prefix so the existing ``FIELD_NAMES`` iteration in
+# ``to_label_rows`` skips them naturally (FIELD_NAMES is a hardcoded
+# tuple — anything not in it is invisible to the value-OCR loop):
+#
+#   $column_x_offset      : int  — global x-shift applied to every
+#                                  HUD row's x_value_start. Lets the
+#                                  user nudge ALL three rows (mass /
+#                                  resistance / instability) at once
+#                                  because they share a column. Default 0.
+#   $manual_override_mode : bool — when True, the pipeline bypasses
+#                                  ALL auto-detection (label_match,
+#                                  scan_results_anchor, NCC, …) and
+#                                  uses ONLY the user-drawn boxes
+#                                  stored in $manual_overrides.
+#                                  Default False.
+#   $manual_overrides     : dict — field name → ``{x, y, w, h}`` dict
+#                                  in HUD-region-relative coords.
+#                                  Used only when
+#                                  $manual_override_mode is True.
+#                                  Default {}.
+#
+# These coexist alongside the existing per-region keys (``rows``,
+# ``saved_at``, ``image_size``, ``value_column_left``) without
+# collision because ``$`` is reserved here and never appears in
+# FIELD_NAMES.
+
+_KEY_COLUMN_X_OFFSET = "$column_x_offset"
+_KEY_MANUAL_OVERRIDE_MODE = "$manual_override_mode"
+_KEY_MANUAL_OVERRIDES = "$manual_overrides"
+
+
+def _ensure_entry(data: dict, region: dict) -> dict:
+    """Return the per-region entry, creating it if missing.
+    Mutates ``data`` in place and returns the entry dict so the
+    caller can set keys on it before calling ``_save_all``.
+    """
+    key = _region_key(region)
+    entry = data["calibrations"].get(key)
+    if entry is None:
+        entry = {
+            "saved_at": datetime.utcnow().isoformat(timespec="seconds"),
+            "rows": {},
+        }
+        data["calibrations"][key] = entry
+    if "rows" not in entry or not isinstance(entry.get("rows"), dict):
+        entry["rows"] = {}
+    return entry
+
+
+def get_column_x_offset(region: dict) -> int:
+    """Return the column x offset for this region (default 0).
+
+    Applied to every HUD row's ``x_value_start`` at scan time. Use
+    this to shift mass / resistance / instability value-crops left or
+    right together (they share a vertical column on the SC HUD, so a
+    single global delta keeps them aligned).
+    """
+    cal = load(region)
+    if not cal:
+        return 0
+    try:
+        return int(cal.get(_KEY_COLUMN_X_OFFSET, 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def set_column_x_offset(region: dict, val: int) -> None:
+    """Persist the column x offset for this region.
+
+    See ``get_column_x_offset`` for semantics.
+    """
+    data = _load_all()
+    # _load_all may return the cached dict by reference — copy before
+    # mutating so we don't poison the cache for parallel readers.
+    import copy as _copy
+    data = _copy.deepcopy(data)
+    entry = _ensure_entry(data, region)
+    try:
+        entry[_KEY_COLUMN_X_OFFSET] = int(val)
+    except (TypeError, ValueError):
+        log.warning("set_column_x_offset: bad value %r — ignored", val)
+        return
+    entry["saved_at"] = datetime.utcnow().isoformat(timespec="seconds")
+    _save_all(data)
+    log.info(
+        "calibration: column_x_offset=%d region=%s",
+        int(val), _region_key(region),
+    )
+
+
+def get_manual_override_mode(region: dict) -> bool:
+    """Return whether this region is in manual-override mode (default False).
+
+    When True, the OCR pipeline skips ALL auto-detection (NCC label
+    matching, scan-results anchor, signal-icon anchor) and uses only
+    the user's manually-drawn boxes from ``$manual_overrides``.
+    """
+    cal = load(region)
+    if not cal:
+        return False
+    return bool(cal.get(_KEY_MANUAL_OVERRIDE_MODE, False))
+
+
+def set_manual_override_mode(region: dict, val: bool) -> None:
+    """Toggle manual-override mode for this region.
+
+    See ``get_manual_override_mode`` for semantics.
+    """
+    data = _load_all()
+    import copy as _copy
+    data = _copy.deepcopy(data)
+    entry = _ensure_entry(data, region)
+    entry[_KEY_MANUAL_OVERRIDE_MODE] = bool(val)
+    entry["saved_at"] = datetime.utcnow().isoformat(timespec="seconds")
+    _save_all(data)
+    log.info(
+        "calibration: manual_override_mode=%s region=%s",
+        bool(val), _region_key(region),
+    )
+
+
+def get_manual_override_box(region: dict, field: str) -> Optional[dict]:
+    """Return the manual rectangle for ``field`` in override mode, or None.
+
+    Box shape is ``{"x": int, "y": int, "w": int, "h": int}`` in
+    HUD-region-relative coords (same convention as the saved
+    ``rows`` boxes). Returns None when the field has no manual
+    override stored.
+    """
+    cal = load(region)
+    if not cal:
+        return None
+    overrides = cal.get(_KEY_MANUAL_OVERRIDES) or {}
+    if not isinstance(overrides, dict):
+        return None
+    box = overrides.get(field)
+    if not isinstance(box, dict):
+        return None
+    # Defensive copy so callers can't mutate the cached dict.
+    try:
+        return {
+            "x": int(box["x"]),
+            "y": int(box["y"]),
+            "w": int(box["w"]),
+            "h": int(box["h"]),
+        }
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def set_manual_override_box(
+    region: dict, field: str, box: dict,
+) -> None:
+    """Store a manual rectangle for ``field``.
+
+    ``box`` is ``{"x": int, "y": int, "w": int, "h": int}`` in
+    HUD-region-relative coords. Used only when
+    ``$manual_override_mode`` is True for this region.
+
+    Unlike ``save_row``, this DOES NOT validate ``field`` against
+    ``FIELD_NAMES`` — manual overrides intentionally accept any
+    string the UI passes, including the HUD's
+    ``mass`` / ``resistance`` / ``instability`` and the signal-region's
+    ``signature``. The pipeline only consumes the field names it
+    knows about.
+    """
+    data = _load_all()
+    import copy as _copy
+    data = _copy.deepcopy(data)
+    entry = _ensure_entry(data, region)
+    overrides = entry.get(_KEY_MANUAL_OVERRIDES)
+    if not isinstance(overrides, dict):
+        overrides = {}
+        entry[_KEY_MANUAL_OVERRIDES] = overrides
+    try:
+        overrides[field] = {
+            "x": int(box["x"]),
+            "y": int(box["y"]),
+            "w": int(box["w"]),
+            "h": int(box["h"]),
+        }
+    except (KeyError, TypeError, ValueError) as exc:
+        log.warning(
+            "set_manual_override_box: bad box %r for field=%s (%s) — ignored",
+            box, field, exc,
+        )
+        return
+    entry["saved_at"] = datetime.utcnow().isoformat(timespec="seconds")
+    _save_all(data)
+    log.info(
+        "calibration: manual_override_box field=%s box=%s region=%s",
+        field, overrides[field], _region_key(region),
+    )
+
+
+def clear_manual_overrides(region: dict) -> None:
+    """Wipe all manual overrides for this region (returns to auto-detect).
+
+    Removes BOTH the per-field box dict and the override-mode flag
+    so the pipeline reverts cleanly to its auto-detect behaviour.
+    """
+    data = _load_all()
+    import copy as _copy
+    data = _copy.deepcopy(data)
+    key = _region_key(region)
+    entry = data["calibrations"].get(key)
+    if entry is None:
+        return
+    entry.pop(_KEY_MANUAL_OVERRIDES, None)
+    entry.pop(_KEY_MANUAL_OVERRIDE_MODE, None)
+    entry["saved_at"] = datetime.utcnow().isoformat(timespec="seconds")
+    _save_all(data)
+    log.info(
+        "calibration: cleared manual overrides region=%s", key,
+    )
+
+
 def to_label_rows(
     region: dict, image_w: int, image_h: int,
     img: "Optional[object]" = None,
@@ -439,6 +776,19 @@ def to_label_rows(
 
     result: dict[str, tuple[int, int, int]] = {}
     for field in FIELD_NAMES:
+        # ``signature`` is the signal-scanner digit-cluster crop, NOT a
+        # HUD label row. It's stored under the ocr_region key (not the
+        # hud_region key), but defend against the degenerate case where
+        # both regions point at the same coordinates: silently dropping
+        # it here keeps the HUD value-OCR loop from ever seeing it.
+        if field == "signature":
+            continue
+        # ``needle`` (difficulty bar) is HUD-region-keyed but NOT a
+        # value-OCR row — the difficulty detector in
+        # ``api.scan_hud_onnx`` reads ``get_row(region, "needle")``
+        # directly. Drop it here so the HUD value-OCR loop never sees it.
+        if field == "needle":
+            continue
         if field not in rows:
             continue
         b = rows[field]

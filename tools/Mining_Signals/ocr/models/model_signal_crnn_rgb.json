@@ -1,0 +1,16 @@
+{
+  "schema": "crnn_rgb_v1",
+  "alphabet": "0123456789,",
+  "blank_idx": 11,
+  "input_shape": [
+    null,
+    3,
+    48,
+    null
+  ],
+  "input_normalization": "rgb_u8_to_float[0,1] then polarity-canonicalized per-channel",
+  "checkpoint_val_acc": 0.8333333333333334,
+  "checkpoint_val_loss": 0.40057286620140076,
+  "checkpoint_epoch": 68,
+  "source_checkpoint": "model_signal_crnn_rgb_best.pth"
+}

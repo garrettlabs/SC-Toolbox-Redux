@@ -1,0 +1,379 @@
+{
+  "source_dir": "C:\\Users\\prjgn\\AppData\\Roaming\\ShipBit\\WingmanAI\\custom_skills\\SC_Toolbox_Beta_V1.2\\tools\\Mining_Signals\\training_data_panels\\user_20260418_154408\\region1",
+  "reference": "scan_results",
+  "captures_total": 3,
+  "captures_used": 2,
+  "captures_skipped": [
+    "cap_20260418_155710_185.boxes.json"
+  ],
+  "feature_capture_counts": {
+    "scan_results": 2,
+    "resource": 2,
+    "top_line": 2,
+    "mass_row": 2,
+    "bot_line": 2,
+    "outcome": 2,
+    "instability_row": 2,
+    "resistance_row": 2
+  },
+  "features": {
+    "scan_results": {
+      "x_frac": {
+        "mean": 0.0,
+        "std": 0.0,
+        "min": 0.0,
+        "max": 0.0
+      },
+      "y_frac": {
+        "mean": 0.0,
+        "std": 0.0,
+        "min": 0.0,
+        "max": 0.0
+      },
+      "w_frac": {
+        "mean": 1.0,
+        "std": 0.0,
+        "min": 1.0,
+        "max": 1.0
+      },
+      "h_frac": {
+        "mean": 1.0,
+        "std": 0.0,
+        "min": 1.0,
+        "max": 1.0
+      },
+      "count": 2
+    },
+    "resource": {
+      "x_frac": {
+        "mean": -0.06280193236714976,
+        "std": 0.0,
+        "min": -0.06280193236714976,
+        "max": -0.06280193236714976
+      },
+      "y_frac": {
+        "mean": 1.3125,
+        "std": 0.0,
+        "min": 1.3125,
+        "max": 1.3125
+      },
+      "w_frac": {
+        "mean": 0.966183574879227,
+        "std": 0.0,
+        "min": 0.966183574879227,
+        "max": 0.966183574879227
+      },
+      "h_frac": {
+        "mean": 1.28125,
+        "std": 0.0,
+        "min": 1.28125,
+        "max": 1.28125
+      },
+      "count": 2
+    },
+    "top_line": {
+      "x_frac": {
+        "mean": -0.06763285024154589,
+        "std": 0.0,
+        "min": -0.06763285024154589,
+        "max": -0.06763285024154589
+      },
+      "y_frac": {
+        "mean": 0.875,
+        "std": 0.0,
+        "min": 0.875,
+        "max": 0.875
+      },
+      "w_frac": {
+        "mean": 1.7198067632850242,
+        "std": 0.0,
+        "min": 1.7198067632850242,
+        "max": 1.7198067632850242
+      },
+      "h_frac": {
+        "mean": 0.25,
+        "std": 0.0,
+        "min": 0.25,
+        "max": 0.25
+      },
+      "count": 2
+    },
+    "mass_row": {
+      "x_frac": {
+        "mean": -0.014492753623188406,
+        "std": 0.0,
+        "min": -0.014492753623188406,
+        "max": -0.014492753623188406
+      },
+      "y_frac": {
+        "mean": 2.75,
+        "std": 0.0,
+        "min": 2.75,
+        "max": 2.75
+      },
+      "w_frac": {
+        "mean": 1.1980676328502415,
+        "std": 0.0,
+        "min": 1.1980676328502415,
+        "max": 1.1980676328502415
+      },
+      "h_frac": {
+        "mean": 1.28125,
+        "std": 0.0,
+        "min": 1.28125,
+        "max": 1.28125
+      },
+      "count": 2
+    },
+    "bot_line": {
+      "x_frac": {
+        "mean": 0.0,
+        "std": 0.0,
+        "min": 0.0,
+        "max": 0.0
+      },
+      "y_frac": {
+        "mean": 7.6875,
+        "std": 0.0,
+        "min": 7.6875,
+        "max": 7.6875
+      },
+      "w_frac": {
+        "mean": 1.5990338164251208,
+        "std": 0.0,
+        "min": 1.5990338164251208,
+        "max": 1.5990338164251208
+      },
+      "h_frac": {
+        "mean": 0.46875,
+        "std": 0.0,
+        "min": 0.46875,
+        "max": 0.46875
+      },
+      "count": 2
+    },
+    "outcome": {
+      "x_frac": {
+        "mean": -0.00966183574879227,
+        "std": 0.0,
+        "min": -0.00966183574879227,
+        "max": -0.00966183574879227
+      },
+      "y_frac": {
+        "mean": 6.4375,
+        "std": 0.0,
+        "min": 6.4375,
+        "max": 6.4375
+      },
+      "w_frac": {
+        "mean": 1.6135265700483092,
+        "std": 0.0,
+        "min": 1.6135265700483092,
+        "max": 1.6135265700483092
+      },
+      "h_frac": {
+        "mean": 1.1875,
+        "std": 0.0,
+        "min": 1.1875,
+        "max": 1.1875
+      },
+      "count": 2
+    },
+    "instability_row": {
+      "x_frac": {
+        "mean": -0.033816425120772944,
+        "std": 0.0,
+        "min": -0.033816425120772944,
+        "max": -0.033816425120772944
+      },
+      "y_frac": {
+        "mean": 5.34375,
+        "std": 0.0,
+        "min": 5.34375,
+        "max": 5.34375
+      },
+      "w_frac": {
+        "mean": 1.2463768115942029,
+        "std": 0.0,
+        "min": 1.2463768115942029,
+        "max": 1.2463768115942029
+      },
+      "h_frac": {
+        "mean": 1.0,
+        "std": 0.0,
+        "min": 1.0,
+        "max": 1.0
+      },
+      "count": 2
+    },
+    "resistance_row": {
+      "x_frac": {
+        "mean": -0.01932367149758454,
+        "std": 0.0,
+        "min": -0.01932367149758454,
+        "max": -0.01932367149758454
+      },
+      "y_frac": {
+        "mean": 4.0,
+        "std": 0.0,
+        "min": 4.0,
+        "max": 4.0
+      },
+      "w_frac": {
+        "mean": 1.2270531400966183,
+        "std": 0.0,
+        "min": 1.2270531400966183,
+        "max": 1.2270531400966183
+      },
+      "h_frac": {
+        "mean": 1.28125,
+        "std": 0.0,
+        "min": 1.28125,
+        "max": 1.28125
+      },
+      "count": 2
+    }
+  },
+  "worst_std_per_feature": {
+    "resource": {
+      "coord": "x_frac",
+      "std": 0.0
+    },
+    "top_line": {
+      "coord": "x_frac",
+      "std": 0.0
+    },
+    "mass_row": {
+      "coord": "x_frac",
+      "std": 0.0
+    },
+    "bot_line": {
+      "coord": "x_frac",
+      "std": 0.0
+    },
+    "outcome": {
+      "coord": "x_frac",
+      "std": 0.0
+    },
+    "instability_row": {
+      "coord": "x_frac",
+      "std": 0.0
+    },
+    "resistance_row": {
+      "coord": "x_frac",
+      "std": 0.0
+    }
+  },
+  "per_capture": [
+    {
+      "name": "cap_20260418_155705_329.boxes.json",
+      "image": "cap_20260418_155705_329.png",
+      "feature_count": 8,
+      "fracs": {
+        "scan_results": {
+          "x_frac": 0.0,
+          "y_frac": 0.0,
+          "w_frac": 1.0,
+          "h_frac": 1.0
+        },
+        "resource": {
+          "x_frac": -0.06280193236714976,
+          "y_frac": 1.3125,
+          "w_frac": 0.966183574879227,
+          "h_frac": 1.28125
+        },
+        "top_line": {
+          "x_frac": -0.06763285024154589,
+          "y_frac": 0.875,
+          "w_frac": 1.7198067632850242,
+          "h_frac": 0.25
+        },
+        "mass_row": {
+          "x_frac": -0.014492753623188406,
+          "y_frac": 2.75,
+          "w_frac": 1.1980676328502415,
+          "h_frac": 1.28125
+        },
+        "bot_line": {
+          "x_frac": 0.0,
+          "y_frac": 7.6875,
+          "w_frac": 1.5990338164251208,
+          "h_frac": 0.46875
+        },
+        "outcome": {
+          "x_frac": -0.00966183574879227,
+          "y_frac": 6.4375,
+          "w_frac": 1.6135265700483092,
+          "h_frac": 1.1875
+        },
+        "instability_row": {
+          "x_frac": -0.033816425120772944,
+          "y_frac": 5.34375,
+          "w_frac": 1.2463768115942029,
+          "h_frac": 1.0
+        },
+        "resistance_row": {
+          "x_frac": -0.01932367149758454,
+          "y_frac": 4.0,
+          "w_frac": 1.2270531400966183,
+          "h_frac": 1.28125
+        }
+      }
+    },
+    {
+      "name": "cap_20260418_155707_070.boxes.json",
+      "image": "cap_20260418_155707_070.png",
+      "feature_count": 8,
+      "fracs": {
+        "scan_results": {
+          "x_frac": 0.0,
+          "y_frac": 0.0,
+          "w_frac": 1.0,
+          "h_frac": 1.0
+        },
+        "resource": {
+          "x_frac": -0.06280193236714976,
+          "y_frac": 1.3125,
+          "w_frac": 0.966183574879227,
+          "h_frac": 1.28125
+        },
+        "top_line": {
+          "x_frac": -0.06763285024154589,
+          "y_frac": 0.875,
+          "w_frac": 1.7198067632850242,
+          "h_frac": 0.25
+        },
+        "mass_row": {
+          "x_frac": -0.014492753623188406,
+          "y_frac": 2.75,
+          "w_frac": 1.1980676328502415,
+          "h_frac": 1.28125
+        },
+        "bot_line": {
+          "x_frac": 0.0,
+          "y_frac": 7.6875,
+          "w_frac": 1.5990338164251208,
+          "h_frac": 0.46875
+        },
+        "outcome": {
+          "x_frac": -0.00966183574879227,
+          "y_frac": 6.4375,
+          "w_frac": 1.6135265700483092,
+          "h_frac": 1.1875
+        },
+        "instability_row": {
+          "x_frac": -0.033816425120772944,
+          "y_frac": 5.34375,
+          "w_frac": 1.2463768115942029,
+          "h_frac": 1.0
+        },
+        "resistance_row": {
+          "x_frac": -0.01932367149758454,
+          "y_frac": 4.0,
+          "w_frac": 1.2270531400966183,
+          "h_frac": 1.28125
+        }
+      }
+    }
+  ]
+}

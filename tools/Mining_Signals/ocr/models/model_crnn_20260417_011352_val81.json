@@ -1,0 +1,14 @@
+{
+  "stamp": "20260417_011352",
+  "val_string_acc": 0.8055164309802249,
+  "epochs": 8,
+  "n_samples": 20000,
+  "lr": 0.0001,
+  "batch_size": 128,
+  "seed": 42,
+  "real_aug_multiplier": 50,
+  "init_from": "ocr/models/model_crnn_pretrained.pt",
+  "charClasses": "0123456789.-% ()ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz",
+  "numTokens": 69,
+  "inputHeight": 32
+}

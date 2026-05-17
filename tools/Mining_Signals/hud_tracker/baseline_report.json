@@ -1,0 +1,94 @@
+{
+  "labeled_dir": "C:\\Users\\prjgn\\AppData\\Roaming\\ShipBit\\WingmanAI\\custom_skills\\SC_Toolbox_Beta_V1.2\\tools\\Mining_Signals\\training_data_panels\\user_20260418_154408\\region1",
+  "total_captures": 2,
+  "detection_rate": 1.0,
+  "correct_localization_rate": 1.0,
+  "median_iou_overall": 0.5818181818181818,
+  "p90_iou_overall": 0.5818181818181818,
+  "median_iou_detected": 0.5818181818181818,
+  "p90_iou_detected": 0.5818181818181818,
+  "mean_ms_per_frame": 20.737299986649305,
+  "median_ms_per_frame": 20.737299986649305,
+  "confident_but_wrong_count": 0,
+  "thresholds": {
+    "correct_iou_min": 0.5,
+    "wrong_iou_max": 0.3,
+    "confident_score_min": 0.5
+  },
+  "worst20": [
+    {
+      "capture": "cap_20260418_155705_329.png",
+      "gt": {
+        "x": 72,
+        "y": 61,
+        "w": 207,
+        "h": 32
+      },
+      "pred": {
+        "x": 62,
+        "y": 54,
+        "w": 253,
+        "h": 45
+      },
+      "score": 1.1211844682693481,
+      "iou": 0.5818181818181818,
+      "ms": 20.958399982191622
+    },
+    {
+      "capture": "cap_20260418_155707_070.png",
+      "gt": {
+        "x": 72,
+        "y": 61,
+        "w": 207,
+        "h": 32
+      },
+      "pred": {
+        "x": 54,
+        "y": 55,
+        "w": 253,
+        "h": 45
+      },
+      "score": 1.1125868558883667,
+      "iou": 0.5818181818181818,
+      "ms": 20.516199991106987
+    }
+  ],
+  "per_capture": [
+    {
+      "capture": "cap_20260418_155705_329.png",
+      "gt": {
+        "x": 72,
+        "y": 61,
+        "w": 207,
+        "h": 32
+      },
+      "pred": {
+        "x": 62,
+        "y": 54,
+        "w": 253,
+        "h": 45
+      },
+      "score": 1.1211844682693481,
+      "iou": 0.5818181818181818,
+      "ms": 20.958399982191622
+    },
+    {
+      "capture": "cap_20260418_155707_070.png",
+      "gt": {
+        "x": 72,
+        "y": 61,
+        "w": 207,
+        "h": 32
+      },
+      "pred": {
+        "x": 54,
+        "y": 55,
+        "w": 253,
+        "h": 45
+      },
+      "score": 1.1125868558883667,
+      "iou": 0.5818181818181818,
+      "ms": 20.516199991106987
+    }
+  ]
+}

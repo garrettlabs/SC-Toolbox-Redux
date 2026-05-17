@@ -5,9 +5,25 @@ safety net. Only invoked when a glyph's NCC confidence is below
 ``FALLBACK_CONF_THRESHOLD`` or the top-two template scores are
 within a small ambiguity gap.
 
-If the user installed an online-learned model at
-``%LOCALAPPDATA%/SC_Toolbox/model_cnn_online.onnx``, that is
-preferred (same behavior as the legacy onnx_hud_reader).
+Model-path priority order at load time (``_ensure_model``):
+
+  1. ``%LOCALAPPDATA%/SC_Toolbox/model_cnn_online.onnx`` —
+     online-learner-trained model, if present.
+  2. ``ocr/models/model_hud_cnn.onnx`` — HUD-specific 12-class CNN
+     trained by ``ocr/train_hud_cnn.py``. PREFERRED when present:
+     this loader feeds ``_classify_crops`` in ``api.py`` which is
+     the HUD primary per-glyph path. The HUD font visually differs
+     from the signature font, so the HUD CNN must NEVER be
+     substituted for the signature CNN — that model has its own
+     session (``_signal_session`` in ``ocr/sc_ocr/api.py``) and
+     never touches this loader.
+  3. ``ocr/models/model_cnn.onnx`` — the shipped legacy model
+     (no provenance info; trained against a similar 12-class
+     alphabet but with no documented HUD/Signature isolation).
+     Used only if neither (1) nor (2) is on disk.
+
+Metadata sidecar (``model_*.json``) — read from beside the model
+file, so the alphabet matches whichever model was loaded.
 """
 from __future__ import annotations
 
@@ -66,12 +82,37 @@ _ONLINE_MODEL_PATH = os.path.join(
 )
 
 
+def _resolve_hud_cnn_path() -> str:
+    """Pick the HUD-primary CNN file with the priority documented in
+    this module's docstring.
+
+    Importing the training registry is best-effort; if it isn't on
+    sys.path for some reason (e.g. minimal runtime ship), the helper
+    falls back to ``ONNX_MODEL_PATH`` so the production cascade keeps
+    working with the shipped legacy ``model_cnn.onnx``.
+    """
+    if os.path.isfile(_ONLINE_MODEL_PATH):
+        return _ONLINE_MODEL_PATH
+    # HUD-specific CNN (preferred over the legacy generic model_cnn.onnx).
+    try:
+        from ..training_registry import get_model_path
+        hud_path = str(get_model_path("hud"))
+        if os.path.isfile(hud_path):
+            return hud_path
+    except Exception as exc:  # pragma: no cover — defensive
+        log.debug(
+            "sc_ocr.fallback: registry lookup for HUD CNN failed: %s", exc,
+        )
+    # Legacy generic shipped model.
+    return str(ONNX_MODEL_PATH)
+
+
 def _ensure_model() -> bool:
     global _session, _char_classes
     if _session is not None:
         return True
 
-    path = _ONLINE_MODEL_PATH if os.path.isfile(_ONLINE_MODEL_PATH) else str(ONNX_MODEL_PATH)
+    path = _resolve_hud_cnn_path()
     if not os.path.isfile(path):
         log.debug("sc_ocr.fallback: ONNX model not found at %s", path)
         return False
@@ -84,11 +125,22 @@ def _ensure_model() -> bool:
 
     try:
         import json
-        meta_path = os.path.join(os.path.dirname(path), "model_cnn.json")
+        # Sidecar JSON lives next to whichever model file we loaded.
+        # ``model_hud_cnn.onnx`` → ``model_hud_cnn.json``, etc.
+        base = os.path.splitext(os.path.basename(path))[0]
+        meta_path = os.path.join(os.path.dirname(path), f"{base}.json")
         if os.path.isfile(meta_path):
             with open(meta_path) as f:
                 meta = json.load(f)
                 _char_classes = meta.get("charClasses", _char_classes)
+        else:
+            # Older shipped model_cnn.onnx ships with model_cnn.json — same
+            # filename stem, just keep the original lookup as the fallback.
+            legacy = os.path.join(os.path.dirname(path), "model_cnn.json")
+            if os.path.isfile(legacy):
+                with open(legacy) as f:
+                    meta = json.load(f)
+                    _char_classes = meta.get("charClasses", _char_classes)
 
         # Single-threaded to respect the 7% CPU budget
         opts = ort.SessionOptions()
@@ -101,7 +153,10 @@ def _ensure_model() -> bool:
             sess_options=opts,
             providers=["CPUExecutionProvider"],
         )
-        log.info("sc_ocr.fallback: ONNX loaded (%s)", os.path.basename(path))
+        log.info(
+            "sc_ocr.fallback: ONNX loaded (%s, classes=%r)",
+            os.path.basename(path), _char_classes,
+        )
         return True
     except Exception as exc:
         log.warning("sc_ocr.fallback: ONNX load failed: %s", exc)

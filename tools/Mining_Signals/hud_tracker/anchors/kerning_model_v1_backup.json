@@ -1,0 +1,53 @@
+{
+  "schema": "kerning_v1",
+  "units": "fraction-of-row-height",
+  "n_captures_walked": 232,
+  "n_captures_kept": 14,
+  "n_digits_histogram": {
+    "4": 6,
+    "5": 8
+  },
+  "slots": {
+    "0": {
+      "center_offset_mean": -0.8313968685300207,
+      "center_offset_median": -0.8323809523809524,
+      "center_offset_sigma": 0.15617898178798675,
+      "digit_w_mean": 0.32106754658385095,
+      "digit_w_median": 0.33,
+      "n": 8
+    },
+    "1": {
+      "center_offset_mean": -0.40470375897394534,
+      "center_offset_median": -0.36,
+      "center_offset_sigma": 0.16266425021075712,
+      "digit_w_mean": 0.37717875292409453,
+      "digit_w_median": 0.31304347826086953,
+      "n": 14
+    },
+    "2": {
+      "center_offset_mean": 0.19836326328950554,
+      "center_offset_median": 0.16875,
+      "center_offset_sigma": 0.19531778096035352,
+      "digit_w_mean": 0.4499090169664704,
+      "digit_w_median": 0.4575,
+      "n": 14
+    },
+    "3": {
+      "center_offset_mean": 0.831068773359146,
+      "center_offset_median": 0.87,
+      "center_offset_sigma": 0.33716987003853716,
+      "digit_w_mean": 0.4178282380145734,
+      "digit_w_median": 0.4482608695652174,
+      "n": 14
+    },
+    "4": {
+      "center_offset_mean": 1.3484688163803071,
+      "center_offset_median": 1.3849999999999998,
+      "center_offset_sigma": 0.33022473753000553,
+      "digit_w_mean": 0.4231539888682746,
+      "digit_w_median": 0.4423809523809524,
+      "n": 14
+    }
+  },
+  "comment": "center_offset = (digit_center_x - comma_center_x) / row_height. Slot 0 is leftmost digit (only present in 5-digit values). Slot 1 is the digit immediately left of the comma. Slots 2/3/4 are right of the comma. Slots 1..4 are always present; slot 0 is empty when n_digits == 4."
+}

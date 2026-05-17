@@ -29,7 +29,7 @@ import numpy as np
 from PIL import Image
 from PIL.ImageQt import ImageQt
 from PySide6.QtCore import (
-    QObject, QPoint, QPointF, QRect, QRectF, Qt, QTimer, Signal,
+    QEvent, QObject, QPoint, QPointF, QRect, QRectF, Qt, QTimer, Signal,
 )
 from PySide6.QtGui import (
     QBrush, QColor, QFont, QImage, QPainter, QPen, QPixmap,
@@ -38,7 +38,7 @@ from PySide6.QtWidgets import (
     QApplication, QCheckBox, QDialog, QFrame, QGraphicsPixmapItem,
     QGraphicsRectItem, QGraphicsScene, QGraphicsView, QGroupBox,
     QHBoxLayout, QLabel, QPushButton, QScrollArea, QSizePolicy,
-    QStatusBar, QTabWidget, QTextBrowser, QVBoxLayout, QWidget,
+    QSpinBox, QStatusBar, QTabWidget, QTextBrowser, QVBoxLayout, QWidget,
 )
 
 from ocr.sc_ocr import calibration
@@ -57,13 +57,58 @@ TEXT_DIM = "#888"
 # Polling interval for the live preview
 POLL_MS = 400
 
+# Cadence for the continuous "preview shows the live screen at the
+# calibrated crop position" refresh timer. Independent of the OCR scan
+# loop — when the user has scanning paused, this timer still re-crops
+# the latest screen capture so the boxes are visibly persistent. ~1 s
+# is the sweet spot: visible drift between updates is still below the
+# threshold where the boxes feel "frozen", but we steal half as much
+# GUI-thread time as 500 ms (interactions stay responsive).
+LIVE_REFRESH_MS = 1500
+
+# Window during which a freshly-arrived broadcast crop suppresses the
+# timer's fallback render. The broadcast crop is the EXACT image OCR
+# saw, so when one arrives we want to show it (not the timer's slightly
+# different re-crop) until it's clearly stale.
+BROADCAST_FRESHNESS_S = 1.0
+
+# How often the live-refresh tick re-runs the heavy label-detection
+# pass (`_find_label_rows`). Multi-scale NCC against a fresh capture is
+# ~20-100 ms — fine once in a while, lethal at 2 fps. The HUD doesn't
+# move within a single calibration session, so we cache the detected
+# rows for several seconds and reuse them between detect runs. Locked
+# rows skip detection entirely; this only matters in auto-detect mode.
+LABEL_DETECT_INTERVAL_S = 3.0
+
+# After any user input event (click / key / wheel) on the dialog or any
+# of its children, suppress the next live-refresh tick for this many
+# milliseconds. Keeps the GUI thread free for the input handler so
+# slider drags / spinner clicks / scrolling feel snappy instead of
+# fighting the screen-capture pipeline for CPU.
+INPUT_PAUSE_MS = 400
+
 # Field colors (matches debug_overlay)
 FIELD_COLORS: dict[str, tuple[int, int, int]] = {
     "_mineral_row":   (0, 230, 100),
     "mass":           (0, 200, 255),
     "resistance":     (200, 100, 255),
     "instability":    (255, 100, 200),
+    # Signature uses a warm amber so it visually separates from the
+    # HUD rows (cool blues / pinks) — the user reads them as different
+    # data sources.
+    "signature":      (255, 180, 80),
+    # Needle (difficulty bar) — yellow so it visually distinguishes
+    # from every other HUD row. The difficulty bar is the bottom-most
+    # element of the SCAN RESULTS panel and is its own thing.
+    "needle":         (255, 240, 100),
 }
+
+# Mouse-drag throttle: minimum interval (ms) between successive
+# ``box_changed`` emits during an in-progress drag. Mouse moves can fire
+# at hundreds of Hz; without throttling we'd flood the OCR pipeline with
+# re-crop requests. ~33 ms ≈ 30 Hz, smooth visually and well below
+# anything the OCR pipeline cares about.
+DRAG_EMIT_THROTTLE_MS = 33
 
 
 class _CropPreview(QLabel):
@@ -74,15 +119,33 @@ class _CropPreview(QLabel):
     no max height — the preview grows when the dialog is enlarged. The
     last PIL crop is cached so ``resizeEvent`` can re-render it
     instantly on drag-resize (without waiting for the 400 ms poll tick).
+
+    Mouse-drag: left-click + drag inside the preview translates the
+    underlying box (x, y) so the user can re-position the crop without
+    using the arrow nudges. The preview shows a SCALED copy of the
+    PIL crop, so widget-pixel deltas must be inverted through the
+    scale ratio to land in image-pixel units. See ``_drag_scale_factor``.
     """
+
+    # Drag-delta in IMAGE-PIXEL units: (field, dx, dy). The owning
+    # ``_RowControl`` connects this to apply the delta to its own box
+    # and emit ``box_changed`` (matching the arrow nudges' contract).
+    drag_delta = Signal(str, int, int)
 
     def __init__(self, field: str, parent=None):
         super().__init__(parent)
         self._field = field
-        # Small floor so the compact dialog still fits all 4 rows; the
-        # vertical Expanding size policy below lets it grow to fill any
-        # extra space the user gives it.
-        self.setMinimumSize(180, 36)
+        # Per-field minimum height. The needle row's crop covers the
+        # full MASS / RESISTANCE / INSTABILITY band (placeholder is
+        # 280x130 px in image coords) — at the default 36-px minimum
+        # the aspect-fit scaler shrinks it to a thumbnail too small to
+        # read. 160 px gives the needle preview enough room to render
+        # the M/R/I rows at near-native scale so the user can actually
+        # verify what's being captured. Other rows keep the small floor
+        # because their crops are single-line value strips that read
+        # fine at 36 px.
+        _min_h = 160 if field == "needle" else 36
+        self.setMinimumSize(180, _min_h)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setAlignment(Qt.AlignCenter)
         color = FIELD_COLORS.get(field, (200, 200, 200))
@@ -95,13 +158,164 @@ class _CropPreview(QLabel):
         # without waiting for the next poll tick.
         self._last_pil: Optional[Image.Image] = None
 
+        # ── Mouse-drag state ──
+        # ``_dragging`` flips True on left-press inside the preview and
+        # back to False on release; mouseMoveEvent uses it as a guard.
+        # ``_drag_anchor_widget`` is the press-time mouse position in
+        # widget coords, snapshotted so we can compute total delta from
+        # the press point each move (rather than incremental deltas
+        # which would compound rounding errors).
+        # ``_drag_emitted_dx/dy`` track how much we've already emitted
+        # in image-px units so each move only emits the *new* delta.
+        # ``_drag_disabled`` is set by the row when locked — drag is a
+        # no-op then, mirroring how arrow nudges no-op when locked.
+        # ``_last_emit_ms`` throttles emit cadence to ~30 Hz.
+        self._dragging: bool = False
+        self._drag_anchor_widget: Optional[QPoint] = None
+        self._drag_emitted_dx: int = 0
+        self._drag_emitted_dy: int = 0
+        self._drag_disabled: bool = False
+        self._last_emit_ms: int = 0
+        # Cursor reflects whether drag is allowed.
+        self.setCursor(Qt.SizeAllCursor)
+
     def update_crop(self, pil: Optional[Image.Image]) -> None:
         if pil is None:
             self._last_pil = None
             self.setText("(no crop yet)")
             return
+        # Needle row only: bake "NOT SCANNED" / "SCAN" zone labels onto
+        # the PIL image as visual reference markers. The labels are
+        # drawn once (here) rather than as Qt overlays so they survive
+        # any future re-render path and stay aligned with the image.
+        if self._field == "needle":
+            try:
+                pil = self._add_needle_zone_labels(pil)
+            except Exception:
+                # Defensive — overlay drawing must never break the
+                # preview itself.
+                pass
         self._last_pil = pil
         self._render_cached()
+
+    @staticmethod
+    def _add_needle_zone_labels(pil: Image.Image) -> Image.Image:
+        """Overlay the needle preview with zone-calibration markers:
+
+          * Three full-height vertical lines at 25 / 50 / 75 % width,
+            so the user can see the bar's quarter divisions when the
+            in-game needle isn't currently rendered (impossible rocks,
+            no laser applied) and still calibrate by quartile.
+          * Big, obvious 'NOT SCANNED' / 'SCAN' badges centered over
+            the two halves so left vs right is unmistakable.
+          * Subtle red / green half-strip tints at the very top edge
+            so even at small preview sizes the side designation reads
+            at a glance.
+
+        Drawn on a copy — caller's PIL image untouched."""
+        from PIL import ImageDraw
+        out = pil.copy().convert("RGB")
+        draw = ImageDraw.Draw(out)
+        W, H = out.size
+        if W < 12 or H < 12:
+            return out
+
+        # ── Font sizing: scale to crop height, but cap so labels stay
+        # readable on tall previews without dominating the image. ──
+        font_size = max(11, min(22, H // 8))
+        try:
+            from PIL import ImageFont
+            font = ImageFont.truetype("arial.ttf", font_size)
+        except Exception:
+            try:
+                from PIL import ImageFont
+                font = ImageFont.load_default()
+            except Exception:
+                font = None
+
+        def _tw(t: str) -> int:
+            if font is None:
+                return len(t) * 6
+            try:
+                bbox = font.getbbox(t)
+                return int(bbox[2] - bbox[0])
+            except Exception:
+                return len(t) * 6
+
+        # ── Top edge tint strips (red left / green right) so the side
+        # is obvious at a glance even when labels are hard to read. ──
+        tint_h = max(4, font_size // 3)
+        draw.rectangle([(0, 0), (W // 2, tint_h)], fill=(140, 40, 40))
+        draw.rectangle([(W // 2, 0), (W, tint_h)], fill=(40, 120, 40))
+
+        # ── Vertical guide lines, full crop height, at 25% / 50% / 75%.
+        # Color-coded: 25% → bright red (deep "NOT SCANNED" zone),
+        # 50% → white (zone divider, where the needle would sit at
+        # mid-power), 75% → bright green (deep "SCAN" zone). ──
+        line_color_25 = (220, 60, 60)     # red
+        line_color_50 = (240, 240, 240)   # white center divider
+        line_color_75 = (60, 200, 60)     # green
+        x_25 = W // 4
+        x_50 = W // 2
+        x_75 = (3 * W) // 4
+        # Width=2 so they're visible on top of detailed game content
+        # without obscuring the underlying pixels too much.
+        draw.line([(x_25, 0), (x_25, H - 1)], fill=line_color_25, width=2)
+        draw.line([(x_50, 0), (x_50, H - 1)], fill=line_color_50, width=2)
+        draw.line([(x_75, 0), (x_75, H - 1)], fill=line_color_75, width=2)
+
+        # ── Zone labels: BIG, centered over each half, with a solid
+        # background plate so they stay legible on busy game content.
+        left_text = "NOT SCANNED"
+        right_text = "SCAN"
+        left_w = _tw(left_text)
+        right_w = _tw(right_text)
+        pad_x = 8
+        pad_y = 3
+        badge_h = font_size + pad_y * 2
+
+        # LEFT label — center horizontally in left half
+        lx0 = max(0, (W // 4) - (left_w // 2) - pad_x)
+        lx1 = min(W // 2 - 2, lx0 + left_w + pad_x * 2)
+        ly0 = tint_h + 2
+        ly1 = ly0 + badge_h
+        draw.rectangle([(lx0, ly0), (lx1, ly1)], fill=(160, 30, 30))
+        # White outline so the badge stands out from the dark game UI
+        draw.rectangle(
+            [(lx0, ly0), (lx1, ly1)], outline=(255, 255, 255), width=1,
+        )
+        if font is not None:
+            draw.text(
+                (lx0 + pad_x, ly0 + pad_y),
+                left_text, fill=(255, 255, 255), font=font,
+            )
+        else:
+            draw.text(
+                (lx0 + pad_x, ly0 + pad_y),
+                left_text, fill=(255, 255, 255),
+            )
+
+        # RIGHT label — center horizontally in right half
+        rx0 = max(W // 2 + 2, (3 * W) // 4 - (right_w // 2) - pad_x)
+        rx1 = min(W - 1, rx0 + right_w + pad_x * 2)
+        ry0 = tint_h + 2
+        ry1 = ry0 + badge_h
+        draw.rectangle([(rx0, ry0), (rx1, ry1)], fill=(30, 130, 30))
+        draw.rectangle(
+            [(rx0, ry0), (rx1, ry1)], outline=(255, 255, 255), width=1,
+        )
+        if font is not None:
+            draw.text(
+                (rx0 + pad_x, ry0 + pad_y),
+                right_text, fill=(255, 255, 255), font=font,
+            )
+        else:
+            draw.text(
+                (rx0 + pad_x, ry0 + pad_y),
+                right_text, fill=(255, 255, 255),
+            )
+
+        return out
 
     def _render_cached(self) -> None:
         pil = self._last_pil
@@ -130,6 +344,126 @@ class _CropPreview(QLabel):
         if self._last_pil is not None:
             self._render_cached()
 
+    # ── Mouse-drag plumbing ─────────────────────────────────────────
+
+    def set_drag_disabled(self, disabled: bool) -> None:
+        """Owner toggles drag on/off (e.g. when row is locked).
+
+        When disabled, mouse-press silently no-ops and the cursor
+        reverts to the default arrow so the move-affordance disappears.
+        """
+        self._drag_disabled = bool(disabled)
+        if self._drag_disabled:
+            self.setCursor(Qt.ArrowCursor)
+            # Cancel any in-flight drag so a row that locks mid-drag
+            # doesn't keep emitting deltas.
+            self._dragging = False
+            self._drag_anchor_widget = None
+        else:
+            self.setCursor(Qt.SizeAllCursor)
+
+    def _drag_scale_factor(self) -> float:
+        """Image-px per widget-px during a drag.
+
+        The preview displays the row's PIL crop scaled by ``ratio`` (see
+        ``_render_cached`` — same min(avail_w/src_w, avail_h/src_h)
+        formula). So 1 widget-px == 1/ratio image-px. We invert that
+        ratio here. Falls back to 1.0 if the cached PIL is missing
+        (shouldn't happen during drag because the press path won't
+        engage without a crop), so the math doesn't divide-by-zero.
+        """
+        pil = self._last_pil
+        if pil is None:
+            return 1.0
+        src_w = max(1, pil.width)
+        src_h = max(1, pil.height)
+        avail_w = max(40, self.width() - 6)
+        avail_h = max(24, self.height() - 6)
+        ratio = min(avail_w / src_w, avail_h / src_h)
+        if ratio <= 0:
+            return 1.0
+        return 1.0 / ratio
+
+    def mousePressEvent(self, event):
+        # Right / middle clicks: explicitly ignore — no context menu,
+        # no drag, no nothing. Per task spec: "simplest interpretation".
+        if event.button() != Qt.LeftButton:
+            super().mousePressEvent(event)
+            return
+        if self._drag_disabled:
+            super().mousePressEvent(event)
+            return
+        # No-op when there's no crop to drag. Without a cached PIL we
+        # don't have a sensible scale factor and there's also nothing
+        # visible to anchor the user's drag against.
+        if self._last_pil is None:
+            super().mousePressEvent(event)
+            return
+        self._dragging = True
+        self._drag_anchor_widget = event.pos()
+        self._drag_emitted_dx = 0
+        self._drag_emitted_dy = 0
+        self._last_emit_ms = 0
+        event.accept()
+
+    def mouseMoveEvent(self, event):
+        if not self._dragging or self._drag_disabled:
+            super().mouseMoveEvent(event)
+            return
+        if not (event.buttons() & Qt.LeftButton):
+            # Lost the button somewhere — release acts as a defensive end.
+            self._dragging = False
+            self._drag_anchor_widget = None
+            super().mouseMoveEvent(event)
+            return
+        if self._drag_anchor_widget is None:
+            super().mouseMoveEvent(event)
+            return
+        # Throttle: monotonic-ms compare. This approach is simpler than
+        # juggling a QTimer.singleShot pending state, and good enough at
+        # ~30 Hz (the user's cursor doesn't notice a 33 ms pause between
+        # emits because each emit triggers a re-crop that takes longer).
+        try:
+            import time as _time
+            now_ms = int(_time.monotonic() * 1000)
+        except Exception:
+            now_ms = 0
+        if now_ms and (now_ms - self._last_emit_ms) < DRAG_EMIT_THROTTLE_MS:
+            event.accept()
+            return
+        # Total widget-px delta from the press point.
+        delta_w = event.pos() - self._drag_anchor_widget
+        scale = self._drag_scale_factor()
+        total_dx_img = int(round(delta_w.x() * scale))
+        total_dy_img = int(round(delta_w.y() * scale))
+        # Emit only the INCREMENT since the last emit. The owning row's
+        # nudge logic clamps and re-emits a full box, so each delta is
+        # applied once and the accumulated total tracks press-to-now.
+        inc_dx = total_dx_img - self._drag_emitted_dx
+        inc_dy = total_dy_img - self._drag_emitted_dy
+        if inc_dx == 0 and inc_dy == 0:
+            event.accept()
+            return
+        self._drag_emitted_dx = total_dx_img
+        self._drag_emitted_dy = total_dy_img
+        self._last_emit_ms = now_ms
+        try:
+            self.drag_delta.emit(self._field, inc_dx, inc_dy)
+        except Exception:
+            pass
+        event.accept()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() != Qt.LeftButton:
+            super().mouseReleaseEvent(event)
+            return
+        if self._dragging:
+            self._dragging = False
+            self._drag_anchor_widget = None
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
 
 class _RowControl(QGroupBox):
     """One row: live preview + nudge controls + lock button + status."""
@@ -150,6 +484,13 @@ class _RowControl(QGroupBox):
         v.setSpacing(4)
 
         self._preview = _CropPreview(field)
+        # Mouse-drag inside the preview translates the row's box. The
+        # preview emits delta in IMAGE-PIXEL units (it owns the scale
+        # factor since it owns the rendered pixmap); we apply the delta
+        # via the same path as the arrow nudges so the contract is
+        # identical (clamp to non-negative, mark manual, fire
+        # ``box_changed`` for the parent dialog to re-crop).
+        self._preview.drag_delta.connect(self._on_preview_drag)
         v.addWidget(self._preview)
 
         # ── Nudge controls row ──
@@ -182,6 +523,25 @@ class _RowControl(QGroupBox):
             nudge.addWidget(b)
 
         nudge.addStretch(1)
+
+        # ✏ Set — manually seed a placeholder crop when auto-detection
+        # has rejected this row. Without this, the user has nothing to
+        # nudge ("Cannot nudge: no crop detected yet"). Clicking ✏ Set
+        # drops a sensible default rectangle into the row's box and
+        # flips into manual mode so the user can use the existing nudge
+        # arrows + Lock to position it precisely.
+        self._btn_seed_manual = QPushButton("✏ Set")
+        self._btn_seed_manual.setToolTip(
+            "Set a starting crop rectangle when auto-detection failed. "
+            "Then use ← ↑ ↓ → and W± H± to position, click Lock to save."
+        )
+        self._btn_seed_manual.setStyleSheet(
+            "QPushButton { background: #335577; color: #cce0ff; padding: 2px 6px; "
+            "border: none; font-size: 9pt; }"
+            "QPushButton:hover { background: #4477aa; }"
+        )
+        self._btn_seed_manual.clicked.connect(self._on_seed_manual)
+        nudge.addWidget(self._btn_seed_manual)
 
         self._btn_reset_live = QPushButton("↻ Auto")
         self._btn_reset_live.setToolTip(
@@ -250,7 +610,32 @@ class _RowControl(QGroupBox):
         self._preview.update_crop(pil)
         self._latest_box = box
         if box is None:
-            self._status.setText("(crop not detected — check HUD region)")
+            if self._field == "needle":
+                # The needle row has no auto-detect: the difficulty crop
+                # is computed inside api.py (currently as a left-half
+                # fallback) rather than derived from a label-row anchor.
+                # When the broadcast delivers a non-None pil, the OCR IS
+                # producing a crop — saying "crop not detected" would be
+                # wrong. Tell the user what's actually happening: they
+                # see the live OCR crop until they click Set to customize.
+                if pil is not None:
+                    self._status.setText(
+                        "(showing live OCR crop — click ✏ Set to seed "
+                        "your own rectangle)"
+                    )
+                else:
+                    self._status.setText(
+                        "(no scan yet — start scanning so the OCR "
+                        "produces a crop)"
+                    )
+            elif self._field == "signature":
+                self._status.setText(
+                    "(crop not detected — check signal scanner region)"
+                )
+            else:
+                self._status.setText(
+                    "(crop not detected — check HUD region)"
+                )
         else:
             self._status.setText(
                 f"x={box['x']} y={box['y']} w={box['w']} h={box['h']}"
@@ -263,6 +648,31 @@ class _RowControl(QGroupBox):
         self._status.setText(
             f"MANUAL: x={box['x']} y={box['y']} w={box['w']} h={box['h']}"
         )
+
+    def refresh_preview_image(self, pil: Optional[Image.Image]) -> None:
+        """Lightweight preview-only refresh used by the dialog's
+        live-refresh timer (between scans).
+
+        Unlike :meth:`update_live` / :meth:`update_manual`, this method
+        deliberately leaves ``_latest_box`` and the status text
+        untouched: the timer just re-crops the SAME box (locked,
+        seeded-manual, or auto-detected) from the most recent screen
+        capture so the user sees the live screen content at that crop
+        position. Status text continues to reflect the authoritative
+        source (LOCKED / MANUAL / detected coords).
+        """
+        if pil is None:
+            return
+        self._preview.update_crop(pil)
+
+    def get_latest_box(self) -> Optional[dict]:
+        """Public accessor for the row's currently active box, or None
+        if no box is known yet. Used by the dialog's live-refresh timer
+        to decide whether the row already has a box to crop with."""
+        return self._latest_box
+
+    def is_manual(self) -> bool:
+        return self._is_manual
 
     def _nudge(self, dx: int, dy: int, dw: int, dh: int) -> None:
         """User clicked an arrow / resize button. Adjust the box by
@@ -289,6 +699,29 @@ class _RowControl(QGroupBox):
         # Ask parent to re-crop the panel image with the new box
         self.box_changed.emit(self._field, dict(box))
 
+    def _on_preview_drag(self, field: str, dx: int, dy: int) -> None:
+        """Apply an in-progress drag delta from the preview widget.
+
+        Arrives in IMAGE-PIXEL units already (the preview converted
+        widget-px → image-px via its current scale ratio). This is a
+        TRANSLATION only; width/height stay fixed (drag is mouse-move,
+        not edge-resize). Mirrors ``_nudge`` for the lock + no-crop
+        guards so the contract is identical.
+        """
+        if self._is_locked:
+            return
+        if self._latest_box is None:
+            return
+        if dx == 0 and dy == 0:
+            return
+        box = dict(self._latest_box)
+        box["x"] = max(0, box["x"] + int(dx))
+        box["y"] = max(0, box["y"] + int(dy))
+        # w/h are not touched during drag — translation only.
+        self._latest_box = box
+        self._is_manual = True
+        self.box_changed.emit(self._field, dict(box))
+
     def _on_reset_to_live(self) -> None:
         """Discard manual adjustments, return to live auto-detection."""
         self._is_manual = False
@@ -298,6 +731,90 @@ class _RowControl(QGroupBox):
             )
             return
         self._status.setText("Returned to live detection — waiting for next scan")
+
+    # Reasonable starting rectangles when the user clicks ✏ Set on a row
+    # whose auto-detect failed. Coords are HUD-region-relative; the user
+    # nudges from here. Heights are deliberately tall (28-32 px) and
+    # x-starts deliberately ~halfway across so labels-on-left, values-on-
+    # right HUDs work as a starting point. If the user's HUD is laid out
+    # differently they nudge — point of this feature is "give me SOMETHING
+    # to drag around."
+    _PLACEHOLDER_BOXES: dict = {
+        "mineral":     {"x":  20, "y":  10, "w": 200, "h": 30},
+        "mass":        {"x": 180, "y":  70, "w": 160, "h": 28},
+        "resistance":  {"x": 180, "y": 110, "w": 160, "h": 28},
+        "instability": {"x": 180, "y": 150, "w": 160, "h": 28},
+        # Signature lives in the SIGNAL-scanner region (not the HUD
+        # region), and that region is typically narrow + short — a
+        # small inset box that the user nudges right after the
+        # location-pin icon and down onto the digit row.
+        "signature":   {"x": 200, "y":  10, "w": 120, "h": 30},
+        # Needle (difficulty bar) — covers BOTH the M / R / I row band
+        # AND the EASY / MEDIUM / HARD / EXTREME / IMPOSSIBLE difficulty
+        # bar at the bottom of the panel, in one tall full-width crop.
+        # User asked for the whole context (full rows including values
+        # AND the red difficulty bar all the way down).
+        #
+        # Geometry (placeholder — user nudges/locks):
+        #   x=0   → left edge (full width)
+        #   y=60  → ~10 px above the MASS row's top (mass.y=70)
+        #   w=400 → full width — wide enough to cover labels AND values
+        #   h=200 → from y=60 down through the difficulty bar
+        "needle":      {"x":   0, "y":  60, "w": 400, "h": 200},
+    }
+
+    def _on_seed_manual(self) -> None:
+        """Drop a default-position rectangle in this row so the user can
+        nudge from there. Used when label_match rejects the row entirely
+        (no crop appears) — without this the existing nudge arrows are
+        no-ops because there's no box to adjust.
+
+        After seeding, the row is in manual mode: live auto-detection no
+        longer overwrites the box. User uses ← ↑ ↓ → / W± / H± to position
+        and Lock to commit. Lock saves through the same path as a normal
+        auto-detected lock — calibration.json gets the manual rectangle.
+        """
+        if self._is_locked:
+            self._status.setText("(unlock first to seed a manual crop)")
+            return
+        box = dict(self._PLACEHOLDER_BOXES.get(
+            self._field, {"x": 80, "y": 60, "w": 160, "h": 28}
+        ))
+        self._latest_box = box
+        self._is_manual = True
+        self._status.setText(
+            f"MANUAL (seed): x={box['x']} y={box['y']} w={box['w']} h={box['h']} "
+            "— nudge to position, then Lock"
+        )
+        # Trigger re-crop so the preview pane shows the placeholder rectangle
+        # cropped from the latest HUD frame.
+        self.box_changed.emit(self._field, dict(box))
+
+    def add_footer_widget(self, widget: QWidget) -> None:
+        """Insert an extra widget into this row's group-box, just above
+        the status/lock line.
+
+        Used by the dialog to embed a globally-scoped sub-control inside
+        a specific row's panel (e.g. the column x-offset bar gets nested
+        into the needle row so the difficulty-tuning controls all live in
+        one visual block). Semantics of the embedded widget are NOT
+        scoped to this row — the caller is responsible for whatever
+        behavior the widget owns.
+        """
+        # The internal layout ``v`` has, in order:
+        #   [0] preview, [1] nudge layout, [2] status+lock layout
+        # plus any previously added footer widgets between [1] and the
+        # status row. We always insert RIGHT BEFORE the last item (the
+        # status+lock layout) so footers stack just above the status
+        # line in the order they're added.
+        layout = self.layout()
+        if layout is None:
+            return
+        last = layout.count() - 1
+        if last < 0:
+            layout.addWidget(widget)
+        else:
+            layout.insertWidget(last, widget)
 
     def display_locked(self, pil: Optional[Image.Image], box: dict) -> None:
         """Show the locked box visualization (called when load from disk)."""
@@ -373,13 +890,41 @@ class _RowControl(QGroupBox):
 
     def _recover_box(self) -> Optional[dict]:
         """Last-resort attempt to derive a box at lock-click time
-        when _latest_box is stale-None. Tries 3 sources in order:
-          1. debug_overlay's current in-memory state (may have been
-             cleared by a recent scan reset; worth re-checking)
-          2. The saved debug_value_<field>_crop.png file's pixel size
+        when _latest_box is stale-None. Tries sources in order:
+          1. needle field → placeholder fallback (no auto-detect path,
+             so locking without prior Set should still work; placeholder
+             gives the user a sane starting rectangle to lock)
+          2. signature → consult sc_ocr.api.get_last_signal_crop_box
+          3. debug_overlay's current in-memory state (HUD rows)
+          4. The saved debug_value_<field>_crop.png file's pixel size
              paired with the most recent label_rows from disk
-          3. None — caller will show a popup
+          5. None — caller will show a popup
         """
+        # ``needle`` has no auto-detect source — the difficulty crop is
+        # computed entirely inside api.py. If the user clicks Lock
+        # without first clicking Set, _latest_box is None and the
+        # standard recovery (debug_overlay.label_rows) wouldn't find it
+        # either. Fall back to the placeholder so Lock just works.
+        if self._field == "needle":
+            try:
+                box = dict(self._PLACEHOLDER_BOXES.get("needle", {}))
+                if box:
+                    box["_source"] = "placeholder_fallback"
+                    return box
+            except Exception:
+                pass
+        # ``signature`` lives outside the HUD debug_overlay; consult
+        # the signal API's own last-crop telemetry first.
+        if self._field == "signature":
+            try:
+                from ocr.sc_ocr import api as _api
+                _sig_box = _api.get_last_signal_crop_box()
+                if _sig_box is not None:
+                    box = dict(_sig_box)
+                    box["_source"] = "sc_ocr.api.get_last_signal_crop_box"
+                    return box
+            except Exception:
+                pass
         # Source 1: in-memory debug_overlay state
         try:
             from ocr.sc_ocr import debug_overlay
@@ -427,6 +972,13 @@ class _RowControl(QGroupBox):
         return None
 
     def _apply_lock_style(self, locked: bool) -> None:
+        # Keep the preview's drag-affordance in sync with the lock
+        # state. Locked rows refuse arrow nudges (see ``_nudge``) — the
+        # mouse-drag in the preview matches that contract.
+        try:
+            self._preview.set_drag_disabled(bool(locked))
+        except Exception:
+            pass
         if locked:
             self._lock_btn.setText("🔓 Unlock")
             self._lock_btn.setStyleSheet(
@@ -469,11 +1021,33 @@ class _LiveCropSignaler(QObject):
     crop_ready = Signal(str, object)
 
 
+class _LiveRefreshSignaler(QObject):
+    """Cross-thread bridge for the live-refresh tick result.
+
+    Mirrors ``_LiveCropSignaler``: the heavy parts of the live-refresh
+    tick (screen capture + label-row detection) run on a daemon worker
+    thread to keep the UI responsive. The worker emits this signal with
+    the captured PILs and detected label rows; the default cross-thread
+    QueuedConnection delivers the payload to the UI thread, where Phase
+    3 (per-row preview update) can safely touch widgets.
+
+    Payload types are ``object`` so ``Optional[PIL.Image.Image]`` and
+    plain dicts pass through verbatim without Qt metatype gymnastics.
+    """
+    result_ready = Signal(object, object, object)
+
+
 class CalibrationDialog(QDialog):
     """Main calibration dialog — non-modal so user can see the game HUD
     beside it."""
 
-    def __init__(self, region: dict, scan_callback, parent=None):
+    def __init__(
+        self,
+        region: dict,
+        scan_callback,
+        parent=None,
+        signature_region: Optional[dict] = None,
+    ):
         """
         Parameters:
             region : the user's HUD region dict {"x", "y", "w", "h"}
@@ -482,6 +1056,11 @@ class CalibrationDialog(QDialog):
                 trigger the pipeline and read back what crops were
                 used. The OCR pipeline already saves debug crops to
                 disk; we read them from there for the live preview.
+            signature_region : the user's SIGNATURE-scanner ocr_region
+                dict, or None if the user hasn't set it yet. Used as
+                the calibration key for the "signature" row so it
+                lives under the signal region rather than the HUD
+                region (the two are independent on-screen rectangles).
         """
         super().__init__(parent)
         self.setWindowTitle("Mining HUD OCR Calibration")
@@ -493,6 +1072,7 @@ class CalibrationDialog(QDialog):
         self.resize(720, 640)
         self.setWindowFlag(Qt.WindowStaysOnTopHint, False)
         self._region = region
+        self._signature_region = signature_region
         self._scan_callback = scan_callback
 
         # ── Tabs ──
@@ -559,27 +1139,143 @@ class CalibrationDialog(QDialog):
         # status bar prefers this over the disk mtime when present so a
         # user with no cross-process viewers sees an accurate freshness.
         self._last_broadcast_ts: float = 0.0
+        # Per-field timestamp so the live-refresh timer can suppress
+        # its fallback render for rows whose authoritative broadcast
+        # crop arrived very recently (avoids flicker between the OCR-
+        # exact crop and the timer's re-crop, which can differ by a
+        # frame's worth of HUD content).
+        self._last_broadcast_ts_per_field: dict[str, float] = {}
 
         # ── Polling timer for status / cold-start fallback ──
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
         self._timer.start(POLL_MS)
 
+        # ── Continuous live-preview refresh timer ──
+        # Independent of the OCR scan loop. Every ~500 ms we capture
+        # the current HUD region + signature region and re-crop each
+        # row's preview using its currently-active box (locked >
+        # seeded-manual > auto-detected). This makes the calibration
+        # boxes "persistent" rather than "freezing on the last broadcast
+        # crop": the user sees what each box selects on the live screen
+        # even when scanning is paused or hasn't started.
+        #
+        # When a real scan completes and broadcasts a crop via
+        # ``live_broadcast``, that broadcast crop is preferred for a
+        # short freshness window (BROADCAST_FRESHNESS_S) — the broadcast
+        # crop went through the actual OCR pipeline, so it's the most
+        # authoritative image to show. The live-refresh timer fills the
+        # gaps between scans.
+        self._live_refresh_timer = QTimer(self)
+        self._live_refresh_timer.timeout.connect(self._live_refresh_tick)
+        self._live_refresh_timer.start(LIVE_REFRESH_MS)
+        # Cross-thread bridge for the live-refresh tick. Phase 1
+        # (capture) + Phase 2 (label-row detection) run on a daemon
+        # worker thread; the worker emits this signal and the default
+        # QueuedConnection delivers the payload back to the UI thread
+        # for Phase 3 (per-row preview update). See
+        # ``_live_refresh_tick`` and ``_on_live_refresh_result``.
+        self._live_refresh_signaler = _LiveRefreshSignaler()
+        self._live_refresh_signaler.result_ready.connect(
+            self._on_live_refresh_result
+        )
+        # Re-entrancy guard for the live-refresh worker. The QTimer can
+        # fire faster than the worker completes (cold mss capture +
+        # NCC detect can take >1.5 s on first tick), so we drop ticks
+        # that arrive while a worker is already in flight rather than
+        # piling them up.
+        self._live_refresh_in_flight: bool = False
+        # Per-tick label_match cache: avoids re-running the heavy NCC /
+        # anchor detection every tick when no row needs it (locked +
+        # manual rows never need it; only auto-detect rows do). Reused
+        # across ticks within `LABEL_DETECT_INTERVAL_S` even when an
+        # auto-detect row IS present — see ``_live_refresh_tick``.
+        self._cached_hud_label_rows: Optional[dict] = None
+        self._cached_hud_label_rows_id: Optional[int] = None
+        self._last_label_detect_ts: float = 0.0
+
+        # User-input tracking for tick suppression. Updated by
+        # ``eventFilter`` on every meaningful input event (mouse press,
+        # key press, wheel) bubbling out of any child widget. Read by
+        # ``_live_refresh_tick`` to skip if the user is actively
+        # interacting — prevents the screen-capture pipeline from
+        # stealing GUI cycles mid-drag.
+        self._last_user_input_ts: float = 0.0
+        # Install ourselves as an event filter on the QApplication so
+        # we see input events regardless of which child widget receives
+        # them. Cleaned up in ``closeEvent``.
+        try:
+            _app = QApplication.instance()
+            if _app is not None:
+                _app.installEventFilter(self)
+                self._installed_app_filter = True
+            else:
+                self._installed_app_filter = False
+        except Exception:
+            self._installed_app_filter = False
+
         self._refresh_header()
         self._reload_locked_state_from_disk()
 
-        # ── One-shot bootstrap scan ──
-        # Do ONE scan on dialog open so the previews populate
-        # immediately, even if the toolbox's main scan loop isn't
-        # running yet. The bootstrap scan goes through live_broadcast,
-        # so the dialog gets its first crops in real time without
-        # touching disk.
-        if scan_callback is not None:
-            try:
-                scan_callback(region)
-            except Exception as exc:
-                log.debug("bootstrap scan failed: %s", exc)
+        # ── Deferred bootstrap scan ──
+        # The bootstrap scans (HUD + signature) are HEAVY: each runs a
+        # full label_match + Tesseract anchor + OCR pipeline pass and
+        # can take 200ms-5s on cold start (multi-voter ensemble + ONNX
+        # model load). On the GUI thread that's enough for Windows to
+        # mark the window "Not Responding" and freeze interactions on
+        # every other Qt window in the same process.
+        #
+        # v2.2.7+: run the bootstrap on a daemon Python thread instead.
+        # The OCR pipeline is thread-safe enough for this — it writes to
+        # module-level caches but those caches are also read by the GUI
+        # thread via copy-on-read, so no shared mutable state. Live
+        # refresh tick on the GUI thread will pick up the freshly-cached
+        # state on the next 1s tick.
+        QTimer.singleShot(0, self._run_bootstrap_scans)
         self._tick()
+
+    def _run_bootstrap_scans(self) -> None:
+        """Kick off the bootstrap scan on a worker thread so the GUI
+        thread stays responsive. The scan results land in shared
+        module-level caches that the live-refresh tick reads on its
+        next firing — no signal/slot plumbing required because we
+        don't touch widgets directly from the worker."""
+        import threading as _threading
+
+        def _bg() -> None:
+            try:
+                if self._scan_callback is not None:
+                    try:
+                        self._scan_callback(self._region)
+                    except Exception as exc:
+                        log.debug("bootstrap scan failed: %s", exc)
+                if self._signature_region is not None:
+                    try:
+                        from ocr import screen_reader as _sr
+                        _sr.scan_region(dict(self._signature_region))
+                    except Exception as exc:
+                        log.debug("signal bootstrap scan failed: %s", exc)
+            except Exception as exc:
+                # Last-ditch — never let a worker crash leak into the GUI.
+                log.debug("bootstrap worker exception: %s", exc)
+
+        try:
+            _threading.Thread(
+                target=_bg, daemon=True, name="cal_bootstrap",
+            ).start()
+        except Exception as exc:
+            # Threading failure is exceptional (probably interpreter
+            # shutting down). Fall back to synchronous so we at least
+            # do *something* — but log loudly.
+            log.warning(
+                "calibration: bootstrap thread spawn failed (%s); "
+                "running synchronously, may freeze UI briefly", exc,
+            )
+            try:
+                if self._scan_callback is not None:
+                    self._scan_callback(self._region)
+            except Exception:
+                pass
 
     # ──────────────────────────────────────────
     # Calibrate tab
@@ -751,6 +1447,90 @@ class CalibrationDialog(QDialog):
         )
         v.addWidget(info)
 
+        # ── Global column x-offset (one shift applied to ALL HUD rows) ──
+        # The mass / resistance / instability values share a column on
+        # the HUD, so a single x-offset lets the user nudge all three
+        # crops left or right without touching each row individually.
+        # Per-region: the value re-loads when the user changes their
+        # HUD region (see _on_region_changed-style hooks in the future
+        # — for now we read in _build_calibrate_tab and reload on tick).
+        #
+        # NOTE: this widget is GLOBAL (affects mass/resi/inst together);
+        # we just nest it visually inside the needle row's group box
+        # below so all the value-column / difficulty-tuning controls
+        # live in one place. The shift it applies is unchanged — still
+        # global, still affects all HUD rows.
+        col_bar = QWidget()
+        col_bar.setStyleSheet(
+            f"background: {PANEL_BG}; padding: 4px; border-radius: 4px;"
+        )
+        ch = QHBoxLayout(col_bar)
+        ch.setContentsMargins(8, 6, 8, 6)
+        ch.setSpacing(6)
+        col_title = QLabel("Column x-offset (all rows):")
+        col_title.setStyleSheet(
+            f"color: {TEXT_PRIMARY}; font-family: Consolas; font-size: 10pt;"
+        )
+        ch.addWidget(col_title)
+
+        self._col_left_btn = QPushButton("←")
+        self._col_left_btn.setFixedSize(28, 26)
+        self._col_left_btn.setToolTip(
+            "Shift the value column 1 px LEFT (Shift+click = 5 px). "
+            "Affects mass / resistance / instability simultaneously."
+        )
+        self._col_left_btn.setStyleSheet(
+            f"QPushButton {{ background: {LOCK_GRAY}; color: white; "
+            "border: none; font-weight: bold; }}"
+            "QPushButton:hover { background: #777; }"
+        )
+        self._col_left_btn.clicked.connect(
+            lambda: self._on_col_nudge(-1)
+        )
+        ch.addWidget(self._col_left_btn)
+
+        self._col_spin = QSpinBox()
+        self._col_spin.setRange(-200, 200)
+        self._col_spin.setValue(self._safe_get_col_offset())
+        self._col_spin.setSuffix(" px")
+        self._col_spin.setMinimumWidth(90)
+        self._col_spin.setToolTip(
+            "Direct entry for the column x-offset. Negative = shift "
+            "value crops LEFT; positive = shift RIGHT. Applies to all "
+            "HUD rows in this region."
+        )
+        self._col_spin.valueChanged.connect(self._on_col_offset_changed)
+        ch.addWidget(self._col_spin)
+
+        self._col_right_btn = QPushButton("→")
+        self._col_right_btn.setFixedSize(28, 26)
+        self._col_right_btn.setToolTip(
+            "Shift the value column 1 px RIGHT (Shift+click = 5 px). "
+            "Affects mass / resistance / instability simultaneously."
+        )
+        self._col_right_btn.setStyleSheet(
+            f"QPushButton {{ background: {LOCK_GRAY}; color: white; "
+            "border: none; font-weight: bold; }}"
+            "QPushButton:hover { background: #777; }"
+        )
+        self._col_right_btn.clicked.connect(
+            lambda: self._on_col_nudge(+1)
+        )
+        ch.addWidget(self._col_right_btn)
+
+        self._col_status = QLabel("")
+        self._col_status.setStyleSheet(
+            f"color: {TEXT_DIM}; font-family: Consolas; font-size: 9pt;"
+        )
+        ch.addWidget(self._col_status, 1)
+        self._refresh_col_status()
+        # NOTE: col_bar is NOT added to the top-level layout `v` — it is
+        # instead embedded into the needle row's group box below
+        # (`_row_controls["needle"].add_footer_widget(col_bar)`) so the
+        # value-column / difficulty-tuning controls live together
+        # visually. The shift it applies is still GLOBAL — see the
+        # comment at col_bar construction.
+
         # Row controls live inside a scroll area so the dialog can be
         # shrunk down without truncating rows or fighting their minimum
         # heights. The action bar (Reset / Close) stays pinned below
@@ -775,6 +1555,21 @@ class CalibrationDialog(QDialog):
             # rather than just adding empty padding at the bottom.
             rows_layout.addWidget(ctrl, 1)
 
+        # Inject the global column x-offset bar into the needle row's
+        # group box. This keeps difficulty-detection-area tuning + the
+        # value-column shift in the same visual block, since the column
+        # x-offset directly controls where the M/R/I values get cropped
+        # — which is what difficulty detection inspects. The widget's
+        # behavior is unchanged (still globally affects mass/resi/inst).
+        # If the needle row isn't in FIELD_NAMES (defensive guard for
+        # future field-list changes), fall back to adding col_bar at
+        # the top level so it doesn't disappear.
+        needle_ctrl = self._row_controls.get("needle")
+        if needle_ctrl is not None:
+            needle_ctrl.add_footer_widget(col_bar)
+        else:
+            v.addWidget(col_bar)
+
         rows_scroll = QScrollArea()
         rows_scroll.setWidgetResizable(True)
         rows_scroll.setFrameShape(QFrame.NoFrame)
@@ -789,6 +1584,50 @@ class CalibrationDialog(QDialog):
         # Action row
         actions = QHBoxLayout()
         actions.addStretch(1)
+
+        # User-initiated one-shot scan. Lets the user verify a freshly
+        # adjusted region or locked crop without closing the dialog and
+        # toggling the main UI's Start Scan. Green (accent) because
+        # it's a positive, safe action — it doesn't change toggle
+        # state, doesn't mutate calibration, just fires a single OCR
+        # pass against the latest config.
+        self._scan_now_btn = QPushButton("▶ Scan now")
+        self._scan_now_btn.setToolTip(
+            "Fire one OCR scan against the current calibration so you "
+            "can verify the result without closing the dialog. Does "
+            "not change the Start/Stop Scan state in the main window."
+        )
+        self._scan_now_btn.setStyleSheet(
+            f"QPushButton {{ background: {ACCENT}; color: black; "
+            "padding: 6px 14px; font-weight: bold; border: none; }}"
+            "QPushButton:hover { background: #5e8; }"
+            "QPushButton:disabled { background: #2a4a35; color: #888; }"
+        )
+        self._scan_now_btn.clicked.connect(self._on_scan_now)
+        actions.addWidget(self._scan_now_btn)
+
+        # Manual escape hatch — wipes every rolling window + lock
+        # cache so the next scan starts fresh. Lives next to the other
+        # destructive "reset" controls. Orange (between "Reset all
+        # calibration"'s red and the green close button) so users see
+        # it as recoverable: it doesn't touch saved calibration on
+        # disk, only runtime in-memory consensus state.
+        reset_consensus_btn = QPushButton("Reset consensus")
+        reset_consensus_btn.setToolTip(
+            "Clear all rolling-window consensus and locked-in OCR "
+            "values for the signal + HUD scanners. Use this if a "
+            "stuck reading is showing the wrong value (e.g. a "
+            "leading 1 that won't go away). The next scan starts "
+            "fresh. Does not touch saved calibration."
+        )
+        reset_consensus_btn.setStyleSheet(
+            "QPushButton { background: #b56000; color: white; padding: 6px 14px; "
+            "border: none; }"
+            "QPushButton:hover { background: #d97a1a; }"
+        )
+        reset_consensus_btn.clicked.connect(self._on_reset_consensus)
+        actions.addWidget(reset_consensus_btn)
+
         reset_btn = QPushButton("Reset all calibration")
         reset_btn.setStyleSheet(
             "QPushButton { background: #722; color: white; padding: 6px 14px; "
@@ -808,6 +1647,55 @@ class CalibrationDialog(QDialog):
         actions.addWidget(close_btn)
 
         v.addLayout(actions)
+
+        # ── EMERGENCY OVERRIDE row (separate row so it visually stands
+        # apart from the normal Close / Reset actions). Big red button
+        # with a tooltip explaining what it does. The "Disable manual
+        # override" sibling shows up only when override mode is active.
+        emergency_row = QHBoxLayout()
+        emergency_row.addStretch(1)
+
+        self._override_status_lbl = QLabel("")
+        self._override_status_lbl.setStyleSheet(
+            "color: #ff8888; font-weight: bold; font-family: Electrolize, Consolas;"
+        )
+        emergency_row.addWidget(self._override_status_lbl)
+
+        self._disable_override_btn = QPushButton("Disable manual override")
+        self._disable_override_btn.setToolTip(
+            "Turn off manual override mode for this region. The OCR "
+            "pipeline returns to using auto-detection / row locks."
+        )
+        self._disable_override_btn.setStyleSheet(
+            "QPushButton { background: #555; color: #ffd0d0; "
+            "padding: 6px 14px; border: none; }"
+            "QPushButton:hover { background: #777; }"
+        )
+        self._disable_override_btn.clicked.connect(self._on_disable_override)
+        self._disable_override_btn.setVisible(False)
+        emergency_row.addWidget(self._disable_override_btn)
+
+        self._emergency_btn = QPushButton("⚠ EMERGENCY OVERRIDE")
+        self._emergency_btn.setToolTip(
+            "Manual selection only. Disables auto-detection. Opens a "
+            "dialog where you draw each field's box on a live HUD shot."
+        )
+        self._emergency_btn.setStyleSheet(
+            "QPushButton { background: #aa1a1a; color: white; "
+            "padding: 8px 18px; font-weight: bold; font-size: 10pt; "
+            "border: 2px solid #ff4040; }"
+            "QPushButton:hover { background: #cc2222; }"
+            "QPushButton:pressed { background: #881010; }"
+        )
+        self._emergency_btn.clicked.connect(self._on_open_emergency_override)
+        emergency_row.addWidget(self._emergency_btn)
+
+        v.addLayout(emergency_row)
+
+        # Now that all visible widgets exist, sync the override-mode UI
+        # to whatever's currently saved on disk. Doing this AFTER the
+        # widgets are created avoids attribute-order pitfalls.
+        self._refresh_override_indicator()
         return page
 
     # ──────────────────────────────────────────
@@ -978,6 +1866,424 @@ so you can switch between setups without losing your work.</p>
             )
 
     # ──────────────────────────────────────────
+    # Continuous live-preview refresh
+    # ──────────────────────────────────────────
+
+    def eventFilter(self, obj: QObject, event: QEvent) -> bool:
+        """Track meaningful user input events to suppress live-refresh
+        ticks while the user is interacting.
+
+        Installed on QApplication in ``__init__`` so we see events from
+        every child widget (sliders, spinners, buttons, scroll areas)
+        without per-widget plumbing. Read by ``_live_refresh_tick``.
+
+        Returns False unconditionally — never consume the event, just
+        observe it.
+        """
+        try:
+            t = event.type()
+            # Cherry-pick events that mean "the user is doing
+            # something". MouseMove is intentionally excluded — it
+            # fires constantly on hover and would keep the live-refresh
+            # permanently paused.
+            if t in (
+                QEvent.Type.MouseButtonPress,
+                QEvent.Type.MouseButtonRelease,
+                QEvent.Type.MouseButtonDblClick,
+                QEvent.Type.KeyPress,
+                QEvent.Type.Wheel,
+            ):
+                # Only count if the event target is OUR dialog or a
+                # descendant — events from unrelated windows in the
+                # same Qt app shouldn't pause our timer. Uses
+                # ``QWidget.isAncestorOf`` (a single C++ call) instead
+                # of a Python-side parent-chain walk; the global filter
+                # sees events from EVERY widget in the toolbox process
+                # so the per-event cost matters here.
+                try:
+                    if isinstance(obj, QWidget) and (
+                        obj is self or self.isAncestorOf(obj)
+                    ):
+                        import time as _t
+                        self._last_user_input_ts = _t.time()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return False
+
+    def _live_refresh_tick(self) -> None:
+        """Re-crop each row's preview from the LIVE screen, every tick.
+
+        Independent of the OCR scan loop. The point is: when the user
+        opens this dialog, every row's preview pane should show what
+        the calibrated crop position currently selects on screen RIGHT
+        NOW — not whatever frame the last OCR scan happened to capture
+        (which could be many seconds old, or never if scanning is
+        paused).
+
+        Strategy per row:
+          * locked → re-crop the LIVE HUD/signature capture using the
+            locked rectangle. The user sees the locked region track
+            the live screen, so they can verify the box still
+            captures the right content as the game state changes.
+          * seeded-manual → same, but with the placeholder rectangle
+            the user nudged from. So the ✏ Set rectangle is also
+            visibly persistent.
+          * auto-detect → ask the existing ``_find_label_rows`` (HUD)
+            or ``get_last_signal_crop_box`` (signature) for the
+            current detected box, then re-crop from the live capture.
+
+        Cost mitigation:
+          * Skip the entire tick if the user just interacted (within
+            ``INPUT_PAUSE_MS``). Keeps slider drags / spinner clicks
+            from competing with screen capture for GUI thread time.
+          * One mss capture per region (HUD + signature) per tick,
+            shared across all rows in that region.
+          * ``_find_label_rows`` only runs when at least one row is
+            in auto-detect mode AND the cached result is stale (older
+            than ``LABEL_DETECT_INTERVAL_S``). Locked + manual rows
+            skip detection entirely.
+          * Per-row freshness: rows that received a broadcast crop
+            within the last ``BROADCAST_FRESHNESS_S`` seconds skip
+            this tick (the broadcast is more authoritative).
+
+        Defensive: every step is wrapped so a screen-capture failure
+        or label-match exception doesn't kill the timer.
+        """
+        # Skip when the dialog is on the Tutorial tab — the existing
+        # ``_on_tab_changed`` already gates the OCR-poll timer; mirror
+        # that behaviour for this timer so we don't burn CPU on screen
+        # captures the user isn't looking at.
+        try:
+            if self._tabs.currentIndex() != 0:
+                return
+        except Exception:
+            pass
+
+        import time as _time
+        _now = _time.time()
+
+        # Skip if the user just interacted — let the GUI thread
+        # finish handling their input cleanly before stealing it back.
+        try:
+            if (_now - self._last_user_input_ts) < (INPUT_PAUSE_MS / 1000.0):
+                return
+        except Exception:
+            pass
+
+        # Re-entrancy guard: drop this tick if the previous worker is
+        # still running. The QTimer fires every LIVE_REFRESH_MS (1.5 s)
+        # but a cold-start mss capture + NCC label-row detection can
+        # exceed that on the first tick. Without this guard we'd pile
+        # up workers whose results race each other to update the UI.
+        if getattr(self, "_live_refresh_in_flight", False):
+            return
+
+        # Snapshot the per-field auto/locked/manual state on the UI
+        # thread (cheap; touches our own widgets only). The worker
+        # thread reads only this snapshot, never `_row_controls`, so
+        # it doesn't race with user toggles.
+        any_auto_hud_row = False
+        try:
+            for field, ctrl in self._row_controls.items():
+                # Signature and needle aren't HUD-label-row fields:
+                # signature lives under the signal region; needle
+                # (difficulty bar) has no auto-detect path of its own
+                # (the difficulty detector in api.scan_hud_onnx crops
+                # the panel left-half, not a label row). Skip both so
+                # they don't trigger the heavy ``_find_label_rows`` pass.
+                if field == "signature" or field == "needle":
+                    continue
+                if not ctrl.is_locked() and not ctrl.is_manual():
+                    any_auto_hud_row = True
+                    break
+        except Exception:
+            any_auto_hud_row = False
+
+        # Snapshot what the worker needs about the cache so it can
+        # decide whether to re-run label-row detection. Reading these
+        # is cheap; the worker mutates its own locals only.
+        cached_label_rows = self._cached_hud_label_rows
+        last_detect_ts = self._last_label_detect_ts
+        region_snap = dict(self._region) if self._region else None
+        sig_region_snap = (
+            dict(self._signature_region)
+            if self._signature_region is not None
+            else None
+        )
+
+        self._live_refresh_in_flight = True
+
+        import threading as _threading
+
+        def _worker() -> None:
+            """Phase 1 + Phase 2 on a daemon worker thread.
+
+            Captures the HUD/signature regions and (when needed) runs
+            the heavy label-row detection. Emits the result to the UI
+            thread via the queued ``result_ready`` signal; Phase 3
+            (per-row preview update) runs in
+            ``_on_live_refresh_result`` on the UI thread.
+            """
+            hud_pil_w: Optional[Image.Image] = None
+            sig_pil_w: Optional[Image.Image] = None
+            hud_label_rows_w: dict = {}
+            try:
+                # ── Phase 1: capture the screens we need ──
+                try:
+                    from ocr import screen_reader as _sr
+                    try:
+                        if region_snap is not None:
+                            hud_pil_w = _sr.capture_region(region_snap)
+                    except Exception as exc:
+                        log.debug(
+                            "live_refresh worker: HUD capture failed: %s",
+                            exc,
+                        )
+                    if sig_region_snap is not None:
+                        try:
+                            sig_pil_w = _sr.capture_region(sig_region_snap)
+                        except Exception as exc:
+                            log.debug(
+                                "live_refresh worker: signature capture "
+                                "failed: %s", exc,
+                            )
+                except Exception as exc:
+                    log.debug(
+                        "live_refresh worker: screen_reader import/capture "
+                        "failed: %s", exc,
+                    )
+
+                # ── Phase 2: optional heavy label-row detection ──
+                # Only when at least one HUD row is in auto-detect AND
+                # the cached result is stale. Locked + manual rows
+                # never need this.
+                if any_auto_hud_row and hud_pil_w is not None:
+                    stale = (
+                        cached_label_rows is None
+                        or (_now - last_detect_ts)
+                        >= LABEL_DETECT_INTERVAL_S
+                    )
+                    if stale:
+                        try:
+                            from ocr import onnx_hud_reader as _ohr
+                            try:
+                                _ohr._set_current_region(region_snap)
+                            except Exception:
+                                pass
+                            hud_label_rows_w = (
+                                _ohr._find_label_rows(hud_pil_w) or {}
+                            )
+                        except Exception as exc:
+                            log.debug(
+                                "live_refresh worker: _find_label_rows "
+                                "failed: %s", exc,
+                            )
+                            hud_label_rows_w = cached_label_rows or {}
+                    else:
+                        hud_label_rows_w = cached_label_rows or {}
+
+                # Hand the payload back to the UI thread. The default
+                # cross-thread connection (QueuedConnection) marshals
+                # this to ``_on_live_refresh_result``.
+                try:
+                    self._live_refresh_signaler.result_ready.emit(
+                        hud_pil_w, sig_pil_w, hud_label_rows_w,
+                    )
+                except Exception as exc:
+                    # If the dialog is being torn down, the signaler
+                    # may be partially destroyed. Swallow — the next
+                    # tick (if any) will try again.
+                    log.debug(
+                        "live_refresh worker: signal emit failed: %s",
+                        exc,
+                    )
+            finally:
+                # Always clear the in-flight flag so the next tick can
+                # spawn a fresh worker.
+                try:
+                    self._live_refresh_in_flight = False
+                except Exception:
+                    pass
+
+        try:
+            _threading.Thread(
+                target=_worker, daemon=True, name="cal_live_refresh",
+            ).start()
+        except Exception as exc:
+            # Thread spawn failure is exceptional — clear the flag so
+            # we don't deadlock the timer.
+            self._live_refresh_in_flight = False
+            log.debug("live_refresh: worker spawn failed: %s", exc)
+
+    def _on_live_refresh_result(
+        self,
+        hud_pil: Optional[Image.Image],
+        sig_pil: Optional[Image.Image],
+        hud_label_rows: dict,
+    ) -> None:
+        """UI-thread Phase 3: apply worker's capture + detect results.
+
+        Receives the captured HUD/signature PILs and detected label
+        rows from ``_live_refresh_tick``'s worker thread (delivered via
+        the queued ``result_ready`` signal). Updates the dialog's
+        cached state, then runs the per-row preview refresh — same
+        widgets and cache TTL semantics as before, just split.
+        """
+        # Drop the result if the dialog is closing — a queued signal
+        # may arrive after closeEvent has stopped the timer but before
+        # the dialog is destroyed.
+        try:
+            if not self.isVisible():
+                return
+        except Exception:
+            return
+
+        import time as _time
+        _now = _time.time()
+
+        # Mirror the old function's writes to the dialog's cached
+        # capture state. Other code paths read these (status bar,
+        # disk-fallback _tick, etc.).
+        self.latest_hud_pil = hud_pil
+        self.latest_signature_pil = sig_pil
+
+        # Refresh the label-row cache only when the worker actually
+        # ran detection (non-empty dict). An empty dict means either
+        # the worker reused the cached value or there were no auto
+        # rows — in both cases we leave the cache alone.
+        if hud_label_rows:
+            self._cached_hud_label_rows = hud_label_rows
+            self._last_label_detect_ts = _now
+
+        # Resolve the rows dict the per-row update should use. If the
+        # worker reused cached rows, fall back to the current cache.
+        rows_for_render = hud_label_rows or (self._cached_hud_label_rows or {})
+
+        # ── Phase 3: per-row crop + preview refresh (UI thread) ──
+        for field, ctrl in self._row_controls.items():
+            try:
+                # Suppress this tick's render if a broadcast crop
+                # arrived very recently — that crop is the OCR-exact
+                # image and we don't want to overwrite it with a re-
+                # cropped frame that may differ by a frame or two.
+                last_bcast = self._last_broadcast_ts_per_field.get(field, 0.0)
+                if last_bcast > 0 and (_now - last_bcast) < BROADCAST_FRESHNESS_S:
+                    continue
+
+                if field == "signature":
+                    self._refresh_signature_row(ctrl, sig_pil)
+                else:
+                    self._refresh_hud_row(ctrl, field, hud_pil, rows_for_render)
+            except Exception as exc:
+                log.debug(
+                    "live_refresh: row %s refresh failed: %s", field, exc,
+                )
+
+    def _refresh_hud_row(
+        self,
+        ctrl: "_RowControl",
+        field: str,
+        hud_pil: Optional[Image.Image],
+        hud_label_rows: dict,
+    ) -> None:
+        """Re-crop one HUD row from the live HUD capture and push to
+        its preview. See :meth:`_live_refresh_tick` for the strategy."""
+        if hud_pil is None:
+            return
+        # Pick the box: locked → seeded-manual → auto-detected.
+        box: Optional[dict] = None
+        if ctrl.is_locked() or ctrl.is_manual():
+            box = ctrl.get_latest_box()
+            # Locked rows also have the calibrated box on disk; if the
+            # in-memory latest_box is somehow None, fall back to disk.
+            if box is None and ctrl.is_locked():
+                try:
+                    from ocr.sc_ocr import calibration as _cal
+                    box = _cal.get_row(self._region, field)
+                except Exception:
+                    box = None
+        else:
+            # Auto-detect: derive from the freshly-computed label_rows.
+            row = hud_label_rows.get(field)
+            if row is not None:
+                # row tuple is (y1, y2, label_right) per
+                # _find_label_rows return shape.
+                try:
+                    y1, y2, label_right = row[0], row[1], row[2]
+                    box = {
+                        "x": int(label_right),
+                        "y": int(y1),
+                        "w": max(4, int(hud_pil.width - label_right)),
+                        "h": max(4, int(y2 - y1)),
+                    }
+                except Exception:
+                    box = None
+
+        if box is None:
+            return
+        cropped = self._crop_safely(hud_pil, box)
+        if cropped is None:
+            return
+        ctrl.refresh_preview_image(cropped)
+
+    def _refresh_signature_row(
+        self,
+        ctrl: "_RowControl",
+        sig_pil: Optional[Image.Image],
+    ) -> None:
+        """Re-crop the signature row from the live signal-region
+        capture. Same locked > manual > auto fallback as HUD rows."""
+        if sig_pil is None:
+            return
+        box: Optional[dict] = None
+        if ctrl.is_locked() or ctrl.is_manual():
+            box = ctrl.get_latest_box()
+            if box is None and ctrl.is_locked() and self._signature_region is not None:
+                try:
+                    from ocr.sc_ocr import calibration as _cal
+                    box = _cal.get_row(self._signature_region, "signature")
+                except Exception:
+                    box = None
+        else:
+            # Auto-detect: ask the signal pipeline for the last crop
+            # box. This is updated by the most recent
+            # ``_signal_recognize_pil`` call (i.e. by the toolbox's
+            # main scan loop). Cheap accessor — no work per tick.
+            try:
+                from ocr.sc_ocr import api as _api
+                box = _api.get_last_signal_crop_box()
+            except Exception:
+                box = None
+
+        if box is None:
+            return
+        cropped = self._crop_safely(sig_pil, box)
+        if cropped is None:
+            return
+        ctrl.refresh_preview_image(cropped)
+
+    @staticmethod
+    def _crop_safely(
+        img: Image.Image, box: dict,
+    ) -> Optional[Image.Image]:
+        """Crop ``img`` by ``box`` while clamping to image bounds.
+        Returns None on degenerate input."""
+        try:
+            x = max(0, int(box.get("x", 0)))
+            y = max(0, int(box.get("y", 0)))
+            w = max(1, int(box.get("w", 0)))
+            h = max(1, int(box.get("h", 0)))
+            x2 = min(img.width, x + w)
+            y2 = min(img.height, y + h)
+            if x2 <= x or y2 <= y:
+                return None
+            return img.crop((x, y, x2, y2))
+        except Exception:
+            return None
+
+    # ──────────────────────────────────────────
     # Live broadcast handlers
     # ──────────────────────────────────────────
 
@@ -1000,7 +2306,14 @@ so you can switch between setups without losing your work.</p>
         no disk read, no PNG decode roundtrip.
         """
         import time as _time
-        self._last_broadcast_ts = _time.time()
+        _now = _time.time()
+        self._last_broadcast_ts = _now
+        # Per-field marker: the live-refresh timer skips this row for a
+        # short freshness window so the OCR-exact broadcast crop isn't
+        # immediately overwritten by the timer's re-crop. ALL rows get
+        # this — locked rows benefit too (they may have been getting a
+        # stale frozen crop before this method fires).
+        self._last_broadcast_ts_per_field[field] = _now
         ctrl = self._row_controls.get(field)
         if ctrl is None or pil is None:
             return
@@ -1059,6 +2372,15 @@ so you can switch between setups without losing your work.</p>
     def _read_live_box(self, field: str) -> Optional[dict]:
         """Read the current detected bounding box from the debug overlay
         telemetry file (if it exists)."""
+        # ``signature`` lives outside debug_overlay's HUD-only state,
+        # so consult the signal scanner's own last-crop-box telemetry.
+        if field == "signature":
+            try:
+                from ocr.sc_ocr import api as _api
+                box = _api.get_last_signal_crop_box()
+            except Exception:
+                box = None
+            return box
         # The runtime debug_overlay module has a label_rows dict that
         # we'd ideally read, but it's in-memory. Easiest is to read
         # the saved label_rows from the most recent scan via a small
@@ -1093,23 +2415,47 @@ so you can switch between setups without losing your work.</p>
 
     def _on_row_box_changed(self, field: str, box: dict) -> None:
         """User nudged a row's box. Re-crop the panel image with the
-        new coords and update the preview."""
+        new coords and update the preview.
+
+        Source image differs by field:
+          * HUD rows → ``debug_overlay._state["image"]`` (the HUD-region
+            capture the OCR pipeline most recently scanned).
+          * ``signature`` → ``screen_reader.get_last_capture()`` (the
+            signal-region capture). The signal pipeline doesn't push
+            into ``debug_overlay``, so we read from the signal scanner's
+            own last-frame cache instead.
+        """
         try:
-            # Pull the latest panel image from the debug overlay state
-            from ocr.sc_ocr import debug_overlay
-            img = debug_overlay._state.get("image")
-            if img is None:
-                # Fall back: read the saved overlay PNG
-                from pathlib import Path
-                overlay_path = Path(debug_overlay.OUT_PATH)
-                if overlay_path.is_file():
-                    img = Image.open(overlay_path).convert("RGB")
-            if img is None:
-                self._status_bar.showMessage(
-                    "Cannot re-crop: no panel image available "
-                    "(start scanning so a panel is captured)", 5000,
-                )
-                return
+            img = None
+            if field == "signature":
+                try:
+                    from ocr import screen_reader as _sr
+                    img = _sr.get_last_capture()
+                except Exception:
+                    img = None
+                if img is None:
+                    self._status_bar.showMessage(
+                        "Cannot re-crop signature: no signal-region "
+                        "capture yet (start scanning so the signal "
+                        "scanner grabs a frame)", 5000,
+                    )
+                    return
+            else:
+                # Pull the latest panel image from the debug overlay state
+                from ocr.sc_ocr import debug_overlay
+                img = debug_overlay._state.get("image")
+                if img is None:
+                    # Fall back: read the saved overlay PNG
+                    from pathlib import Path
+                    overlay_path = Path(debug_overlay.OUT_PATH)
+                    if overlay_path.is_file():
+                        img = Image.open(overlay_path).convert("RGB")
+                if img is None:
+                    self._status_bar.showMessage(
+                        "Cannot re-crop: no panel image available "
+                        "(start scanning so a panel is captured)", 5000,
+                    )
+                    return
             x, y, w, h = box["x"], box["y"], box["w"], box["h"]
             x2 = min(img.width, x + w)
             y2 = min(img.height, y + h)
@@ -1120,22 +2466,69 @@ so you can switch between setups without losing your work.</p>
         except Exception as exc:
             log.debug("re-crop on nudge failed: %s", exc)
 
+    def _region_for_field(self, field: str) -> Optional[dict]:
+        """Return the region dict the given field's calibration is
+        keyed under.
+
+        ``signature`` lives in the SIGNAL-scanner ``ocr_region`` (a
+        separate on-screen rectangle from the HUD); every other field
+        belongs to the HUD region. Returns ``None`` for ``signature``
+        when the user hasn't set the signal region yet — callers should
+        treat that as "can't save / load this field" and surface a
+        helpful status message.
+        """
+        if field == "signature":
+            return self._signature_region
+        return self._region
+
     def _on_row_locked(self, field: str, box: dict) -> None:
-        # Determine value_column_left. If multiple rows are locked,
+        target_region = self._region_for_field(field)
+        if target_region is None:
+            self._status_bar.showMessage(
+                f"⚠ Cannot lock {DISPLAY_NAMES.get(field, field)}: "
+                "signal scanner region not set. Use 'Set Scanning "
+                "Region' in the toolbox first, then re-open this "
+                "dialog.",
+                10000,
+            )
+            log.warning(
+                "calibration_dialog: refusing to save field=%s — no "
+                "signature_region available",
+                field,
+            )
+            return
+
+        # Determine value_column_left. If multiple HUD rows are locked,
         # use the rightmost x (= longest label's colon position).
-        # Otherwise use this row's x.
-        all_xs = [box["x"]]
-        for f, c in self._row_controls.items():
-            if f == field or not c.is_locked():
-                continue
-            existing = calibration.get_row(self._region, f)
-            if existing:
-                all_xs.append(existing["x"])
-        # Wait — value_column_left should be the X where values START
-        # (the user-locked crop's LEFT edge IS that x). Pick max so
-        # short-label rows (smaller x) don't override the longest
-        # label's anchor.
-        value_column_left = max(all_xs)
+        # Skip this for the signature field since it's keyed under a
+        # different region and value_column_left is meaningless for
+        # the signal pipeline. Likewise needle (the difficulty-bar
+        # crop) sits below the value column entirely — its x
+        # coordinate has nothing to do with where MASS / RESISTANCE /
+        # INSTABILITY values start.
+        if field == "signature" or field == "needle":
+            value_column_left = int(box["x"])
+        else:
+            all_xs = [box["x"]]
+            for f, c in self._row_controls.items():
+                # Same exclusion logic when sourcing peer x's: skip
+                # signature (different region) and needle (irrelevant
+                # to the value column).
+                if (
+                    f == field
+                    or f == "signature"
+                    or f == "needle"
+                    or not c.is_locked()
+                ):
+                    continue
+                existing = calibration.get_row(self._region, f)
+                if existing:
+                    all_xs.append(existing["x"])
+            # Wait — value_column_left should be the X where values START
+            # (the user-locked crop's LEFT edge IS that x). Pick max so
+            # short-label rows (smaller x) don't override the longest
+            # label's anchor.
+            value_column_left = max(all_xs)
 
         # Try to capture image size from the debug overlay state
         image_size = None
@@ -1148,7 +2541,7 @@ so you can switch between setups without losing your work.</p>
             pass
 
         calibration.save_row(
-            self._region, field, box,
+            target_region, field, box,
             image_size=image_size,
             value_column_left=value_column_left,
         )
@@ -1156,7 +2549,7 @@ so you can switch between setups without losing your work.</p>
         # written but the row didn't persist (e.g. AV interference,
         # permission issue, race), the user needs to know NOW rather
         # than discover it later when boxes jump during scanning.
-        verify_box = calibration.get_row(self._region, field)
+        verify_box = calibration.get_row(target_region, field)
         if verify_box is None:
             self._status_bar.showMessage(
                 f"⚠ FAILED to persist {DISPLAY_NAMES.get(field, field)} "
@@ -1166,7 +2559,7 @@ so you can switch between setups without losing your work.</p>
             log.error(
                 "calibration_dialog: save_row(%s) reported success but "
                 "get_row read-back returned None for region=%s",
-                field, self._region,
+                field, target_region,
             )
         else:
             self._status_bar.showMessage(
@@ -1177,7 +2570,10 @@ so you can switch between setups without losing your work.</p>
         self._refresh_completion_banner()
 
     def _on_row_unlocked(self, field: str) -> None:
-        calibration.remove_row(self._region, field)
+        target_region = self._region_for_field(field)
+        if target_region is None:
+            return
+        calibration.remove_row(target_region, field)
         self._status_bar.showMessage(
             f"Unlocked {DISPLAY_NAMES.get(field, field)}", 3000,
         )
@@ -1189,6 +2585,118 @@ so you can switch between setups without losing your work.</p>
             ctrl.reset()
         self._refresh_completion_banner()
         self._status_bar.showMessage("All calibration cleared", 3000)
+
+    def _on_scan_now(self) -> None:
+        """Fire one OCR scan via the parent ``MiningSignalsApp``.
+
+        Routes through ``MiningSignalsApp.force_one_scan`` so the dialog
+        doesn't have to know anything about the scan worker plumbing.
+        Defensive: if the parent isn't a ``MiningSignalsApp`` (e.g. the
+        dialog was opened in a test harness), just log and no-op.
+
+        UI affordances:
+        * Disable the button for ~1.5 s so the user can't spam-click it.
+          The Qt event loop debounce is sufficient — we don't need a
+          re-entrancy lock because the button is the only caller.
+        * Show a transient status-bar message; when the next scan crop
+          arrives the existing ``_on_live_crop`` flow refreshes the
+          previews automatically.
+        """
+        cb = getattr(self, "_force_one_scan_cb", None)
+        if cb is None:
+            try:
+                parent = self.parent()
+            except Exception:
+                parent = None
+            if parent is not None and hasattr(parent, "force_one_scan"):
+                cb = parent.force_one_scan
+
+        if cb is None:
+            log.info(
+                "scan-now: parent has no force_one_scan() — no-op "
+                "(dialog likely opened standalone)",
+            )
+            self._status_bar.showMessage(
+                "Scan now unavailable in this context", 3000,
+            )
+            return
+
+        try:
+            cb()
+        except Exception as exc:
+            log.warning("scan-now: force_one_scan() raised: %s", exc)
+            self._status_bar.showMessage(
+                "Scan now failed — see logs", 4000,
+            )
+            return
+
+        self._status_bar.showMessage(
+            "Scanning now — preview will refresh momentarily", 3000,
+        )
+        log.info("calibration dialog: scan-now button clicked")
+
+        # Brief debounce so the user can't queue a flood of one-shot
+        # scans by hammering the button. 1.5 s comfortably covers the
+        # typical OCR pipeline pass and matches the status-bar visual.
+        # Wrap the re-enable in a try/except — if the user closes the
+        # dialog before the timer fires the underlying QWidget has
+        # been deleted, and accessing it raises RuntimeError("Internal
+        # C++ object already deleted").
+        self._scan_now_btn.setEnabled(False)
+
+        def _re_enable() -> None:
+            try:
+                self._scan_now_btn.setEnabled(True)
+            except RuntimeError:
+                # Dialog was closed before the debounce expired — the
+                # button no longer exists. Nothing to do.
+                pass
+
+        QTimer.singleShot(1500, _re_enable)
+
+    def _on_reset_consensus(self) -> None:
+        """Manual unstick — clear all rolling-window consensus + locked
+        OCR values so the next scan starts fresh.
+
+        Routes through the parent ``MiningSignalsApp.reset_consensus_state``
+        if available (it owns the per-app HUD windows AND knows how to
+        reach into ``ocr.sc_ocr.api``'s module-level state). Falls back
+        to a direct ``api.reset_all_consensus()`` call if the parent
+        hookup is missing — defensive only, so the button still does
+        something sensible if the dialog is ever opened standalone.
+        """
+        cleared_app = False
+        try:
+            parent = self.parent()
+            if parent is not None and hasattr(parent, "reset_consensus_state"):
+                parent.reset_consensus_state()
+                cleared_app = True
+        except Exception as exc:
+            log.warning(
+                "reset consensus: parent.reset_consensus_state() failed: %s",
+                exc,
+            )
+
+        if not cleared_app:
+            # Fallback: at least flush the SC-OCR module-level buffers.
+            try:
+                from ocr.sc_ocr import api as _sc_api
+                _sc_api.reset_all_consensus()
+            except Exception as exc:
+                log.warning(
+                    "reset consensus: sc_ocr.api.reset_all_consensus() "
+                    "fallback failed: %s",
+                    exc,
+                )
+                self._status_bar.showMessage(
+                    "Reset consensus failed — see logs", 4000,
+                )
+                return
+
+        self._status_bar.showMessage(
+            "Consensus state cleared — next scan starts fresh", 4000,
+        )
+        log.info("calibration dialog: reset consensus button clicked")
 
     def _refresh_completion_banner(self) -> None:
         complete = calibration.is_complete(self._region)
@@ -1206,26 +2714,43 @@ so you can switch between setups without losing your work.</p>
         )
 
     def _reload_locked_state_from_disk(self) -> None:
-        """On open, read existing calibration and mark locked rows."""
-        cal = calibration.load(self._region)
-        if not cal:
-            return
-        rows = cal.get("rows", {})
-        for field, box in rows.items():
-            if field not in self._row_controls:
-                continue
-            # Try to load the corresponding crop file so the locked
-            # row shows its actual content (instead of "no crop yet").
-            from pathlib import Path as _P
-            tool_dir = _P(__file__).resolve().parent.parent
-            crop_path = tool_dir / f"debug_value_{field}_crop.png"
-            pil = None
-            if crop_path.is_file():
-                try:
-                    pil = Image.open(crop_path).convert("RGB")
-                except Exception:
-                    pil = None
-            self._row_controls[field].display_locked(pil, box)
+        """On open, read existing calibration and mark locked rows.
+
+        HUD rows (mass / resistance / instability / _mineral_row) are
+        keyed under ``self._region`` (the HUD region). The signature
+        row is keyed under ``self._signature_region`` (the signal
+        scanner's ocr_region) when one is set — load it from there.
+        """
+        from pathlib import Path as _P
+        tool_dir = _P(__file__).resolve().parent.parent
+
+        def _restore_rows(cal_dict: Optional[dict], allow_signature: bool) -> None:
+            if not cal_dict:
+                return
+            for field, box in cal_dict.get("rows", {}).items():
+                if field not in self._row_controls:
+                    continue
+                # Filter so HUD-keyed cal data only restores HUD rows
+                # and signature-keyed cal data only restores signature.
+                if field == "signature" and not allow_signature:
+                    continue
+                if field != "signature" and allow_signature:
+                    continue
+                crop_path = tool_dir / f"debug_value_{field}_crop.png"
+                pil = None
+                if crop_path.is_file():
+                    try:
+                        pil = Image.open(crop_path).convert("RGB")
+                    except Exception:
+                        pil = None
+                self._row_controls[field].display_locked(pil, box)
+
+        _restore_rows(calibration.load(self._region), allow_signature=False)
+        if self._signature_region is not None:
+            _restore_rows(
+                calibration.load(self._signature_region),
+                allow_signature=True,
+            )
         self._refresh_completion_banner()
 
     # ──────────────────────────────────────────
@@ -1472,23 +2997,340 @@ so you can switch between setups without losing your work.</p>
             self._voice_pause_btn.setEnabled(False)
             self._voice_pause_btn.setText("⏸ Pause")
 
+    # ──────────────────────────────────────────
+    # Global column x-offset (Feature 1)
+    # ──────────────────────────────────────────
+
+    def _safe_get_col_offset(self) -> int:
+        """Read the saved column x-offset, defaulting to 0 on any error.
+
+        Defensive because the dialog should always come up cleanly even
+        if the calibration accessor is missing / throws (e.g. an old
+        calibration.json schema during an upgrade)."""
+        try:
+            return int(calibration.get_column_x_offset(self._region))
+        except Exception as exc:
+            log.debug(
+                "get_column_x_offset failed (defaulting to 0): %s", exc,
+            )
+            return 0
+
+    def _refresh_col_status(self) -> None:
+        """Update the human-readable status next to the spin box."""
+        try:
+            v = int(self._col_spin.value())
+        except Exception:
+            v = 0
+        if v == 0:
+            txt = "Column x: 0 px (no shift)"
+        elif v < 0:
+            txt = f"Column x: {v} px (left shift)"
+        else:
+            txt = f"Column x: +{v} px (right shift)"
+        try:
+            self._col_status.setText(txt)
+        except Exception:
+            pass
+
+    def _on_col_offset_changed(self, value: int) -> None:
+        """Spin box value changed → persist + update label.
+
+        Called on EVERY value change (typing, arrows, our own programmatic
+        sets), so persistence has to be cheap. Failures are logged but
+        not surfaced — the saved value lives in calibration.json which
+        the pipeline picks up on the next scan automatically."""
+        try:
+            calibration.set_column_x_offset(self._region, int(value))
+        except Exception as exc:
+            log.warning(
+                "set_column_x_offset(%s) failed: %s", value, exc,
+            )
+            try:
+                self._status_bar.showMessage(
+                    f"⚠ Could not save column offset: {exc}", 4000,
+                )
+            except Exception:
+                pass
+        self._refresh_col_status()
+
+    def _on_col_nudge(self, direction: int) -> None:
+        """← / → button — bump the spin box by ±1 (or ±5 with Shift).
+
+        We change the spin box value (rather than calling set_column_
+        x_offset directly) so the existing valueChanged → save path
+        runs and there's only one source of truth."""
+        step = 1
+        try:
+            mods = QApplication.keyboardModifiers()
+            if mods & Qt.ShiftModifier:
+                step = 5
+        except Exception:
+            pass
+        try:
+            self._col_spin.setValue(int(self._col_spin.value()) + direction * step)
+        except Exception as exc:
+            log.debug("col nudge failed: %s", exc)
+
+    def _reload_col_offset_for_region(self) -> None:
+        """Re-read the saved column offset and push it into the spin box.
+
+        Called after the dialog's region changes — the spin box reflects
+        the NEW region's saved offset, not the previous region's. Block
+        valueChanged briefly so the read-back doesn't immediately fire
+        a save back into calibration with the same value."""
+        try:
+            self._col_spin.blockSignals(True)
+            self._col_spin.setValue(self._safe_get_col_offset())
+        except Exception:
+            pass
+        finally:
+            try:
+                self._col_spin.blockSignals(False)
+            except Exception:
+                pass
+        self._refresh_col_status()
+
+    # ──────────────────────────────────────────
+    # Emergency override / Manual Override dialog (Feature 2)
+    # ──────────────────────────────────────────
+
+    def _is_override_active(self) -> bool:
+        try:
+            return bool(calibration.get_manual_override_mode(self._region))
+        except Exception as exc:
+            log.debug("get_manual_override_mode failed: %s", exc)
+            return False
+
+    def _refresh_override_indicator(self) -> None:
+        """Sync the title prefix + small status label + visibility of
+        the 'Disable manual override' button to the saved override flag."""
+        active = self._is_override_active()
+        # Window title prefix.
+        base = "Mining HUD OCR Calibration"
+        try:
+            if active:
+                self.setWindowTitle(f"[OVERRIDE ACTIVE] {base}")
+            else:
+                self.setWindowTitle(base)
+        except Exception:
+            pass
+        # Small inline label next to the EMERGENCY button.
+        try:
+            if active:
+                self._override_status_lbl.setText("● Manual override ACTIVE")
+            else:
+                self._override_status_lbl.setText("")
+        except Exception:
+            pass
+        try:
+            self._disable_override_btn.setVisible(active)
+        except Exception:
+            pass
+
+    def _on_open_emergency_override(self) -> None:
+        """Open the Manual Override dialog modally."""
+        # Lazy import so the calibration dialog still loads even if the
+        # manual override module has an import-time issue (it shouldn't
+        # — the smoke test catches that — but we'd rather show a status
+        # message than crash the calibration UI).
+        try:
+            from ui.manual_override_dialog import ManualOverrideDialog
+        except Exception as exc:
+            log.error(
+                "import ManualOverrideDialog failed: %s",
+                exc, exc_info=True,
+            )
+            self._status_bar.showMessage(
+                f"⚠ Could not open Manual Override: {exc}", 6000,
+            )
+            return
+
+        # Capture a fresh HUD frame for the user to draw on. Prefer the
+        # most-recent capture cached by the live-refresh timer (saves an
+        # mss grab); fall back to a fresh capture if that's stale or
+        # missing.
+        hud_pil: Optional[Image.Image] = getattr(
+            self, "latest_hud_pil", None,
+        )
+        if hud_pil is None and self._region is not None:
+            try:
+                from ocr import screen_reader as _sr
+                hud_pil = _sr.capture_region(self._region)
+            except Exception as exc:
+                log.debug(
+                    "manual override: live capture failed: %s", exc,
+                )
+                hud_pil = None
+
+        dlg = ManualOverrideDialog(
+            region=self._region,
+            hud_pil=hud_pil,
+            parent=self,
+        )
+        dlg.overrides_saved.connect(self._on_overrides_saved)
+        dlg.exec()
+        # exec() blocks; on return the override flag may have changed.
+        self._refresh_override_indicator()
+
+    def _on_overrides_saved(self, saved: dict) -> None:
+        """Manual override dialog reported a successful save."""
+        try:
+            count = len(saved)
+        except Exception:
+            count = 0
+        self._status_bar.showMessage(
+            f"✅ Manual override saved ({count} field(s)). OCR pipeline "
+            "will use these boxes on the next scan.", 8000,
+        )
+        log.info(
+            "calibration: manual override saved for region=%s, "
+            "fields=%s",
+            self._region, list(saved.keys()),
+        )
+        self._refresh_override_indicator()
+
+    def _on_disable_override(self) -> None:
+        """Turn off manual override without re-drawing.
+
+        Just flips the flag — leaves the saved boxes in place so the
+        user can re-enable them later by editing calibration.json or by
+        re-opening the manual override dialog (which loads from saved
+        state if implemented). For the v2.2.6.1 release we don't expose
+        a 're-enable from saved' button, but that's a future-friendly
+        knob."""
+        try:
+            calibration.set_manual_override_mode(self._region, False)
+        except Exception as exc:
+            log.error(
+                "set_manual_override_mode(False) failed: %s",
+                exc, exc_info=True,
+            )
+            self._status_bar.showMessage(
+                f"⚠ Could not disable override: {exc}", 6000,
+            )
+            return
+        self._status_bar.showMessage(
+            "Manual override disabled. Auto-detection / locks resumed.",
+            5000,
+        )
+        log.info(
+            "calibration: manual override DISABLED for region=%s",
+            self._region,
+        )
+        self._refresh_override_indicator()
+
     def _on_tab_changed(self, index: int) -> None:
         """Pause the OCR polling timer when leaving the Calibrate tab."""
         # Tab 0 = Calibrate, Tab 1 = Tutorial
         if index == 0:
             if not self._timer.isActive():
                 self._timer.start(POLL_MS)
+            # Also resume the continuous live-preview refresh so
+            # returning to the Calibrate tab immediately reflects the
+            # current screen at every row's calibrated crop position.
+            try:
+                if not self._live_refresh_timer.isActive():
+                    self._live_refresh_timer.start(LIVE_REFRESH_MS)
+            except Exception:
+                pass
             self._status_bar.showMessage("Live polling resumed", 2000)
         else:
             if self._timer.isActive():
                 self._timer.stop()
+            try:
+                if self._live_refresh_timer.isActive():
+                    self._live_refresh_timer.stop()
+            except Exception:
+                pass
             self._status_bar.showMessage(
                 "Live polling paused (not on Calibrate tab)", 0,
             )
 
+    # ──────────────────────────────────────────
+    # Drag-pause for live-refresh
+    # ──────────────────────────────────────────
+    # The 500ms live-refresh timer fires screen captures + label_match
+    # — heavy work that competes with the window-move event handling
+    # while the user drags the dialog around. The window stutters /
+    # rubber-bands as a result. We pause both timers on first moveEvent
+    # and restart them ~250ms after movement stops via a debounced
+    # singleShot.
+
+    def moveEvent(self, event):
+        """Pause heavy timers during window drag; resume shortly after."""
+        try:
+            super().moveEvent(event)
+        except Exception:
+            pass
+        try:
+            # Lazily create the resume-debounce timer.
+            if not hasattr(self, "_resume_after_move_timer"):
+                self._resume_after_move_timer = QTimer(self)
+                self._resume_after_move_timer.setSingleShot(True)
+                self._resume_after_move_timer.timeout.connect(self._resume_timers_after_move)
+            # Pause the heavy timers if they're currently running.
+            if self._live_refresh_timer.isActive():
+                self._live_refresh_timer.stop()
+                self._was_live_refresh_active = True
+            if self._timer.isActive():
+                self._timer.stop()
+                self._was_poll_timer_active = True
+            # Debounce: each move resets the resume timer to fire
+            # 250 ms after the LAST move event.
+            self._resume_after_move_timer.start(250)
+        except Exception:
+            pass
+
+    def _resume_timers_after_move(self) -> None:
+        """Restart the timers paused during window drag."""
+        try:
+            if getattr(self, "_was_poll_timer_active", False):
+                self._timer.start(POLL_MS)
+                self._was_poll_timer_active = False
+            # Only restart live-refresh if we're still on the Calibrate tab.
+            if getattr(self, "_was_live_refresh_active", False):
+                # Mirror the tab-aware logic in _on_tab_changed: only resume
+                # if Calibrate tab is active.
+                tab_idx = self._tabs.currentIndex() if hasattr(self, "_tabs") else 0
+                if tab_idx == 0:
+                    self._live_refresh_timer.start(LIVE_REFRESH_MS)
+                self._was_live_refresh_active = False
+        except Exception:
+            pass
+
     def closeEvent(self, event):
         try:
             self._timer.stop()
+        except Exception:
+            pass
+        try:
+            self._live_refresh_timer.stop()
+        except Exception:
+            pass
+        # Defensively clear the live-refresh in-flight flag. The worker
+        # thread itself is fire-and-forget (daemon); if it's still
+        # running it'll finish, attempt to emit the queued signal, and
+        # ``_on_live_refresh_result`` will drop the payload because
+        # ``isVisible()`` returns False on a closing dialog.
+        try:
+            self._live_refresh_in_flight = False
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "_resume_after_move_timer"):
+                self._resume_after_move_timer.stop()
+        except Exception:
+            pass
+        # Uninstall the global event filter we attached in __init__ —
+        # leaving it on QApplication after the dialog is gone causes
+        # event dispatch into a half-dead Python object (Qt has a C++
+        # ref but Python may have dropped it).
+        try:
+            if getattr(self, "_installed_app_filter", False):
+                _app = QApplication.instance()
+                if _app is not None:
+                    _app.removeEventFilter(self)
+                self._installed_app_filter = False
         except Exception:
             pass
         # Stop any in-flight voice playback so audio doesn't keep

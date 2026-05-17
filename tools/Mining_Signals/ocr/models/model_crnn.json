@@ -1,0 +1,11 @@
+{
+  "charClasses": "0123456789.-% ()ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz",
+  "blankIdx": 68,
+  "numTokens": 69,
+  "inputHeight": 32,
+  "valStringAcc": 0.8282,
+  "modelKind": "crnn",
+  "modelSize": "small",
+  "restoredFrom": "model_crnn_20260417_091915_val83.pt",
+  "note": "best production model; 82% val was label-polluted but lived well"
+}

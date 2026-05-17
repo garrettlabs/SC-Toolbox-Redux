@@ -1,0 +1,12 @@
+{
+  "charClasses": "0123456789.-% ()ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz",
+  "blankIdx": 68,
+  "numTokens": 69,
+  "inputHeight": 32,
+  "valStringAcc": 0.5369786345666948,
+  "trainSamples": 202609,
+  "valSamples": 22513,
+  "modelKind": "crnn",
+  "modelSize": "large",
+  "numParams": 4096741
+}

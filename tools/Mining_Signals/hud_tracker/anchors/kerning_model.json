@@ -1,0 +1,53 @@
+{
+  "schema": "kerning_v1",
+  "units": "fraction-of-row-height",
+  "calibration_source": "approved_sidecars",
+  "n_sidecars_used": 161,
+  "n_digits_histogram": {
+    "4": 37,
+    "5": 124
+  },
+  "slots": {
+    "0": {
+      "center_offset_mean": -0.5470262406250839,
+      "center_offset_median": -0.5680147058823529,
+      "center_offset_sigma": 0.09926081577508652,
+      "digit_w_mean": 0.2421797988263483,
+      "digit_w_median": 0.22918229557389347,
+      "n": 124
+    },
+    "1": {
+      "center_offset_mean": -0.24585218328075625,
+      "center_offset_median": -0.25757575757575757,
+      "center_offset_sigma": 0.0513990961556501,
+      "digit_w_mean": 0.2886437790868447,
+      "digit_w_median": 0.30303030303030304,
+      "n": 161
+    },
+    "2": {
+      "center_offset_mean": 0.26253442026629126,
+      "center_offset_median": 0.2727272727272727,
+      "center_offset_sigma": 0.03738183261840079,
+      "digit_w_mean": 0.32200825305791464,
+      "digit_w_median": 0.3333333333333333,
+      "n": 161
+    },
+    "3": {
+      "center_offset_mean": 0.6071203550318621,
+      "center_offset_median": 0.6323529411764706,
+      "center_offset_sigma": 0.08226035089280256,
+      "digit_w_mean": 0.3272191385611333,
+      "digit_w_median": 0.3333333333333333,
+      "n": 161
+    },
+    "4": {
+      "center_offset_mean": 0.957645962548986,
+      "center_offset_median": 1.0,
+      "center_offset_sigma": 0.12698942374168887,
+      "digit_w_mean": 0.343608499297217,
+      "digit_w_median": 0.3548387096774194,
+      "n": 161
+    }
+  },
+  "comment": "Re-calibrated from user-approved Glyph Forge sidecar JSONs. Positions are user-verified during the Row Reviewer pass. Sigma per slot should be substantially tighter than the previous version which measured from segmenter output."
+}
