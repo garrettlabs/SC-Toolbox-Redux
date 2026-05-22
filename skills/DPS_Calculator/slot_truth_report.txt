@@ -1,0 +1,110 @@
+====================================================================================================
+  SLOT TRUTH AUDIT - slot_extractor vs erkul's rendered slots
+====================================================================================================
+erkul_slot_truth.json captured: 2026-05-18T05:44:15+00:00
+ships - cache: 217, erkul truth: 217
+
+In cache but NOT erkul truth (2): Aurora Mk I  LX, Defender
+In erkul truth but NOT cache (2): Aurora Mk I LX, BANU
+
+====================================================================================================
+  HOW TO READ THIS
+====================================================================================================
+  - WeaponGun and MissileLauncher counts are reconciled for erkul's display
+    conventions (turret grouping, empty weapon mounts, xN missile stacks),
+    so deltas in those types are real discrepancies, not counting artifacts.
+  - A NEGATIVE delta (erkul > ours) means erkul renders a hardpoint that
+    slot_extractor failed to find - the highest-value bugs; listed first.
+  - Shield/Cooler/PowerPlant/Radar use raw counts; a small delta there can
+    be an empty component slot that erkul labels generically.
+
+====================================================================================================
+  HIGH-CONFIDENCE: slot_extractor finds FEWER weapons than erkul  (5 ships)
+====================================================================================================
+
+  F7C-M Super Hornet Mk II           ours=  4  erkul=  5  -> MISSING 1
+  Idris P                            ours= 23  erkul= 24  -> MISSING 1
+  MDC                                ours=  0  erkul=  1  -> MISSING 1
+  Perseus                            ours= 10  erkul= 16  -> MISSING 6
+  ROC                                ours=  0  erkul=  1  -> MISSING 1
+
+====================================================================================================
+  SLOT COUNT MISMATCHES vs erkul truth  (19 ships)
+====================================================================================================
+
+  C1 Spirit:
+    WeaponGun         : ours=  4  erkul=  3  delta=+1
+
+  Constellation Taurus:
+    WeaponGun         : ours=  6  erkul=  5  delta=+1
+
+  Cyclone AA:
+    WeaponGun         : ours=  1  erkul=  0  delta=+1
+
+  Eclipse:
+    MissileLauncher   : ours=  1  erkul=  4  delta=-3
+
+  F7C-M Super Hornet Mk II:
+    WeaponGun         : ours=  4  erkul=  5  delta=-1
+
+  Gladiator:
+    MissileLauncher   : ours= 17  erkul= 21  delta=-4
+
+  Golem OX:
+    WeaponGun         : ours=  4  erkul=  2  delta=+2
+
+  Idris P:
+    WeaponGun         : ours= 23  erkul= 24  delta=-1
+
+  MDC:
+    WeaponGun         : ours=  0  erkul=  1  delta=-1
+
+  Mustang Gamma:
+    WeaponGun         : ours=  3  erkul=  2  delta=+1
+
+  Mustang Omega:
+    WeaponGun         : ours=  3  erkul=  2  delta=+1
+
+  Nomad:
+    WeaponGun         : ours=  4  erkul=  3  delta=+1
+
+  Perseus:
+    WeaponGun         : ours= 10  erkul= 16  delta=-6
+
+  RAFT:
+    WeaponGun         : ours=  3  erkul=  1  delta=+2
+
+  ROC:
+    WeaponGun         : ours=  0  erkul=  1  delta=-1
+
+  Reliant Mako:
+    WeaponGun         : ours=  4  erkul=  2  delta=+2
+
+  Reliant Sen:
+    WeaponGun         : ours=  4  erkul=  2  delta=+2
+
+  Storm AA:
+    WeaponGun         : ours=  1  erkul=  0  delta=+1
+
+  Vanguard Sentinel:
+    PowerPlant        : ours=  2  erkul=  1  delta=+1
+
+====================================================================================================
+  PER-TYPE SUMMARY
+====================================================================================================
+  Type                 Match   Mismatch
+  --------------------------------------
+  WeaponGun              199         16
+  MissileLauncher        213          2
+  Shield                 215          0
+  Cooler                 215          0
+  PowerPlant             214          1
+  QuantumDrive           215          0
+  Radar                  215          0
+
+====================================================================================================
+  SUMMARY
+====================================================================================================
+  ships audited       : 215
+  ships with mismatch : 19
+  skipped (scrape error / name mismatch): 0

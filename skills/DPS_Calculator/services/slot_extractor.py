@@ -9,6 +9,7 @@ _PORT_NAME_TYPES: list[tuple[tuple[str, ...], str]] = [
     (("shield",),        "Shield"),
     (("cooler",),        "Cooler"),
     (("power_plant",),   "PowerPlant"),
+    (("powerplant",),    "PowerPlant"),
     (("quantum_drive",), "QuantumDrive"),
     (("radar",),         "Radar"),
 ]
@@ -18,7 +19,22 @@ _PORT_NAME_TYPES: list[tuple[tuple[str, ...], str]] = [
 # "screen"  → screen_radar inside manned turrets is a display, not a slot.
 # "display" → same reasoning.
 # "controller" → shield/cooler controllers are not component slots.
-_INFERENCE_SKIP_KEYWORDS = ("cockpit", "screen", "display", "controller", "blastshield")
+# "helper" → radar_helper/landingpad_helper are internal helper ports, not slots.
+_INFERENCE_SKIP_KEYWORDS = ("cockpit", "screen", "display", "controller",
+                            "blastshield", "helper")
+
+# Non-canonical itemTypes.type strings normalised to their canonical type.
+# The Mule's battery port reports "Powerplant - Power"; erkul renders it as a
+# power-plant slot.
+_TYPE_ALIASES = {"Powerplant - Power": "PowerPlant"}
+
+# Installed-item localName pattern for blanking caps / cover plates (Talon leg
+# caps, Reliant missile caps). erkul strips these — they are not real slots.
+# Matched on the item localName, not the port name: the same port can hold a
+# real rack on a different ship variant.  'umnt_' (universal mount) items are
+# excluded — erkul keeps a capped universal-mount port as an empty slot
+# (e.g. F7C-S Ghost centre turret with umnt_anvl_s5_cap).
+_CAP_ITEM_RE = re.compile(r"_cap(_(l|r|left|right))?$", re.I)
 
 
 def _infer_type_from_port(pname: str) -> str | None:
@@ -49,6 +65,21 @@ def _count_explicit_types(loadout: list) -> set:
 
     _walk(loadout)
     return found
+
+
+def _has_editable_typed_port(loadout: list, type_name: str) -> bool:
+    """True if any port in the tree is editable and explicitly typed `type_name`."""
+    def _walk(ports) -> bool:
+        for port in (ports or []):
+            if port.get("editable") and any(
+                    t.get("type") == type_name
+                    for t in port.get("itemTypes", []) or []):
+                return True
+            if _walk(port.get("loadout", [])):
+                return True
+        return False
+
+    return _walk(loadout)
 
 
 _TURRET_HOUSING_SUBTYPES = {
@@ -99,6 +130,36 @@ def _gun_position_count(port: dict) -> int:
     return count
 
 
+def _is_missile_rack_port(port: dict) -> bool:
+    """Ground-vehicle missile racks (Ballista, Storm AA, MOTH, Nova, ...) carry
+    no itemTypes; identify one by a leaf child whose port name marks it as a
+    missile attach point."""
+    for child in port.get("loadout", []) or []:
+        cname = child.get("itemPortName", "").lower()
+        if "missile" in cname and not child.get("loadout"):
+            return True
+    return False
+
+
+def _is_pdc_turret_port(pname: str) -> bool:
+    """Point-defence turret ports carry no itemTypes. They are named
+    hardpoint_pdc or hardpoint_pdc_* ; the paired controller / ai-module
+    ports (hardpoint_pdc_wc/_mc/_aim) are not weapons and are excluded."""
+    p = pname.lower()
+    if p != "hardpoint_pdc" and not p.startswith("hardpoint_pdc_"):
+        return False
+    return not any(x in p for x in ("controller", "aimodule", "_wc", "_mc", "_aim"))
+
+
+def _holds_tractor_beam(port: dict) -> bool:
+    """True if the port or any descendant has a tractor-beam item installed.
+    erkul renders such a turret in its tractor-beam section, not as a weapon
+    (e.g. the MPUV Tractor's gun turret holds grin_tractorbeam_s1)."""
+    if (port.get("localName") or "").lower().startswith("grin_tractorbeam"):
+        return True
+    return any(_holds_tractor_beam(c) for c in port.get("loadout", []) or [])
+
+
 def extract_slots_by_type(loadout: list, accept_types: set) -> list:
     """
     Walk the loadout tree and return slots whose itemTypes match accept_types.
@@ -111,6 +172,9 @@ def extract_slots_by_type(loadout: list, accept_types: set) -> list:
     # entire loadout has no itemTypes, while avoiding phantom slots on ships
     # such as Caterpillar that have both explicit and un-typed shield ports).
     _explicit_types = _count_explicit_types(loadout)
+    # Whether the ship has a real (editable) radar slot. Used to drop built-in
+    # non-editable cockpit-radar ports that erkul does not render as slots.
+    _has_editable_radar = _has_editable_typed_port(loadout, "Radar")
 
     slots = []
 
@@ -199,9 +263,19 @@ def extract_slots_by_type(loadout: list, accept_types: set) -> list:
             pname     = port.get("itemPortName", "")
             pname_lower = pname.lower()
 
-            # Skip non-weapon ports
+            # Skip non-weapon ports - but keep one whose name matches a skip
+            # pattern yet is genuinely a component: a missile rack sharing a
+            # fuel-intake port (Starfarer/Gemini), or a Radar on a 'scanner'
+            # port (MPUV).
             if any(pat in pname_lower for pat in _SKIP_PORT_PATTERNS):
-                continue
+                _ptypes = {t.get("type", "") for t in port.get("itemTypes", []) or []}
+                _keep = (
+                    (("fuel_intake" in pname_lower or "fuel_port" in pname_lower)
+                     and _is_missile_rack_port(port))
+                    or ("scan" in pname_lower and "Radar" in _ptypes)
+                )
+                if not _keep:
+                    continue
 
             types     = port.get("itemTypes", [])
             editable  = port.get("editable", False)
@@ -209,7 +283,21 @@ def extract_slots_by_type(loadout: list, accept_types: set) -> list:
             local_ref = port.get("localName", port.get("localReference", ""))
             children  = port.get("loadout", [])
 
-            type_names = {t.get("type", "")  for t in types}
+            # Skip blanking-cap ports — the installed item is a cover plate
+            # (Talon leg caps, Reliant missile caps) that erkul does not render
+            # as a slot. Keyed on the item localName, not the port name: the
+            # same port holds a real rack on other variants (Talon Shrike).
+            _ln = port.get("localName", "")
+            if _ln and not _ln.startswith("umnt_") and _CAP_ITEM_RE.search(_ln):
+                continue
+
+            # A turret occupied by a tractor beam is rendered by erkul in its
+            # tractor-beam section, not as a weapon slot (MPUV Tractor).
+            if "WeaponGun" in accept_types and _holds_tractor_beam(port):
+                continue
+
+            type_names = {_TYPE_ALIASES.get(t.get("type", ""), t.get("type", ""))
+                          for t in types}
             sub_names  = {t.get("subType", "") for t in types}
 
             # Infer component type from port name when itemTypes is absent.
@@ -221,8 +309,30 @@ def extract_slots_by_type(loadout: list, accept_types: set) -> list:
             # are correctly inferred.
             if not type_names:
                 inferred = _infer_type_from_port(pname)
-                if inferred and inferred not in _explicit_types:
+                # Untyped shield/cooler/power-plant/qdrive ports are real slots
+                # and are always inferred. Untyped 'radar'-named ports are
+                # usually cockpit radar displays, not slots - infer Radar only
+                # when the ship has no explicitly-typed Radar port at all.
+                if inferred and (inferred != "Radar" or inferred not in _explicit_types):
                     type_names = {inferred}
+
+            # A missile rack carries its missiles as leaf attach ports. Ground
+            # vehicles tag the rack with no itemTypes; ships like the Apollo and
+            # Hermes tag it MissileLauncher but omit the MissileRack subtype.
+            # Either way, route it through the MissileRack handling below.
+            if _is_missile_rack_port(port):
+                if not type_names:
+                    type_names = {"MissileLauncher"}
+                # Only genuine missile racks expand into per-missile sub-slots.
+                # A pure bomb rack (BombLauncher with no MissileLauncher type)
+                # is a single entry to erkul — leave it un-expanded.
+                if "MissileLauncher" in type_names:
+                    sub_names = sub_names | {"MissileRack"}
+
+            # Point-defence (M2C 'Swarm') turrets carry no itemTypes; identify
+            # them by name so they extract as one weapon slot each.
+            if not type_names and _is_pdc_turret_port(pname):
+                type_names = {"WeaponGun"}
 
             label = _port_label(pname)
             if re.match(r'^Class \d+$', label, re.I):
@@ -250,6 +360,22 @@ def extract_slots_by_type(loadout: list, accept_types: set) -> list:
 
             # Skip bomb launchers from weapon extraction (they're not guns)
             if is_bomb and "WeaponGun" in accept_types and "BombLauncher" not in accept_types:
+                continue
+
+            # Skip real guns from missile extraction. The Idris nose railgun is
+            # typed WeaponGun/Gun + MissileLauncher/MissileRack; erkul renders
+            # it as a weapon, not a missile.
+            if (is_gun and "Gun" in sub_names
+                    and "MissileLauncher" in accept_types
+                    and "WeaponGun" not in accept_types):
+                continue
+
+            # Skip empty, non-editable missile ports — erkul drops a missile
+            # hardpoint with no rack, no default item and no way to fill it
+            # (Talon Shrike's vestigial wing missile mounts).
+            if (is_missile and not editable and not children
+                    and not port.get("localName")
+                    and not port.get("localReference")):
                 continue
 
             # Skip PURE missile turrets (PDS/CIWS) from gun extraction.
@@ -282,18 +408,34 @@ def extract_slots_by_type(loadout: list, accept_types: set) -> list:
                     # Compound GunTurret / Turret detection:
                     # If the port contains multiple independent gun positions as
                     # children (e.g. 400i remote turrets, Scorpius remote turret,
-                    # F7A canard nose, Asgard pilot turret with hardpoint_left/right),
-                    # recurse into children instead of adding a single slot.
-                    # Note: is_gun may be True on compound turrets that also declare
-                    # WeaponGun in their itemTypes (e.g. Asgard pilot turret) — we
-                    # must NOT skip the compound path for those.
-                    if (children and _gun_position_count(port) > 1):
-                        # Arm-style turrets (hardpoint_turret_*/joint_turret_* children)
-                        # have guns one size class smaller than the housing port.
+                    # F7A canard nose), recurse into children instead of adding a
+                    # single slot.
+                    # A port that is itself WeaponGun-typed is a single weapon to
+                    # erkul even when it has multiple gun-position children (e.g.
+                    # Asgard pilot turret, Freelancer side cannons) — count it once,
+                    # do not recurse.
+                    if (children and _gun_position_count(port) > 1 and not is_gun):
+                        # Multi-gun turret housing: erkul groups the identical
+                        # inner guns into a single 'weapons' entry ("Gun xN").
+                        # Emit one slot carrying the gun count to mirror that,
+                        # rather than recursing into N separate slots.
+                        # Arm-style turrets (hardpoint_turret_*/joint_turret_*
+                        # children) have guns one size class smaller than the
+                        # housing port.
                         first_child = children[0].get("itemPortName", "") if children else ""
                         size_adjust = (first_child.startswith("hardpoint_turret_") or
                                        first_child.startswith("joint_turret_"))
-                        walk(children, label, max(max_sz - 1, 1) if size_adjust else max_sz)
+                        inner_sz = max(max_sz - 1, 1) if size_adjust else max_sz
+                        slots.append({
+                            "id":        f"{parent_label}:{pname}",
+                            "label":     label,
+                            "max_size":  inner_sz,
+                            "editable":  True,
+                            "local_ref": _resolve_weapon_ref(port),
+                            "outer_ref": port.get("localReference", "")
+                                         or port.get("localName", ""),
+                            "gun_count": _gun_position_count(port),
+                        })
                     elif "MissileRack" in sub_names and children:
                         # Rack hardware slot (the rack itself, e.g. MSD-423)
                         rack_ref = port.get("localReference", "") or port.get("localName", "")
@@ -305,11 +447,19 @@ def extract_slots_by_type(loadout: list, accept_types: set) -> list:
                             "local_ref": rack_ref,
                             "is_rack":   True,
                         })
-                        # Individual missile sub-slots
+                        # Individual missile sub-slots. Most racks name these
+                        # missile_NN_attach; torpedo launchers (Vanguard
+                        # Harbinger) use torpedo_tray_NN_attach_node.
+                        # Only loaded sub-slots count: erkul shows a rack's
+                        # equipped missiles, not its empty capacity (a rack's
+                        # loadout tree can list more attach ports than the rack
+                        # item actually holds, e.g. F7C-M Heartseeker).
                         for child in children:
                             child_ipn = child.get("itemPortName", "")
                             child_ref = child.get("localReference", "") or child.get("localName", "")
-                            if "missile" in child_ipn.lower():
+                            child_lower = child_ipn.lower()
+                            if (("missile" in child_lower or "torpedo" in child_lower)
+                                    and child_ref):
                                 slots.append({
                                     "id":         f"{parent_label}:{pname}:{child_ipn}",
                                     "label":      label,
@@ -393,7 +543,15 @@ def extract_slots_by_type(loadout: list, accept_types: set) -> list:
                         walk(children, label if is_gun_arm else parent_label, max_sz)
             else:
                 # Component tab logic (Shield, Cooler, Radar, PowerPlant, QuantumDrive…)
-                if is_match:
+                # '_fake' local names are display/dummy components (e.g. MOLE
+                # mining-cab radars) that erkul does not count.
+                # A non-editable Radar port is a built-in cockpit display, not a
+                # swappable slot — erkul drops it when the ship also has a real
+                # editable radar (e.g. Prospector); it is kept when it is the
+                # ship's only radar (e.g. Hull A).
+                is_builtin_radar = ("Radar" in type_names and not editable
+                                    and _has_editable_radar)
+                if is_match and "_fake" not in (local_ref or "") and not is_builtin_radar:
                     slots.append({
                         "id":        f"{pname}",
                         "label":     label,
