@@ -509,6 +509,67 @@ public partial class MainWindow : Window
         }
     }
 
+    /// <summary>
+    /// Check the registry for an installed VC++ 2015-2022 Redistributable
+    /// (x64).  The Mining Signals OCR runtime links onnxruntime, which
+    /// requires vcruntime140 / msvcp140; on systems without them the
+    /// scanner silently dies with both CNN voters reporting "unavailable".
+    /// </summary>
+    private static bool IsVcRedistInstalled()
+    {
+        try
+        {
+            using var key = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(
+                @"SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\X64");
+            if (key == null) return false;
+            return (key.GetValue("Installed") as int?) == 1;
+        }
+        catch { return false; }
+    }
+
+    /// <summary>
+    /// Silent-install the bundled vc_redist.x64.exe if the VC++ Runtime
+    /// isn't already on the machine.  No-ops (no UAC prompt) when the
+    /// runtime is already installed so most users see no friction.
+    /// Failures are swallowed -- the app install proceeds regardless,
+    /// and Mining Signals' Python startup check will surface a clear
+    /// "missing VC++ Runtime" dialog if it's still wrong afterwards.
+    /// </summary>
+    private async Task EnsureVcRedistAsync()
+    {
+        if (IsVcRedistInstalled()) return;
+
+        var dir = AppContext.BaseDirectory;
+        var vcRedist = System.IO.Path.Combine(dir, "vc_redist.x64.exe");
+        if (!System.IO.File.Exists(vcRedist)) return; // not bundled -- skip
+
+        try
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName = vcRedist,
+                Arguments = "/install /quiet /norestart",
+                UseShellExecute = true,   // shell-execute so the "runas" verb takes effect
+                Verb = "runas",           // request UAC elevation
+                WindowStyle = ProcessWindowStyle.Hidden,
+            };
+            var proc = Process.Start(psi);
+            if (proc == null) return;
+            // Wait up to 3 minutes for the redistributable install.
+            // Accepted exit codes: 0 (success), 1638 (newer already
+            // installed), 3010 (success + reboot required).  We don't
+            // gate on the code -- the Python startup check is the
+            // real backstop if onnxruntime still can't load.
+            await Task.Run(() => proc.WaitForExit(180_000));
+        }
+        catch
+        {
+            // UAC dismissed, or Process.Start refused for any reason --
+            // continue with the app install.  The Python startup check
+            // will tell the user if they still need to install vcredist.
+        }
+    }
+
     private async Task StartInstallAsync()
     {
         // Sweep zombie launcher / Update.exe processes that might be
@@ -524,6 +585,17 @@ public partial class MainWindow : Window
         // sweep above so Update.exe has released its file locks before
         // we try to delete it.
         WipeStaleInstallRoot();
+
+        // Ensure the Microsoft Visual C++ Runtime is present before we
+        // run Velopack's Setup.exe.  Mining Signals' OCR pipeline links
+        // onnxruntime, which needs vcruntime140 / msvcp140; on machines
+        // without them onnxruntime can't load and the scanner silently
+        // dies with both CNN voters reporting "unavailable" -- the
+        // v2.2.10 user-reported failure mode.  EnsureVcRedistAsync is a
+        // no-op (no UAC) when the runtime is already installed, so most
+        // users see no extra friction.
+        StatusDetail.Text = "Checking system dependencies…";
+        await EnsureVcRedistAsync();
 
         // Skip the entire Velopack subprocess if the same version is
         // already installed. Without this, Setup.exe's --silent mode
