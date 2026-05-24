@@ -8,7 +8,7 @@
 ; =====================================================================
 
 #define MyAppName      "SC Toolbox"
-#define MyAppVersion   "2.2.10"
+#define MyAppVersion   "2.2.11"
 #define MyAppPublisher "SC Toolbox"
 #define MyAppURL       "https://github.com/ScPlaceholder/SC-Toolbox-Beta-V2"
 

@@ -24,8 +24,8 @@
 
     <!-- Branding -->
     <ApplicationIcon>..\..\assets\sc_toolbox.ico</ApplicationIcon>
-    <Version>2.2.10</Version>
-    <FileVersion>2.2.10</FileVersion>
+    <Version>2.2.11</Version>
+    <FileVersion>2.2.11</FileVersion>
     <Product>SC Toolbox Installer</Product>
     <Company>SC Toolbox</Company>
     <Copyright>Copyright (c) 2026</Copyright>
