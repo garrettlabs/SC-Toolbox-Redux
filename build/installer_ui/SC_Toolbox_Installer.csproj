@@ -1,0 +1,60 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <RootNamespace>SC_Toolbox.Installer</RootNamespace>
+    <AssemblyName>SC_Toolbox_Setup</AssemblyName>
+    <UseWPF>true</UseWPF>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+
+    <!-- Single self-contained .exe — easier to ship than runtime-dependent.
+         Result is ~80 MB but Velopack's bundled .nupkg dwarfs that anyway. -->
+    <PublishSingleFile>true</PublishSingleFile>
+    <SelfContained>true</SelfContained>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <!-- Required for our bundled Velopack Setup.exe to land on disk at
+         AppContext.BaseDirectory at runtime. Without it, Content files
+         stay inside the bundle and FindSetupExe() can't see them as files
+         on disk to spawn as a subprocess. -->
+    <IncludeAllContentForSelfExtract>true</IncludeAllContentForSelfExtract>
+    <PublishReadyToRun>false</PublishReadyToRun>
+
+    <!-- Branding -->
+    <ApplicationIcon>..\..\assets\sc_toolbox.ico</ApplicationIcon>
+    <Version>2.2.10</Version>
+    <FileVersion>2.2.10</FileVersion>
+    <Product>SC Toolbox Installer</Product>
+    <Company>SC Toolbox</Company>
+    <Copyright>Copyright (c) 2026</Copyright>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Velopack" Version="0.0.1298" />
+  </ItemGroup>
+
+  <!-- Background images embedded as resources so they ship inside the .exe.
+       Drop additional .jpg/.png files into Resources/Backgrounds/ and they
+       auto-rotate. Filenames are sorted lexically — name them e.g. bg01.jpg,
+       bg02.jpg if you want a specific order. -->
+  <ItemGroup>
+    <Resource Include="Resources\Backgrounds\*.jpg" />
+    <Resource Include="Resources\Backgrounds\*.png" />
+  </ItemGroup>
+
+  <!-- Bundle Velopack's Setup.exe alongside our custom UI as a single .exe.
+       .NET 8's single-file publish bundles all <Content> items into the
+       output binary; on first run it self-extracts to %LOCALAPPDATA%\.net\
+       and our launcher reads Setup.exe from AppContext.BaseDirectory.
+       Tradeoff: ~1.4 GB single-file installer vs. zip-with-two-files.
+       Fallback if anything goes wrong: revert this change, ship as zip. -->
+  <ItemGroup>
+    <Content Include="..\Releases\SC_Toolbox-win-Setup.exe">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+    </Content>
+  </ItemGroup>
+
+</Project>

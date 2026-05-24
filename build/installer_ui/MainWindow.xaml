@@ -1,0 +1,292 @@
+<Window x:Class="SC_Toolbox.Installer.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="SC Toolbox Setup"
+        Height="640" Width="960"
+        MinHeight="640" MinWidth="960"
+        WindowStartupLocation="CenterScreen"
+        Background="#0a0e14"
+        ResizeMode="CanMinimize"
+        FontFamily="Segoe UI"
+        Foreground="{StaticResource TextBrush}">
+    <!--
+        Layout:
+            ┌──────────────────────────────────────────┐
+            │  [Image]  ←── full-window background      │
+            │           (cross-fades every 6 s)         │
+            │                                           │
+            │                                           │
+            │   ╭ Status panel ───────────────────╮     │  ← bottom panel
+            │   │ Installing SC Toolbox 2.2.6     │     │     overlays the
+            │   │ ▰▰▰▰▰▰▰▰▱▱▱▱▱▱▱▱▱▱▱▱▱▱     65 % │     │     image
+            │   │ Setting up Mining Signals OCR…  │     │
+            │   │                  [Cancel]       │     │
+            │   ╰─────────────────────────────────╯     │
+            └──────────────────────────────────────────┘
+    -->
+
+    <Grid>
+        <!-- Background image cross-fader: two Image controls overlaid.
+             We swap which one is opaque each tick. -->
+        <Grid x:Name="BackgroundLayer">
+            <Image x:Name="BgPrimary"
+                   Stretch="UniformToFill"
+                   Opacity="1.0" />
+            <Image x:Name="BgSecondary"
+                   Stretch="UniformToFill"
+                   Opacity="0.0" />
+            <!-- Subtle dark gradient at the bottom so the status panel
+                 reads cleanly over any image. -->
+            <Rectangle VerticalAlignment="Bottom" Height="240">
+                <Rectangle.Fill>
+                    <LinearGradientBrush StartPoint="0,0" EndPoint="0,1">
+                        <GradientStop Color="#000a0e14" Offset="0.0" />
+                        <GradientStop Color="#cc0a0e14" Offset="1.0" />
+                    </LinearGradientBrush>
+                </Rectangle.Fill>
+            </Rectangle>
+        </Grid>
+
+        <!-- Foreground content overlay -->
+        <Grid Margin="32,28,32,28">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="*" />
+                <RowDefinition Height="Auto" />
+            </Grid.RowDefinitions>
+
+            <!-- Top header: app title + version -->
+            <StackPanel Grid.Row="0" Orientation="Horizontal" VerticalAlignment="Top">
+                <TextBlock x:Name="TitleText" FontSize="28" FontWeight="Light"
+                           Foreground="{StaticResource AccentBrush}"
+                           Text="SC TOOLBOX" />
+                <!-- The version strings here, in WelcomeTitle and in
+                     StatusTitle are design-time placeholders only.
+                     MainWindow.xaml.cs overwrites all three at runtime
+                     from INSTALLER_VERSION (assembly <Version>) right
+                     after InitializeComponent(), so the .cs is the single
+                     source of truth — these literals just keep the VS
+                     designer roughly current. -->
+                <TextBlock FontSize="28" FontWeight="Light"
+                           Foreground="{StaticResource TextDimBrush}"
+                           Margin="14,0,0,0"
+                           x:Name="VersionText"
+                           Text="v2.2.10" />
+            </StackPanel>
+
+            <!-- Middle filler — could host a tip carousel later -->
+            <TextBlock Grid.Row="1"
+                       x:Name="TipText"
+                       VerticalAlignment="Bottom"
+                       HorizontalAlignment="Left"
+                       Margin="0,0,0,24"
+                       FontSize="14"
+                       FontStyle="Italic"
+                       Foreground="{StaticResource TextDimBrush}"
+                       TextWrapping="Wrap"
+                       MaxWidth="640"
+                       Text="" />
+
+            <!-- Bottom panel slot: hosts EITHER the Welcome panel (shown on
+                 first launch, awaiting user consent) OR the Status/progress
+                 panel (shown once Install is clicked). They occupy the same
+                 grid cell and toggle via Visibility. The "Already installed"
+                 detection still flips us straight into the celebration state
+                 inside StatusPanel, bypassing the welcome. -->
+            <Grid Grid.Row="2">
+                <!-- ── Welcome panel (initial state) ────────────────────── -->
+                <Border x:Name="WelcomePanel"
+                        Background="{StaticResource PanelBackBrush}"
+                        BorderBrush="{StaticResource PanelBorderBrush}"
+                        BorderThickness="1"
+                        CornerRadius="2"
+                        Padding="24,20"
+                        Visibility="Visible">
+                    <Grid>
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                        </Grid.RowDefinitions>
+
+                        <!-- Welcome headline -->
+                        <TextBlock Grid.Row="0"
+                                   x:Name="WelcomeTitle"
+                                   FontSize="20"
+                                   FontWeight="SemiBold"
+                                   Foreground="{StaticResource TextBrush}"
+                                   Text="Welcome to SC Toolbox v2.2.10 setup" />
+
+                        <!-- Description: what gets installed + where + size.
+                             Wrapped, dim color so it reads as supporting text. -->
+                        <TextBlock Grid.Row="1"
+                                   x:Name="WelcomeBody"
+                                   Margin="0,10,0,0"
+                                   FontSize="13"
+                                   Foreground="{StaticResource TextDimBrush}"
+                                   TextWrapping="Wrap"
+                                   Text="This will install SC Toolbox to %LOCALAPPDATA%\SC_Toolbox\ (~1.4 GB on disk). It includes a bundled Python runtime, machine-learning models for Mining Signals OCR, and a Tesseract OCR engine — no separate downloads or system-wide installs are needed." />
+
+                        <!-- Options + buttons row. Mirrors the layout of the
+                             status panel below so the visual transition feels
+                             continuous when Install is clicked. -->
+                        <Grid Grid.Row="2" Margin="0,18,0,0">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <CheckBox Grid.Column="0"
+                                      x:Name="AddDesktopShortcut"
+                                      Content="Add desktop shortcut"
+                                      IsChecked="True"
+                                      Foreground="{StaticResource TextBrush}"
+                                      VerticalAlignment="Center" />
+                            <StackPanel Grid.Column="1" Orientation="Horizontal">
+                                <!-- Primary green Install button — same accent
+                                     treatment as the celebration's Launch
+                                     button so the visual language is consistent. -->
+                                <Button x:Name="InstallButton"
+                                        Content="Install"
+                                        Padding="28,8"
+                                        Margin="0,0,10,0"
+                                        FontSize="14"
+                                        FontWeight="Bold"
+                                        Background="{StaticResource AccentBrush}"
+                                        Foreground="#0a0e14"
+                                        BorderBrush="{StaticResource AccentBrush}"
+                                        BorderThickness="2"
+                                        Cursor="Hand"
+                                        IsDefault="True"
+                                        Click="InstallButton_Click" />
+                                <Button x:Name="WelcomeCancelButton"
+                                        Content="Cancel"
+                                        Padding="20,6"
+                                        Click="CancelButton_Click" />
+                            </StackPanel>
+                        </Grid>
+                    </Grid>
+                </Border>
+
+                <!-- ── Status / progress panel (shown after Install click) ── -->
+                <Border x:Name="StatusPanel"
+                        Background="{StaticResource PanelBackBrush}"
+                        BorderBrush="{StaticResource PanelBorderBrush}"
+                        BorderThickness="1"
+                        CornerRadius="2"
+                        Padding="24,20"
+                        Visibility="Collapsed">
+                    <Grid>
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                        </Grid.RowDefinitions>
+
+                        <!-- Status headline (with checkmark slot for the
+                             completion state — Path is collapsed during
+                             install, made visible + animated on success). -->
+                        <StackPanel Grid.Row="0" Orientation="Horizontal" VerticalAlignment="Center">
+                            <Viewbox x:Name="CompleteCheck"
+                                     Width="28" Height="28"
+                                     Margin="0,0,12,0"
+                                     Visibility="Collapsed"
+                                     RenderTransformOrigin="0.5,0.5">
+                                <Viewbox.RenderTransform>
+                                    <ScaleTransform x:Name="CompleteCheckScale" ScaleX="0" ScaleY="0" />
+                                </Viewbox.RenderTransform>
+                                <Grid Width="24" Height="24">
+                                    <Ellipse Fill="{StaticResource AccentBrush}" />
+                                    <Path Data="M5,12 L10,17 L19,7"
+                                          Stroke="#0a0e14"
+                                          StrokeThickness="3"
+                                          StrokeStartLineCap="Round"
+                                          StrokeEndLineCap="Round"
+                                          StrokeLineJoin="Round" />
+                                </Grid>
+                            </Viewbox>
+                            <TextBlock x:Name="StatusTitle"
+                                       FontSize="20"
+                                       FontWeight="SemiBold"
+                                       Foreground="{StaticResource TextBrush}"
+                                       VerticalAlignment="Center"
+                                       Text="Installing SC Toolbox 2.2.10" />
+                        </StackPanel>
+
+                        <!-- Progress bar + percentage -->
+                        <Grid Grid.Row="1" Margin="0,12,0,0">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <ProgressBar Grid.Column="0"
+                                         x:Name="Progress"
+                                         Height="4"
+                                         Minimum="0"
+                                         Maximum="100"
+                                         Value="0"
+                                         Background="{StaticResource AccentBrushDim}"
+                                         Foreground="{StaticResource AccentBrush}"
+                                         BorderThickness="0" />
+                            <TextBlock Grid.Column="1"
+                                       x:Name="ProgressLabel"
+                                       Margin="14,0,0,0"
+                                       FontSize="14"
+                                       FontFamily="Consolas"
+                                       Foreground="{StaticResource AccentBrush}"
+                                       VerticalAlignment="Center"
+                                       Text="  0 %" />
+                        </Grid>
+
+                        <!-- Status detail -->
+                        <TextBlock Grid.Row="2"
+                                   x:Name="StatusDetail"
+                                   Margin="0,10,0,0"
+                                   FontSize="13"
+                                   Foreground="{StaticResource TextDimBrush}"
+                                   Text="Preparing…"
+                                   TextTrimming="CharacterEllipsis" />
+
+                        <!-- Buttons row. NOTE: the desktop-shortcut checkbox
+                             lives on the Welcome panel — its IsChecked value
+                             is read at install completion, no need to repeat
+                             it here. -->
+                        <Grid Grid.Row="3" Margin="0,12,0,0">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <StackPanel Grid.Column="1" Orientation="Horizontal">
+                                <Button x:Name="LaunchButton"
+                                        Content="LAUNCH SC TOOLBOX"
+                                        Padding="28,12"
+                                        Margin="0,0,10,0"
+                                        FontSize="14"
+                                        FontWeight="Bold"
+                                        Background="{StaticResource AccentBrush}"
+                                        Foreground="#0a0e14"
+                                        BorderBrush="{StaticResource AccentBrush}"
+                                        BorderThickness="2"
+                                        Cursor="Hand"
+                                        Visibility="Collapsed"
+                                        Click="LaunchButton_Click">
+                                    <Button.Effect>
+                                        <DropShadowEffect x:Name="LaunchGlow"
+                                                          Color="#33dd88"
+                                                          BlurRadius="0"
+                                                          ShadowDepth="0"
+                                                          Opacity="0" />
+                                    </Button.Effect>
+                                </Button>
+                                <Button x:Name="CancelButton"
+                                        Content="Cancel"
+                                        Padding="20,6"
+                                        Click="CancelButton_Click" />
+                            </StackPanel>
+                        </Grid>
+                    </Grid>
+                </Border>
+            </Grid>
+        </Grid>
+    </Grid>
+</Window>
