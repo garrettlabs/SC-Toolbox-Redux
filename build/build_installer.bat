@@ -600,14 +600,59 @@ echo.
 echo  [*] Validating staging integrity...
 set "VALIDATION_OK=1"
 
-:: Mining_Signals ONNX model (digit CNN for HUD mass/resistance)
-if not exist "%STAGE%\tools\Mining_Signals\ocr\models\model_cnn.onnx" (
-    echo  [!] MISSING: ocr\models\model_cnn.onnx — HUD scanner broken
-    set "VALIDATION_OK=0"
-)
-if not exist "%STAGE%\tools\Mining_Signals\ocr\models\model_cnn.onnx.data" (
-    echo  [!] MISSING: ocr\models\model_cnn.onnx.data — HUD scanner broken
-    set "VALIDATION_OK=0"
+:: Mining_Signals ONNX models — validate the full voter ensemble.
+::
+:: Pre-v2.2.10 the build only checked model_cnn.onnx (HUD digit CNN).
+:: A user crash log surfaced the gap: signal_anchor reported BOTH
+:: rgb_cnn=unavailable AND gray_cnn=unavailable, meaning the signal-
+:: side CNN models hadn't loaded. With every voter abstaining the
+:: anchor rejected the signature panel and the scanner silently
+:: returned nothing. Any missing model file produces the same class
+:: of failure — the corresponding CNN/CRNN voter sticks in the
+:: "unavailable" state for the process lifetime and the runtime
+:: falls back to weaker readers (or no read at all) without telling
+:: the user.
+::
+:: Each ".onnx" pairs with an ".onnx.data" external-weights file
+:: (CNN weights exceed the 2GB single-protobuf limit).
+::
+::   HUD digit OCR (mass / resistance / instability):
+::     model_cnn          — gray primary
+::     model_cnn_inv      — gray secondary (inverted polarity)
+::     model_crnn         — whole-value sequence reader
+::
+::   Signal-panel OCR (signature scanner):
+::     model_signal_cnn          — gray voter (anchor + per-glyph)
+::     model_signal_inv_cnn      — inverted secondary
+::     model_signal_rgb_cnn_v2   — RGB voter + v2.2.9 PRIMARY reader
+::     model_signal_rgb_inv_cnn  — RGB inverted (primary's polarity pair)
+::     model_signal_crnn_rgb     — RGB CRNN, v2.2.9 SECONDARY reader
+::
+::   Template voter (sixth voter, deterministic furore-font match):
+::     furore_templates.npz
+for %%M in (
+    model_cnn.onnx
+    model_cnn.onnx.data
+    model_cnn_inv.onnx
+    model_cnn_inv.onnx.data
+    model_crnn.onnx
+    model_crnn.onnx.data
+    model_signal_cnn.onnx
+    model_signal_cnn.onnx.data
+    model_signal_inv_cnn.onnx
+    model_signal_inv_cnn.onnx.data
+    model_signal_rgb_cnn_v2.onnx
+    model_signal_rgb_cnn_v2.onnx.data
+    model_signal_rgb_inv_cnn.onnx
+    model_signal_rgb_inv_cnn.onnx.data
+    model_signal_crnn_rgb.onnx
+    model_signal_crnn_rgb.onnx.data
+    furore_templates.npz
+) do (
+    if not exist "%STAGE%\tools\Mining_Signals\ocr\models\%%M" (
+        echo  [!] MISSING: ocr\models\%%M
+        set "VALIDATION_OK=0"
+    )
 )
 
 :: Tesseract binary (all OCR paths depend on this)
@@ -664,6 +709,15 @@ if not exist "%STAGE%\python\Lib\site-packages\onnx" (
 )
 if not exist "%STAGE%\python\Lib\site-packages\PIL" (
     echo  [!] MISSING: Pillow pip package — all image processing broken
+    set "VALIDATION_OK=0"
+)
+:: scipy is required by sc_ocr's multi-recipe adaptive binarizer,
+:: signal_anchor's connected-component labelling, and label_match's
+:: template matching. Without it the signal scanner silently falls
+:: through to Tesseract-only — a recurring silent-degradation already
+:: flagged in this script's pip-install comment above.
+if not exist "%STAGE%\python\Lib\site-packages\scipy" (
+    echo  [!] MISSING: scipy pip package — signal scanner degrades to Tesseract-only
     set "VALIDATION_OK=0"
 )
 
