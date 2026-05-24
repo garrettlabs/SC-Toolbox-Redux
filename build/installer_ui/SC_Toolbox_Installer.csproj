@@ -60,7 +60,7 @@
          vcruntime140.dll / msvcp140.dll.  On Windows installs that
          don't have them (clean Windows / Windows N / locked-down
          enterprise) onnxruntime can't load and the scanner silently
-         dies with both CNN voters reporting "unavailable" -- the
+         dies with both CNN voters reporting "unavailable" — the
          v2.2.10 user-reported failure.  MainWindow.xaml.cs silent-
          installs this at the start of StartInstallAsync, no-op'd when
          the runtime is already present (registry-checked, no UAC).
