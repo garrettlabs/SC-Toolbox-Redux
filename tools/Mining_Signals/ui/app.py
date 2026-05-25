@@ -5545,8 +5545,25 @@ class MiningSignalsApp(SCWindow):
         )
         popup.show()
 
+    @Slot()
     def _dismiss_scanning(self) -> None:
-        """Hide the 'Scanning' placeholder if it's showing."""
+        """Hide the 'Scanning' placeholder if it's showing.
+
+        MUST be decorated with @Slot() because the signature-scanner
+        worker thread invokes this via ``QMetaObject.invokeMethod(
+        self, "_dismiss_scanning", Qt.QueuedConnection)`` (see
+        ``ui/app.py`` around line 4467).  Without the decorator
+        PyQt's meta-object introspection doesn't expose the method
+        as invokable from cross-thread queued connections and Qt
+        logs ``QMetaObject::invokeMethod: No such method
+        MiningSignalsApp::_dismiss_scanning()`` every time the
+        signature scanner tries to clear its "Scanning..." placeholder
+        bubble.  The visible symptom: the bubble stays on screen
+        and the user thinks the scanner is hung / produces no
+        results, even though the OCR pipeline ran fine downstream.
+        Observed hundreds of times in the v2.2.12 user log
+        (mining_signals (3).log).
+        """
         if self._scan_bubble.isVisible() and not self._scan_bubble._matches:
             self._scan_bubble.hide()
 
