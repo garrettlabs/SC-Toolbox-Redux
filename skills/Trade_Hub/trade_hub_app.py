@@ -917,6 +917,19 @@ class TradeHubWindow(SCWindow):
         self._min_profit.returnPressed.connect(self._apply_search)
         sb_lay.addWidget(self._min_profit)
 
+        # Starting investment (max aUEC available for first-leg buy)
+        section(_("STARTING INVESTMENT (aUEC)"))
+        self._max_investment = QLineEdit()
+        self._max_investment.setPlaceholderText(_("e.g. 2000000"))
+        self._max_investment.setToolTip(_(
+            "Maximum aUEC you have to start a trade. Routes whose "
+            "first-leg buy cost (price × ship capacity or "
+            "available stock, whichever is smaller) exceeds this "
+            "amount are hidden. Leave blank or 0 to show all routes."
+        ))
+        self._max_investment.returnPressed.connect(self._apply_search)
+        sb_lay.addWidget(self._max_investment)
+
         # Search
         section(_("SEARCH"))
         self._search = SCSearchBar(placeholder=_("Search..."), debounce_ms=320)
@@ -1225,6 +1238,18 @@ class TradeHubWindow(SCWindow):
             else:
                 mixed = [m for m in mixed if m.num_legs() >= 2]
 
+            # STARTING INVESTMENT cap (MIXED / BASKET path):
+            # the first leg's total buy cost across all cargo slots
+            # must fit the user's budget.  Subsequent legs are paid
+            # for with proceeds from earlier sales so only the first
+            # leg matters for the "money on hand" check.
+            if f.max_investment > 0:
+                mixed = [
+                    m for m in mixed
+                    if m.legs
+                    and m.legs[0].total_investment() <= f.max_investment
+                ]
+
             q = self._search.text().strip().lower()
             if q:
                 mixed = [m for m in mixed if any(q in x.lower() for x in [
@@ -1237,6 +1262,16 @@ class TradeHubWindow(SCWindow):
 
         if self._view_mode == "LOOPS":
             loops = self._filter_loops(self._all_loops, f)
+            # STARTING INVESTMENT cap (LOOPS path): first leg's
+            # (buy_price * effective_scu) must fit the user's budget.
+            if f.max_investment > 0:
+                _ship = self._ship_scu
+                loops = [
+                    m for m in loops
+                    if m.legs
+                    and m.legs[0].price_buy * m.legs[0].effective_scu(_ship)
+                        <= f.max_investment
+                ]
             q = self._search.text().strip().lower()
             if q:
                 loops = [m for m in loops if any(q in x.lower() for x in [
@@ -1246,6 +1281,16 @@ class TradeHubWindow(SCWindow):
             self._populate_loop_table()
         else:
             result = apply_filters(self._all_routes, f)
+            # STARTING INVESTMENT cap (single-route ROUTES path):
+            # this trip's buy cost (price * effective_scu) must fit
+            # the user's budget.
+            if f.max_investment > 0:
+                _ship = self._ship_scu
+                result = [
+                    r for r in result
+                    if r.price_buy * r.effective_scu(_ship)
+                        <= f.max_investment
+                ]
             # Pre-compute profits so sort and display use the same values
             # For expensive modes (Monte Carlo), pre-sort by standard profit
             # and only compute the full simulation for the top N routes
@@ -1376,6 +1421,13 @@ class TradeHubWindow(SCWindow):
             f.min_scu = int(self._min_scu.text()) if self._min_scu.text() else 0
         except ValueError:
             f.min_scu = 0
+        try:
+            # Accept "2,000,000" or "2000000" or "2.5e6".  Strip commas
+            # / whitespace before float() so common keyboard habits work.
+            raw_inv = self._max_investment.text().strip().replace(",", "") if self._max_investment else ""
+            f.max_investment = float(raw_inv) if raw_inv else 0.0
+        except (ValueError, AttributeError):
+            f.max_investment = 0.0
         f.only_selected_systems = getattr(self, "_only_sel_sys", False)
         return f
 
@@ -1418,6 +1470,8 @@ class TradeHubWindow(SCWindow):
         self._commodity_combo.set_text("")
         self._min_scu.clear()
         self._min_profit.clear()
+        if hasattr(self, "_max_investment") and self._max_investment is not None:
+            self._max_investment.clear()
         self._search.clear()
         self._apply_search()
 
@@ -2064,6 +2118,8 @@ class TradeHubWindow(SCWindow):
                 self._commodity_combo.set_text(cmd["commodity"])
             if cmd.get("min_profit_scu"):
                 self._min_profit.setText(str(cmd["min_profit_scu"]))
+            if cmd.get("max_investment") and hasattr(self, "_max_investment"):
+                self._max_investment.setText(str(cmd["max_investment"]))
             self._apply_search()
         elif t == "clear_filters":
             self._clear_filters()

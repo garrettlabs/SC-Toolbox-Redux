@@ -201,6 +201,15 @@ class FilterState:
     min_scu:        int   = 0
     only_selected_systems: bool = False
     allow_illegal: bool = True  # When False, filter out illegal routes
+    # Maximum aUEC the user has available to start a trade.  When > 0
+    # routes whose FIRST LEG buy cost (price_buy * effective_scu)
+    # exceeds this budget are hidden -- the user can't afford to fill
+    # the ship at the first stop.  Subsequent legs in a loop/chain
+    # are paid for with the proceeds from previous legs, so only the
+    # first leg's cost matters for the "starting investment" check.
+    # Applied in trade_hub_app._refresh_display where ship_scu is in
+    # scope; apply_filters itself ignores this field.
+    max_investment: float = 0.0
 
 
 def apply_filters(routes: List[Route], f: FilterState) -> List[Route]:

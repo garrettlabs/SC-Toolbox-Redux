@@ -42,6 +42,21 @@ _TOOL_DIR = os.path.normpath(os.path.join(_THIS_DIR, "..", ".."))
 _TEMPLATES_PATH = os.path.join(
     _TOOL_DIR, "ocr", "sc_templates", "labels.npz",
 )
+# Synthetic sharp RGB MASS template -- colorized from the grayscale
+# MASS template with the measured mint-cyan foreground.  Used by the
+# windowed RGB verifier in step 1b of find_label_positions to break
+# ties between grayscale candidates that score similarly but land on
+# DIFFERENTLY-COLORED text (e.g. mint MASS vs white UNKNOWN footer).
+_RGB_TEMPLATES_PATH = os.path.join(
+    _TOOL_DIR, "ocr", "sc_templates", "labels_rgb_sharp.npz",
+)
+_RGB_TEMPLATES_CACHE: Optional[dict] = None
+
+# Per-channel weights for RGB NCC combine.  G is highest because the
+# mint-cyan HUD text peaks in G (measured fg = (165, 200, 180) -- G
+# 35 pts above R, 20 pts above B).  R is down-weighted because most
+# white false-positive text scores high in R; B is balanced.
+_RGB_WEIGHTS: tuple[float, float, float] = (0.20, 0.50, 0.30)
 
 # Lazy-loaded template cache: {label_name: float32 array (H, W), zero-mean unit-variance}
 _templates_cache: Optional[dict] = None
@@ -111,12 +126,69 @@ def _load_templates() -> Optional[dict]:
                 )
                 continue
             templates[key] = (arr - mean) / std
+
+            # ── Truncated-template fallbacks (RESI / INSTA) ──
+            # The full RESISTANCE: / INSTABILITY: words span 160-230 px
+            # at native scale.  On panels with slight perspective skew,
+            # font-weight differences, or partial occlusion of the right
+            # side of the word, the cumulative misalignment across that
+            # width tanks the NCC score below threshold (observed: 0.25-
+            # 0.39 in real captures where the same panel's MASS still
+            # scored 0.80).
+            #
+            # Truncated templates -- the LEFT portion only ("RESI" of
+            # "RESISTANCE", "INSTA" of "INSTABILITY") -- are shorter so
+            # are less sensitive to right-side degradation while still
+            # being long enough (~70 px) to be visually distinctive
+            # versus other text in the panel.  We try BOTH the full and
+            # truncated template per label and take whichever scores
+            # higher.
+            #
+            # No new template assets: we slice these from the existing
+            # labels.npz at load time.
+            #
+            # Slice widths chosen for DISAMBIGUATION, not just shortness:
+            #
+            #   RESISTANCE: -> "RESIST" (~60% = 103 px)
+            #     Empirically the naive 4-letter "RESI" slice (42%) fails
+            #     because "SCAN RESULTS" is always above the row labels
+            #     and shares the "RES" prefix.  At 4 letters the only
+            #     differentiator is letter 4 (I vs U) -- NCC's slack in
+            #     a 71-px window scored RESULTS HIGHER than RESISTANCE
+            #     in 8/9 measured panels.  "RESIST" (6 letters) vs
+            #     "RESULT" differ at letters 4 (I/U) AND 5 (S/L) -- two
+            #     differences in 6 letters is enough to peak on the
+            #     correct row in every measured panel.
+            #
+            #   INSTABILITY: -> "INSTA" (~46% = 73 px)
+            #     INSTA is unambiguous -- no other word in the panel
+            #     starts with "INSTA".  Diagnostic confirmed the 5-letter
+            #     slice peaks at the SAME position as the full template
+            #     in every measured panel.
+            raw_arr = data[key].astype(np.float32)
+            if key == "resistance":
+                # "RESIST" = 6 of 10 letters in "RESISTANCE"
+                slice_w = max(16, int(raw_arr.shape[1] * 0.60))
+                short = raw_arr[:, :slice_w]
+            elif key == "instability":
+                # "INSTA" = 5 of 11 letters in "INSTABILITY"
+                slice_w = max(16, int(raw_arr.shape[1] * 0.46))
+                short = raw_arr[:, :slice_w]
+            else:
+                short = None
+            if short is not None:
+                smean = float(short.mean())
+                sstd = float(short.std())
+                if sstd >= 1e-3:
+                    templates[f"{key}_short"] = (short - smean) / sstd
         if "height" in data:
             _templates_height = int(data["height"])
         _templates_cache = templates
         log.info(
-            "label_match: loaded %d templates from %s (canonical h=%d)",
+            "label_match: loaded %d templates from %s (canonical h=%d) "
+            "[keys=%s]",
             len(templates), _TEMPLATES_PATH, _templates_height,
+            sorted(templates.keys()),
         )
         return _templates_cache
     except Exception as exc:
@@ -296,6 +368,196 @@ def get_last_full_frame_matches() -> dict[str, dict]:
     image's coordinate frame.
     """
     return dict(_LAST_FULL_FRAME_MATCHES)
+
+
+def _load_rgb_label_template(name: str) -> Optional[np.ndarray]:
+    """Load the synthetic sharp RGB template for ``name``, cached.
+
+    ``name`` is one of ``"mass" | "resistance" | "instability"``.
+    Returns float32 (H, W, 3) or None if the file is missing.  RGB
+    templates are OPTIONAL -- callers degrade gracefully to
+    grayscale-only picking when the file isn't available.
+    """
+    global _RGB_TEMPLATES_CACHE
+    if _RGB_TEMPLATES_CACHE is not None:
+        return _RGB_TEMPLATES_CACHE.get(name)
+    if not os.path.isfile(_RGB_TEMPLATES_PATH):
+        log.info(
+            "label_match: RGB template file not found at %s -- "
+            "label picking will use grayscale only",
+            _RGB_TEMPLATES_PATH,
+        )
+        _RGB_TEMPLATES_CACHE = {}
+        return None
+    try:
+        data = np.load(_RGB_TEMPLATES_PATH)
+        cache: dict = {}
+        for key in ("mass", "resistance", "instability"):
+            if key in data.files:
+                cache[key] = data[key].astype(np.float32, copy=False)
+        _RGB_TEMPLATES_CACHE = cache
+        log.info(
+            "label_match: loaded RGB templates from %s [keys=%s]",
+            _RGB_TEMPLATES_PATH, sorted(cache.keys()),
+        )
+        return cache.get(name)
+    except Exception as exc:
+        log.warning("label_match: RGB template load failed: %s", exc)
+        _RGB_TEMPLATES_CACHE = {}
+        return None
+
+
+def _load_rgb_mass_template() -> Optional[np.ndarray]:
+    """Back-compat shim: ``_load_rgb_label_template("mass")``."""
+    return _load_rgb_label_template("mass")
+
+
+def _rgb_row_search(
+    target_rgb: np.ndarray,
+    template_rgb_native: np.ndarray,
+    scale: float,
+    y_window_top: int,
+    y_window_bot: int,
+) -> tuple[float, int, int]:
+    """RGB NCC search for a label inside a horizontal y-window.
+
+    The full-width RGB target is sliced to rows ``[y_window_top..y_window_bot]``
+    and the scaled template is NCC-searched across that band.  Returns
+    (best_combined_score, best_x, best_y_in_full_image) where the y is
+    converted back to full-image coordinates by adding y_window_top.
+
+    Mirrors the grayscale windowed search structure used for
+    RESISTANCE/INSTABILITY rows -- runs once per row.
+    """
+    try:
+        try:
+            from hud_tracker.anchors.icon_rgb_ncc import _ncc_one_channel
+        except ImportError:
+            from ...hud_tracker.anchors.icon_rgb_ncc import _ncc_one_channel  # type: ignore
+    except Exception:
+        return -1.0, 0, 0
+    scaled = _resize_rgb_template(template_rgb_native, scale)
+    h, w = scaled.shape[:2]
+    H, W = target_rgb.shape[:2]
+    y_window_top = max(0, y_window_top)
+    y_window_bot = min(H, y_window_bot)
+    if y_window_bot - y_window_top < h or w > W:
+        return -1.0, 0, 0
+    band = target_rgb[y_window_top:y_window_bot, :]
+    sR = _ncc_one_channel(band[..., 0], scaled[..., 0])
+    sG = _ncc_one_channel(band[..., 1], scaled[..., 1])
+    sB = _ncc_one_channel(band[..., 2], scaled[..., 2])
+    if sR.size == 0:
+        return -1.0, 0, 0
+    wR, wG, wB = _RGB_WEIGHTS
+    combined = wR * sR + wG * sG + wB * sB
+    idx = int(np.argmax(combined))
+    py, px = divmod(idx, combined.shape[1])
+    return float(combined[py, px]), int(px), int(py + y_window_top)
+
+
+def _resize_rgb_template(template_rgb: np.ndarray, scale: float) -> np.ndarray:
+    """Resize an (H, W, 3) float32 RGB template by scale via PIL bilinear."""
+    h, w = template_rgb.shape[:2]
+    new_h = max(4, int(round(h * scale)))
+    new_w = max(4, int(round(w * scale)))
+    if new_h == h and new_w == w:
+        return template_rgb
+    pil = Image.fromarray(np.clip(template_rgb, 0, 255).astype(np.uint8))
+    pil = pil.resize((new_w, new_h), Image.BILINEAR)
+    return np.asarray(pil, dtype=np.float32)
+
+
+def _rgb_mass_top_k(
+    target_rgb: np.ndarray,
+    template_rgb_native: np.ndarray,
+    k: int = 8,
+) -> list[dict]:
+    """Full-frame RGB NCC of MASS template across all scales.
+
+    Returns up to ``k`` candidate dicts ``{x, y, score, scale, w, h}``
+    sorted by descending score.  Used by the voting step to produce
+    independent RGB candidates that vote against the grayscale ones.
+    """
+    try:
+        try:
+            from hud_tracker.anchors.icon_rgb_ncc import _ncc_one_channel
+        except ImportError:
+            from ...hud_tracker.anchors.icon_rgb_ncc import _ncc_one_channel  # type: ignore
+    except Exception:
+        return []
+    out: list[dict] = []
+    H, W = target_rgb.shape[:2]
+    wR, wG, wB = _RGB_WEIGHTS
+    for scale in _SCALE_FACTORS:
+        t = _resize_rgb_template(template_rgb_native, scale)
+        if t.shape[0] > H or t.shape[1] > W:
+            continue
+        sR = _ncc_one_channel(target_rgb[..., 0], t[..., 0])
+        sG = _ncc_one_channel(target_rgb[..., 1], t[..., 1])
+        sB = _ncc_one_channel(target_rgb[..., 2], t[..., 2])
+        if sR.size == 0:
+            continue
+        combined = wR * sR + wG * sG + wB * sB
+        idx = int(np.argmax(combined))
+        py, px = divmod(idx, combined.shape[1])
+        out.append({
+            "x": int(px), "y": int(py),
+            "score": float(combined[py, px]),
+            "scale": float(scale),
+            "w": int(t.shape[1]), "h": int(t.shape[0]),
+        })
+    out.sort(key=lambda c: -c["score"])
+    return out[:k]
+
+
+def _rgb_score_windowed(
+    target_rgb: np.ndarray,
+    template_rgb_native: np.ndarray,
+    scale: float,
+    gx: int, gy: int,
+    window_px: int = 30,
+) -> float:
+    """Best RGB NCC score within +/- ``window_px`` of (gx, gy).
+
+    The grayscale matcher gives a coarse candidate position; the actual
+    RGB peak may sit a few pixels off due to (a) the synthetic
+    template's idealized colours differing slightly from the real
+    rendered pixels and (b) sub-pixel alignment differences between
+    grayscale-Otsu and per-channel NCC.  Searching a small window
+    around the candidate accommodates both.
+
+    Combines per-channel NCC with ``_RGB_WEIGHTS``.  Returns the best
+    combined score in the window, or -1.0 if the template doesn't fit.
+    """
+    try:
+        # Local import keeps icon_rgb_ncc out of the import chain for
+        # callers that don't need RGB verification.
+        try:
+            from hud_tracker.anchors.icon_rgb_ncc import _ncc_one_channel
+        except ImportError:
+            from ...hud_tracker.anchors.icon_rgb_ncc import _ncc_one_channel  # type: ignore
+    except Exception as exc:
+        log.debug("label_match: RGB NCC helper unavailable: %s", exc)
+        return -1.0
+    scaled = _resize_rgb_template(template_rgb_native, scale)
+    h, w = scaled.shape[:2]
+    H, W = target_rgb.shape[:2]
+    x1 = max(0, gx - window_px)
+    y1 = max(0, gy - window_px)
+    x2 = min(W, gx + window_px + w)
+    y2 = min(H, gy + window_px + h)
+    if x2 - x1 < w or y2 - y1 < h:
+        return -1.0
+    crop = target_rgb[y1:y2, x1:x2]
+    sR = _ncc_one_channel(crop[..., 0], scaled[..., 0])
+    sG = _ncc_one_channel(crop[..., 1], scaled[..., 1])
+    sB = _ncc_one_channel(crop[..., 2], scaled[..., 2])
+    if sR.size == 0:
+        return -1.0
+    wR, wG, wB = _RGB_WEIGHTS
+    combined = wR * sR + wG * sG + wB * sB
+    return float(combined.max())
 
 
 def _normalize_search_centers(
@@ -481,42 +743,179 @@ def find_label_positions(
     search_w = int(W * 0.65)
     crop = img.crop((0, 0, search_w, H))
     target_gray = np.asarray(crop.convert("L"), dtype=np.uint8)
-    target = _canonicalize(target_gray)
+
+    # ── DUAL-POLARITY targets (bypass Otsu heuristic) ──
+    # The Otsu heuristic in _canonicalize makes ONE polarity decision
+    # per image by counting which class is the minority.  On complex
+    # backgrounds (planet-side scans with bright terrain behind the
+    # HUD) that heuristic mis-flips the image -- dropping MASS NCC
+    # from 0.92 at the CORRECT position to 0.59 at a SPURIOUS one
+    # (measured on cap_20260418_160136_959).
+    #
+    # Fix: build BOTH polarities directly from the raw gray (skip
+    # Otsu), normalize each, and run MASS NCC on both.  Take whichever
+    # scores higher.  Same idea as comma_finder.py (signature
+    # pipeline) and the inverted CNN voter -- polarity decided AFTER
+    # matching, not before.
+    #
+    # IMPORTANT: don't call _canonicalize for either polarity, because
+    # it might flip one of them again via Otsu and we'd lose the
+    # opposite-polarity branch.  We just normalize each raw form
+    # independently.
+    def _norm(arr_f32: np.ndarray) -> np.ndarray:
+        m = float(arr_f32.mean())
+        s = float(arr_f32.std())
+        if s >= 1e-3:
+            return (arr_f32 - m) / s
+        return arr_f32 - m
+    target_pos = _norm(target_gray.astype(np.float32))           # text-bright case
+    target_neg = _norm((255 - target_gray).astype(np.float32))   # text-dark case
 
     # ── MASS-FIRST search ──
-    # MASS is the anchor. Find the best MASS match across all scales.
-    # That scale + position defines the panel's geometry. Then search
-    # for RESISTANCE and INSTABILITY at THE SAME SCALE within a
-    # narrow Y window around MASS_y + pitch and MASS_y + 2×pitch.
-    #
-    # This prevents the previous failure mode: RESISTANCE or INSTAB
-    # matching a false positive far below the panel (e.g. asteroid
-    # noise or COMPOSITION-section text) at an unrelated scale, which
-    # would then drag MASS to be flagged as the inconsistent outlier.
+    # MASS is the anchor. Find the best MASS match across all scales
+    # AND both polarities. That scale + position + polarity defines
+    # the panel's geometry. Then search for RESISTANCE / INSTABILITY
+    # at THE SAME SCALE and polarity within narrow Y windows.
     if "mass" not in templates:
         log.warning("label_match: no MASS template — can't anchor")
         _LAST_CALL_CACHE = (*cache_key, {})
         _LAST_FULL_FRAME_MATCHES = {}
         return {}
 
-    # Step 1: Find the best MASS match across all scales.
-    best_mass: Optional[dict] = None
-    for scale in _SCALE_FACTORS:
-        scaled = _resize_template(templates["mass"], scale)
-        score, x, y = _ncc_search(target, scaled)
-        if score < _MIN_MATCH_SCORE:
-            continue
-        if best_mass is None or score > best_mass["score"]:
-            best_mass = {
+    # Step 1: Find candidate MASS matches across all (scale, polarity)
+    # pairs.  We collect the TOP grayscale candidate per (polarity, scale)
+    # so the RGB verifier (step 1b) has multiple candidates to choose
+    # from -- previously a confidently-wrong grayscale peak (panel
+    # 155912_020 scored 0.86 at +205 px off-truth) was picked over the
+    # actual MASS position because the wrong one had higher grayscale
+    # NCC.  RGB color matching breaks ties between same-luminance
+    # different-color regions (the MASS row is mint-cyan; spurious
+    # peaks land on white "UNKNOWN" footer text, mineral name in
+    # different color, etc.).
+    mass_candidates: list[dict] = []
+    for polarity_name, polarity_target in (
+        ("pos", target_pos),
+        ("neg", target_neg),
+    ):
+        for scale in _SCALE_FACTORS:
+            scaled = _resize_template(templates["mass"], scale)
+            if scaled.shape[0] > polarity_target.shape[0] or scaled.shape[1] > polarity_target.shape[1]:
+                continue
+            score, x, y = _ncc_search(polarity_target, scaled)
+            if score < _MIN_MATCH_SCORE:
+                continue
+            mass_candidates.append({
                 "x": x, "y": y,
                 "w": scaled.shape[1], "h": scaled.shape[0],
                 "score": float(score), "scale": float(scale),
-            }
-    if best_mass is None:
-        log.debug("label_match: MASS not found at any scale")
+                "polarity": polarity_name,
+                "_target": polarity_target,
+            })
+
+    if not mass_candidates:
+        log.debug("label_match: MASS not found at any (scale, polarity)")
         _LAST_CALL_CACHE = (*cache_key, {})
         _LAST_FULL_FRAME_MATCHES = {}
         return {}
+
+    # Step 1b: VOTING between grayscale and RGB MASS detectors.
+    # Conservative wiring:
+    #   - Compute RGB top-K independently.
+    #   - Find nearest RGB candidate to GRAYSCALE TOP-1.
+    #   - If they AGREE (within AGREEMENT_PX): keep grayscale top-1
+    #     and mark agreement=True (boosts synthesis confidence).
+    #   - If they DISAGREE: scan further grayscale candidates for
+    #     one whose nearest RGB candidate AGREES, and SWAP only if
+    #     such an alternative exists (otherwise stick with top-1
+    #     to preserve the proven dual-polarity result).
+    #
+    # Why not always pick max voting score?  Tested empirically: full
+    # voting with agreement-bonus 0.20 + disagreement-penalty 0.10
+    # regressed 2 ANNOTATED panels because a high-grayscale top-1 in
+    # "disagreement" got beaten by a low-grayscale top-2 in "agreement"
+    # even when top-1 was actually correct (RGB just peaked nearby).
+    # The conservative gate "swap only if top-1 disagrees AND
+    # alternative agrees" is the safer pattern.
+    mass_candidates.sort(key=lambda c: -c["score"])
+    _rgb_t = _load_rgb_mass_template()
+    voting_used = False
+    agreement = None
+    if _rgb_t is not None:
+        rgb_img = np.asarray(
+            img.crop((0, 0, search_w, H)), dtype=np.float32,
+        )
+        rgb_candidates = _rgb_mass_top_k(rgb_img, _rgb_t, k=8)
+        if rgb_candidates:
+            AGREEMENT_PX = 15
+
+            def _nearest_rgb_dist(g):
+                nearest = min(
+                    rgb_candidates,
+                    key=lambda r: (r["x"] - g["x"]) ** 2 + (r["y"] - g["y"]) ** 2,
+                )
+                dist = ((nearest["x"] - g["x"]) ** 2
+                        + (nearest["y"] - g["y"]) ** 2) ** 0.5
+                return dist, nearest
+
+            top1 = mass_candidates[0]
+            top1_dist, top1_rgb = _nearest_rgb_dist(top1)
+            voting_used = True
+            if top1_dist <= AGREEMENT_PX:
+                # Top-1 confirmed by RGB.
+                agreement = True
+                log.info(
+                    "label_match: MASS top-1 AGREES with RGB (gray=%.2f, "
+                    "rgb=%.2f, dist=%.1fpx) -- keeping top-1",
+                    top1["score"], top1_rgb["score"], top1_dist,
+                )
+            else:
+                # Top-1 disagrees with RGB.  Look for a grayscale
+                # alternative that DOES agree.
+                rescue = None
+                for alt in mass_candidates[1:8]:
+                    alt_dist, alt_rgb = _nearest_rgb_dist(alt)
+                    if alt_dist <= AGREEMENT_PX:
+                        rescue = (alt, alt_rgb, alt_dist)
+                        break
+                if rescue is not None:
+                    alt, alt_rgb, alt_dist = rescue
+                    log.warning(
+                        "label_match: MASS top-1 DISAGREES with RGB "
+                        "(gray=%.2f at (%d,%d), nearest RGB %.1fpx away); "
+                        "swapping to candidate (gray=%.2f, rgb=%.2f, "
+                        "dist=%.1fpx) at (%d,%d)",
+                        top1["score"], top1["x"], top1["y"], top1_dist,
+                        alt["score"], alt_rgb["score"], alt_dist,
+                        alt["x"], alt["y"],
+                    )
+                    mass_candidates[0] = alt
+                    agreement = True
+                else:
+                    # No alternative agrees -- keep top-1, mark as
+                    # disagreement (lowers downstream confidence).
+                    agreement = False
+                    log.info(
+                        "label_match: MASS top-1 DISAGREES with RGB and "
+                        "no alternative agrees -- keeping top-1, marking "
+                        "low confidence",
+                    )
+
+    winner = mass_candidates[0]
+    target: np.ndarray = winner["_target"]
+    best_mass = {
+        "x": winner["x"], "y": winner["y"],
+        "w": winner["w"], "h": winner["h"],
+        "score": winner["score"],
+        "scale": winner["scale"],
+        "polarity": winner["polarity"],
+    }
+    if voting_used and agreement is not None:
+        best_mass["agreement"] = agreement
+    log.info(
+        "label_match: MASS won at polarity=%s scale=%.2f score=%.3f pos=(%d,%d)",
+        best_mass["polarity"], best_mass["scale"], best_mass["score"],
+        best_mass["x"], best_mass["y"],
+    )
 
     # Step 2: Pitch (vertical row spacing) ≈ 1.4× MASS-template height
     # at the matched scale. Used to predict where RESISTANCE and
@@ -541,15 +940,141 @@ def find_label_positions(
     for name, expected_cy in expected.items():
         if name not in templates:
             continue
-        scaled = _resize_template(templates[name], best_mass["scale"])
-        h_scaled = scaled.shape[0]
-        # Crop the search target to the Y window for this label.
-        win_top = max(0, expected_cy - h_scaled // 2 - y_tolerance)
-        win_bot = min(target.shape[0], expected_cy + h_scaled // 2 + y_tolerance)
-        if win_bot - win_top < h_scaled:
+        # ── Full template FIRST; truncated only as fallback ──
+        # We initially tried "use whichever scores higher" but the
+        # short template's smaller area means it scores high on many
+        # false-positive positions (random text fragments, edge
+        # artefacts, neighbouring rows).  Running both as alternatives
+        # caused a measured regression of -6 to -12 ANNOTATED locks.
+        #
+        # Correct discipline: trust the FULL template when it
+        # actually meets threshold.  The short template only fires
+        # when the full template scored below threshold AND the
+        # short scored above it -- in that case the full word
+        # genuinely failed and the truncated match is our best (only)
+        # signal for the row.
+        #
+        # We further require that the short match's left-edge X be
+        # within ±2× the short template width of mass_x, since all
+        # three label rows are left-aligned at the same column.  This
+        # kills false positives that match short-template glyphs
+        # somewhere outside the label column.
+        full_t = templates[name]
+        short_t = templates.get(f"{name}_short")
+        h_scaled_full = _resize_template(full_t, best_mass["scale"]).shape[0]
+        # Use the full template's height to size the search window;
+        # both variants have the same height since we slice only in W.
+        win_top = max(0, expected_cy - h_scaled_full // 2 - y_tolerance)
+        win_bot = min(target.shape[0], expected_cy + h_scaled_full // 2 + y_tolerance)
+        if win_bot - win_top < h_scaled_full:
             continue
         windowed = target[win_top:win_bot, :]
-        score, x, y = _ncc_search(windowed, scaled)
+
+        scaled = _resize_template(full_t, best_mass["scale"])
+        if scaled.shape[0] > windowed.shape[0] or scaled.shape[1] > windowed.shape[1]:
+            score, x, y = -1.0, 0, 0
+        else:
+            score, x, y = _ncc_search(windowed, scaled)
+        variant_used = "full"
+
+        # Truncated template runs ALONGSIDE the full template; whichever
+        # has the higher NCC wins as long as it's column-aligned with
+        # MASS (within 10 px -- all three numeric labels are
+        # left-aligned at the same X).
+        #
+        # The slice widths (RESIST = 60%, INSTA = 46%) were chosen so
+        # the short template's PEAK lands at the same (x,y) as the full
+        # template's peak in every measured panel.  Without the column
+        # gate the short template could still false-positive on stray
+        # text (early attempts with a 4-letter "RESI" slice peaked
+        # inside SCAN RESULTS due to the RES/RES prefix collision).
+        #
+        # Net effect: when the full template degrades below threshold
+        # (e.g. right-side occlusion, perspective skew), the short
+        # template can rescue the row anchor without giving up the
+        # full template's specificity in normal conditions.
+        if short_t is not None:
+            scaled_short = _resize_template(short_t, best_mass["scale"])
+            if (
+                scaled_short.shape[0] <= windowed.shape[0]
+                and scaled_short.shape[1] <= windowed.shape[1]
+            ):
+                s_score, s_x, s_y = _ncc_search(windowed, scaled_short)
+                col_tol = 10
+                if (
+                    s_score > score
+                    and s_score >= _MIN_MATCH_SCORE
+                    and abs(s_x - best_mass["x"]) <= col_tol
+                ):
+                    log.info(
+                        "label_match: %s short (%s, NCC=%.2f) "
+                        "beats full (NCC=%.2f); using short",
+                        name, name.upper()[:6 if name == "resistance" else 5],
+                        s_score, score,
+                    )
+                    score, x, y, scaled = s_score, s_x, s_y, scaled_short
+                    variant_used = "short"
+
+        # ── RGB voting for RESIST/INSTA ──
+        # If grayscale failed (or scored marginally), an independent
+        # RGB NCC sweep within the same y-window may rescue the row.
+        # Pattern mirrors the MASS-voting step 1b: agreement between
+        # grayscale and RGB on position raises confidence, RGB can
+        # rescue when grayscale alone falls below threshold.
+        #
+        # The y-window is already narrow (centered on mass_cy +
+        # N*pitch with +/- pitch*0.35 slack), so we don't need a
+        # separate column gate -- the window itself eliminates the
+        # cross-panel false positives.
+        rgb_row_t = _load_rgb_label_template(name)
+        if rgb_row_t is not None:
+            # Build RGB target once per call (lazy).
+            try:
+                _rgb_full_target  # type: ignore[name-defined]
+            except NameError:
+                _rgb_full_target = np.asarray(
+                    img.crop((0, 0, search_w, H)), dtype=np.float32,
+                )
+            rgb_score, rgb_x, rgb_y_full = _rgb_row_search(
+                _rgb_full_target, rgb_row_t, best_mass["scale"],
+                win_top, win_bot,
+            )
+            # Convert grayscale (window-relative) position to full-image
+            # coords for comparison.
+            gray_y_full = (y + win_top) if score >= _MIN_MATCH_SCORE else -10_000
+            same_row_px = 12  # rows are ~28 px tall; agreement within row
+            if score >= _MIN_MATCH_SCORE and rgb_score >= _MIN_MATCH_SCORE:
+                # Both fired -- check agreement on y.
+                if abs(rgb_y_full - gray_y_full) <= same_row_px:
+                    # Agreement; keep grayscale position but raise
+                    # confidence by recording rgb_score.
+                    log.info(
+                        "label_match: %s gray (NCC=%.2f at y=%d) and "
+                        "RGB (NCC=%.2f at y=%d) AGREE",
+                        name, score, gray_y_full, rgb_score, rgb_y_full,
+                    )
+                # else: disagree silently; keep grayscale (already trusted)
+            elif rgb_score >= _MIN_MATCH_SCORE and score < _MIN_MATCH_SCORE:
+                # Grayscale failed but RGB found a row in the window.
+                # Use the RGB-derived position; this rescues panels
+                # where the rendered label is too dim/skewed for
+                # grayscale NCC but the mint-cyan color is still
+                # detectable.
+                col_tol = 12
+                if abs(rgb_x - best_mass["x"]) <= col_tol:
+                    log.warning(
+                        "label_match: %s grayscale failed (NCC=%.2f) but "
+                        "RGB rescued (NCC=%.2f at x=%d, y=%d)",
+                        name, score, rgb_score, rgb_x, rgb_y_full,
+                    )
+                    score = rgb_score
+                    x = rgb_x
+                    y = rgb_y_full - win_top  # back to window-relative
+                    # scaled stays as grayscale template (used for w/h
+                    # reporting downstream); the value column starts
+                    # at x + scaled.shape[1] regardless.
+                    variant_used = "rgb-rescue"
+
         if score < _MIN_MATCH_SCORE:
             # NCC failed for this label. Before dropping it, check
             # whether MASS matched confidently enough to synthesize
@@ -560,9 +1085,21 @@ def find_label_positions(
             # synthesized box is simply that expected position at the
             # MASS scale. Left edge is shared with MASS — all three
             # numeric labels are left-aligned in the panel.
-            if best_mass["score"] >= _SYNTH_MASS_FLOOR:
-                synth_y = expected_cy - h_scaled // 2
-                synth_y = max(0, min(synth_y, target.shape[0] - h_scaled))
+            # Synthesis fires when MASS is CONFIDENT.  Two paths to
+            # confidence:
+            #   (a) grayscale score alone above _SYNTH_MASS_FLOOR (0.65)
+            #   (b) voting AGREEMENT between grayscale and RGB
+            #       detectors -- the voting test showed agree=100%
+            #       correct on 66/66 panels with truth, so an
+            #       agreement is at least as reliable as a high-only-
+            #       grayscale match.
+            mass_confident = (
+                best_mass["score"] >= _SYNTH_MASS_FLOOR
+                or best_mass.get("agreement") is True
+            )
+            if mass_confident:
+                synth_y = expected_cy - h_scaled_full // 2
+                synth_y = max(0, min(synth_y, target.shape[0] - h_scaled_full))
                 results[name] = {
                     "x": int(best_mass["x"]),
                     "y": int(synth_y),
@@ -591,20 +1128,30 @@ def find_label_positions(
                 name, score, expected_cy, win_top, win_bot,
             )
             continue
+        # When the truncated variant wins, REPORT THE FULL TEMPLATE'S
+        # w/h, not the slice's.  Downstream consumers compute the
+        # value-crop's left edge as ``m["x"] + m["w"]`` -- if w were
+        # only the truncated width (e.g. RESI ~70 px vs RESISTANCE
+        # ~170 px), the value crop would start mid-word and produce
+        # garbage reads.  Since both templates share the same left
+        # edge (the word's first letter), x is unchanged.
+        full_scaled_for_report = _resize_template(full_t, best_mass["scale"])
         results[name] = {
             "x": x,
             "y": y + win_top,  # convert window-local back to image coord
-            "w": scaled.shape[1],
-            "h": scaled.shape[0],
+            "w": int(full_scaled_for_report.shape[1]),
+            "h": int(full_scaled_for_report.shape[0]),
             "score": float(score),
             "scale": float(best_mass["scale"]),
+            "variant_used": variant_used,  # "full" | "short" (telemetry)
         }
 
     for name, m in results.items():
         log.debug(
             "label_match: %s matched at (x=%d, y=%d, w=%d, h=%d) "
-            "score=%.2f scale=%.2f",
+            "score=%.2f scale=%.2f variant=%s",
             name, m["x"], m["y"], m["w"], m["h"], m["score"], m["scale"],
+            m.get("variant_used", "full"),
         )
 
     _LAST_CALL_CACHE = (*cache_key, results)
