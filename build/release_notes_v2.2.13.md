@@ -15,6 +15,12 @@ The fix is a stack of six independent improvements to the label-matcher and trac
 
 Also: a panel-presence pre-filter now silently skips non-HUD frames (transitions, menus, the inventory screen) instead of error-spamming the logs every frame.
 
+## Mining Signals — Signature scanner "scanning forever" fix
+
+The signature scanner had a UI bug where the "Scanning..." placeholder bubble would never dismiss, making the scanner appear stuck even when OCR ran fine downstream. The worker thread tried to clear the bubble via `QMetaObject.invokeMethod` but the target method was missing the `@Slot()` decorator that PyQt needs to expose it as cross-thread invokable. Qt logged 300+ "No such method" warnings per session in the failing user's log; the user saw a perpetual "Scanning..." state and assumed no signature results were being produced.
+
+One-line fix: added the missing decorator. Signature scans now complete and dismiss the placeholder properly.
+
 ## Trade Hub — Starting investment filter
 
 New **STARTING INVESTMENT (aUEC)** field on the trade hub sidebar. Set your available budget (e.g. `2000000` or `2,000,000`) and the route list hides any route whose first-leg buy cost would exceed it. Subsequent legs in a loop or chain are paid for with the proceeds from earlier sales, so only the starting outlay matters for the check.
