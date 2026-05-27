@@ -172,6 +172,7 @@ class SmartRegionSelector(QWidget):
         initial_region: dict | None = None,
         validate_callback=None,
         parent=None,
+        game_resolution: dict | None = None,
     ) -> None:
         super().__init__(parent)
 
@@ -184,6 +185,41 @@ class SmartRegionSelector(QWidget):
         self._min_w = preset["min_w"]
         self._max_w = preset["max_w"]
         self._mode_label = preset["label"]
+
+        # ── Resolution-aware default sizing ──────────────────────────
+        # Annotated HUD panels were captured at ~448x670 from a
+        # 2560x1440 native game resolution.  Scale the default
+        # bubble size by the ratio of user-screen-height to the
+        # 1440 reference so the wire diagram opens roughly the
+        # right size on first use regardless of monitor / game
+        # resolution.  Caller can override by passing game_resolution
+        # explicitly (e.g. loaded from user config).
+        #
+        # Auto-detect: Qt primary screen height as a proxy for the
+        # rendered game height -- accurate on fullscreen / borderless
+        # SC, off when the user runs windowed at a different size
+        # (they can override via the OCR settings).
+        if game_resolution is None:
+            primary = QApplication.primaryScreen()
+            if primary is not None:
+                geom = primary.geometry()
+                game_resolution = {"w": int(geom.width()),
+                                   "h": int(geom.height())}
+            else:
+                game_resolution = {"w": 2560, "h": 1440}  # reference fallback
+        try:
+            self._game_h = max(540, int(game_resolution.get("h", 1440)))
+            self._game_w = max(960, int(game_resolution.get("w", 2560)))
+        except (TypeError, ValueError):
+            self._game_h, self._game_w = 1440, 2560
+        # Annotation reference: HUD panel was 670 tall on a 1440 game.
+        # On a 1080 game the HUD is ~503 tall.  On 4K it's ~1005 tall.
+        _scale_factor = self._game_h / 1440.0
+        self._default_w = max(self._min_w,
+                              min(self._max_w,
+                                  int(preset["width"] * _scale_factor)))
+        self._default_h = max(int(self._min_w / self._aspect),
+                              int(preset["height"] * _scale_factor))
 
         self._validate_callback = validate_callback
         self._validate_ok: bool | None = None
@@ -219,8 +255,8 @@ class SmartRegionSelector(QWidget):
             cx = self.width() // 2
             cy = self.height() // 2
 
-        w = preset["width"]
-        h = preset["height"]
+        w = self._default_w
+        h = self._default_h
 
         if initial_region:
             # Translate native coords -> widget coords (offset by virtual

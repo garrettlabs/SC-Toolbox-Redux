@@ -732,6 +732,41 @@ class MiningSignalsApp(SCWindow):
         self._btn_set_hud_region.setStyleSheet(_btn_style)
         ocr_layout.addWidget(self._btn_set_hud_region)
 
+        # Game resolution input.  v2.2.14: drives the wire-diagram default
+        # bubble size in SmartRegionSelector so the bubble opens at roughly
+        # the correct size on first use, regardless of monitor / game
+        # resolution.  Auto-detected from primary screen on first run;
+        # users can override here if they run SC windowed at a different
+        # size than their monitor.
+        if "game_resolution" not in self._config:
+            try:
+                from PySide6.QtWidgets import QApplication as _QA
+                _scr = _QA.primaryScreen()
+                if _scr is not None:
+                    _g = _scr.geometry()
+                    self._config["game_resolution"] = {
+                        "w": int(_g.width()), "h": int(_g.height()),
+                    }
+                    _save_config(self._config)
+            except Exception:
+                pass
+        _gr = self._config.get("game_resolution") or {"w": 1920, "h": 1080}
+        self._btn_set_resolution = QPushButton(
+            f"Game Resolution: {int(_gr.get('w', 1920))}x{int(_gr.get('h', 1080))}",
+            self._ocr_row,
+        )
+        self._btn_set_resolution.setCursor(Qt.PointingHandCursor)
+        self._btn_set_resolution.setToolTip(
+            "Set your game's render resolution (defaults to your "
+            "primary monitor).  Drives the default bubble size for "
+            "region selection so the wire-diagram opens at the right "
+            "size on first use.  Change this if you run SC windowed "
+            "or at a non-native resolution."
+        )
+        self._btn_set_resolution.clicked.connect(self._on_set_game_resolution)
+        self._btn_set_resolution.setStyleSheet(_btn_style)
+        ocr_layout.addWidget(self._btn_set_resolution)
+
         # ── Calibrate Mining Crops ──
         # Opens a non-modal dialog where the user can confirm each
         # row's crop coordinates and lock them in. Saved to disk;
@@ -3486,6 +3521,7 @@ class MiningSignalsApp(SCWindow):
         self._region_selector = SmartRegionSelector(
             mode="signature",
             initial_region=self._config.get("ocr_region"),
+            game_resolution=self._config.get("game_resolution"),
         )
         self._region_selector.region_selected.connect(self._on_region_selected)
         self._region_selector.show()
@@ -3541,6 +3577,7 @@ class MiningSignalsApp(SCWindow):
         self._hud_region_selector = SmartRegionSelector(
             mode="hud",
             initial_region=self._config.get("hud_region"),
+            game_resolution=self._config.get("game_resolution"),
         )
         self._hud_region_selector.region_selected.connect(self._on_hud_region_selected)
         self._hud_region_selector.show()
@@ -3549,6 +3586,65 @@ class MiningSignalsApp(SCWindow):
         self._config["hud_region"] = region
         _save_config(self._config)
         log.info("Mining HUD region set: %s", region)
+
+    def _on_set_game_resolution(self) -> None:
+        """Open a small dialog to set the game render resolution.
+
+        Drives SmartRegionSelector's default bubble size so the
+        wire-diagram opens at roughly the correct size on first use
+        regardless of monitor / windowed game configuration.  Saved
+        to config under ``game_resolution: {"w", "h"}``.
+
+        Auto-populated from primary screen on first run; this dialog
+        lets users override when SC runs windowed at a non-native
+        size, on a non-primary monitor, or at a custom render scale.
+        """
+        from PySide6.QtWidgets import (
+            QDialog, QVBoxLayout, QHBoxLayout, QLabel, QSpinBox,
+            QDialogButtonBox,
+        )
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Game Resolution")
+        dlg.setModal(True)
+        v = QVBoxLayout(dlg)
+        v.addWidget(QLabel(
+            "Set your Star Citizen render resolution.\n"
+            "(Default = your primary monitor's resolution.)\n\n"
+            "Change this if SC runs windowed at a non-native size or\n"
+            "on a non-primary monitor."
+        ))
+        current = self._config.get("game_resolution") or {"w": 1920, "h": 1080}
+        h_row = QHBoxLayout()
+        h_row.addWidget(QLabel("Width: "))
+        w_spin = QSpinBox()
+        w_spin.setRange(960, 7680)
+        w_spin.setValue(int(current.get("w", 1920)))
+        w_spin.setSingleStep(160)
+        h_row.addWidget(w_spin)
+        h_row.addSpacing(20)
+        h_row.addWidget(QLabel("Height: "))
+        h_spin = QSpinBox()
+        h_spin.setRange(540, 4320)
+        h_spin.setValue(int(current.get("h", 1080)))
+        h_spin.setSingleStep(90)
+        h_row.addWidget(h_spin)
+        v.addLayout(h_row)
+        bb = QDialogButtonBox(
+            QDialogButtonBox.Ok | QDialogButtonBox.Cancel
+        )
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        v.addWidget(bb)
+        if dlg.exec() == QDialog.Accepted:
+            w_val = int(w_spin.value())
+            h_val = int(h_spin.value())
+            self._config["game_resolution"] = {"w": w_val, "h": h_val}
+            _save_config(self._config)
+            if hasattr(self, "_btn_set_resolution"):
+                self._btn_set_resolution.setText(
+                    f"Game Resolution: {w_val}x{h_val}"
+                )
+            log.info("Game resolution set: %dx%d", w_val, h_val)
 
     def _on_set_display(self) -> None:
         self._display_placer = DisplayPlacer()

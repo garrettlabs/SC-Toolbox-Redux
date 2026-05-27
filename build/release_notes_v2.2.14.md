@@ -19,6 +19,10 @@ If the locator can't find a panel (confidence too low, scanner not visible, tran
 
 Opt-out: set `auto_heal_region: false` in the config, or `SC_OCR_AUTO_HEAL_REGION=0` as an environment variable.
 
+### Game-resolution-aware sizing
+
+New "Game Resolution" button in the OCR settings row. Auto-populated from your primary monitor on first run (so most users never need to touch it). The wire-diagram region selector uses this to size its initial bubble proportionally — 1080p users see a small bubble, 4K users see a large one, both showing the correct HUD aspect ratio. Click the button if you run SC windowed at a non-native size or on a non-primary monitor.
+
 ### Guided region selector (when you do recalibrate)
 
 When you click "Set Mining HUD Region" or "Set Scanning Region", you now get a pre-sized bubble with a wire-diagram showing what shape to fit:
