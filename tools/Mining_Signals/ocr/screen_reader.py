@@ -742,7 +742,41 @@ def scan_region(region: dict) -> Optional[int]:
     # produced a 4-5 digit value in [1000, 35000].
     try:
         from .sc_ocr.api import _signal_recognize_pil
-        return _signal_recognize_pil(img, region=region)
+        result = _signal_recognize_pil(img, region=region)
     except Exception as exc:
         log.debug("scan_region: sc_ocr raised %s", exc)
-        return None
+        result = None
+    # ── LIVE SAMPLE CAPTURE (debug, gated) ──────────────────────────
+    # Persist every captured signal panel alongside the value the
+    # production reader returned, so live in-game captures can be
+    # collected for offline accuracy diagnosis. Two ways to enable
+    # (so it works no matter how the app is launched):
+    #   1. env var  SC_LIVE_SAMPLES=<dir>
+    #   2. sentinel  <Mining_Signals>/live_samples/.enabled  (dumps
+    #      into that live_samples/ dir)
+    # Completely inert (one cheap env lookup + one path check, no file
+    # I/O) when neither is present — changes no production behaviour.
+    _ls_dir = os.environ.get("SC_LIVE_SAMPLES")
+    if not _ls_dir:
+        try:
+            _cand = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                "live_samples",
+            )
+            if os.path.exists(os.path.join(_cand, ".enabled")):
+                _ls_dir = _cand
+        except Exception:
+            _ls_dir = None
+    if _ls_dir and img is not None:
+        try:
+            os.makedirs(_ls_dir, exist_ok=True)
+            _ts = time.strftime("%H%M%S")
+            _ms = int((time.time() % 1) * 1000)
+            _tag = result if result is not None else "none"
+            img.convert("RGB").save(
+                os.path.join(_ls_dir, f"sig_{_ts}_{_ms:03d}_{_tag}.png")
+            )
+            log.info("live-sample: saved panel read=%s", _tag)
+        except Exception as _ls_exc:
+            log.debug("scan_region: live-sample dump failed: %s", _ls_exc)
+    return result

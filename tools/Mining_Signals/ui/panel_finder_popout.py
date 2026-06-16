@@ -308,6 +308,25 @@ class PanelFinderPopout(QWidget):
         self._clear_button.clicked.connect(self._on_clear_clicked)
         dp_btns.addWidget(self._clear_button)
 
+        # Record N seconds of the live overlay frames (exactly what this
+        # window shows) into panel_finder_recording\popout_<ts>\ so the
+        # captured finder behavior can be sent for analysis / replayed.
+        self._record_button = QPushButton("● Record 20s")
+        self._record_button.setToolTip(
+            "Capture ~20 s of the live debug-overlay frames into "
+            "panel_finder_recording\\popout_<timestamp>\\ (the folder opens "
+            "when done). Click again to stop early."
+        )
+        self._record_button.setStyleSheet(
+            "QPushButton { background: #663333; color: #ffcccc; "
+            "padding: 3px 10px; border: none; font-size: 9pt; }"
+            "QPushButton:hover { background: #aa4444; }"
+        )
+        self._record_button.clicked.connect(self._on_record_clicked)
+        dp_btns.addWidget(self._record_button)
+        self._rec_active = False
+        self._rec_secs = 20.0
+
         # Inline status notification (transient — cleared after ~2.5 s)
         self._debug_status_lbl = QLabel("")
         self._debug_status_lbl.setStyleSheet(
@@ -390,6 +409,13 @@ class PanelFinderPopout(QWidget):
             _dbg.viewer_heartbeat_tag("overlay")
         except Exception:
             pass
+        # Stop an in-progress recording on time even if no new frame
+        # has arrived (pipeline stalled) — _tick runs every 400 ms.
+        if self._rec_active:
+            import time as _t
+            if _t.monotonic() >= self._rec_end:
+                self._finish_recording()
+
         if not self._overlay_path.is_file():
             self._meta.setText(f"(missing: {self._overlay_path.name})")
             self._img.setText("Waiting for OCR pipeline…")
@@ -410,6 +436,10 @@ class PanelFinderPopout(QWidget):
             return
         self._cached_pil = pil
         self._render()
+
+        # Recording: save this freshly-arrived overlay frame verbatim.
+        if self._rec_active:
+            self._record_overlay_frame()
 
     def _render(self) -> None:
         pil = self._cached_pil
@@ -656,6 +686,59 @@ class PanelFinderPopout(QWidget):
             sb = self._debug_log_widget.verticalScrollBar()
             if sb is not None:
                 sb.setValue(sb.maximum())
+
+    def _on_record_clicked(self) -> None:
+        """Start (or stop) a ~20 s capture of the live overlay frames."""
+        import time as _t
+        from datetime import datetime as _dt
+        if self._rec_active:
+            self._finish_recording()
+            return
+        try:
+            stamp = _dt.now().strftime("%Y%m%d_%H%M%S")
+            self._rec_dir = TOOL_DIR / "panel_finder_recording" / (
+                "popout_" + stamp)
+            self._rec_dir.mkdir(parents=True, exist_ok=True)
+            self._rec_active = True
+            self._rec_count = 0
+            self._rec_end = _t.monotonic() + self._rec_secs
+            self._record_button.setText("● Recording…")
+            self._debug_status_lbl.setText(
+                "Recording %ds of overlay frames…" % int(self._rec_secs))
+        except Exception as exc:
+            self._rec_active = False
+            self._debug_status_lbl.setText("record start failed: %s" % exc)
+
+    def _record_overlay_frame(self) -> None:
+        """Save the just-loaded overlay frame verbatim into the rec dir."""
+        import time as _t
+        import shutil
+        try:
+            self._rec_count += 1
+            dest = self._rec_dir / ("frame_%03d.png" % self._rec_count)
+            shutil.copyfile(str(self._overlay_path), str(dest))
+            remaining = int(max(0, self._rec_end - _t.monotonic()))
+            self._record_button.setText("● Recording %ds…" % remaining)
+        except Exception:
+            pass
+
+    def _finish_recording(self) -> None:
+        """Stop recording, report the folder, and open it."""
+        self._rec_active = False
+        self._record_button.setText("● Record 20s")
+        try:
+            n = getattr(self, "_rec_count", 0)
+            d = str(getattr(self, "_rec_dir", ""))
+            self._debug_status_lbl.setText(
+                "Saved %d frames → %s" % (n, d))
+            import os
+            if d and os.path.isdir(d):
+                try:
+                    os.startfile(d)  # noqa: windows-only — opens the folder
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     def _on_clear_clicked(self) -> None:
         self._debug_log_lines = []

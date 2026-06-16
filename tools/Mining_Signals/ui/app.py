@@ -732,41 +732,6 @@ class MiningSignalsApp(SCWindow):
         self._btn_set_hud_region.setStyleSheet(_btn_style)
         ocr_layout.addWidget(self._btn_set_hud_region)
 
-        # Game resolution input.  v2.2.14: drives the wire-diagram default
-        # bubble size in SmartRegionSelector so the bubble opens at roughly
-        # the correct size on first use, regardless of monitor / game
-        # resolution.  Auto-detected from primary screen on first run;
-        # users can override here if they run SC windowed at a different
-        # size than their monitor.
-        if "game_resolution" not in self._config:
-            try:
-                from PySide6.QtWidgets import QApplication as _QA
-                _scr = _QA.primaryScreen()
-                if _scr is not None:
-                    _g = _scr.geometry()
-                    self._config["game_resolution"] = {
-                        "w": int(_g.width()), "h": int(_g.height()),
-                    }
-                    _save_config(self._config)
-            except Exception:
-                pass
-        _gr = self._config.get("game_resolution") or {"w": 1920, "h": 1080}
-        self._btn_set_resolution = QPushButton(
-            f"Game Resolution: {int(_gr.get('w', 1920))}x{int(_gr.get('h', 1080))}",
-            self._ocr_row,
-        )
-        self._btn_set_resolution.setCursor(Qt.PointingHandCursor)
-        self._btn_set_resolution.setToolTip(
-            "Set your game's render resolution (defaults to your "
-            "primary monitor).  Drives the default bubble size for "
-            "region selection so the wire-diagram opens at the right "
-            "size on first use.  Change this if you run SC windowed "
-            "or at a non-native resolution."
-        )
-        self._btn_set_resolution.clicked.connect(self._on_set_game_resolution)
-        self._btn_set_resolution.setStyleSheet(_btn_style)
-        ocr_layout.addWidget(self._btn_set_resolution)
-
         # ── Calibrate Mining Crops ──
         # Opens a non-modal dialog where the user can confirm each
         # row's crop coordinates and lock them in. Saved to disk;
@@ -3510,19 +3475,8 @@ class MiningSignalsApp(SCWindow):
     def _open_scan_region_selector(self) -> None:
         """Actually open the scanning-region selector. Called either
         directly (when the tip is dismissed) or as the on_proceed
-        callback when the user clicks OK on the tip.
-
-        v2.2.14: switched to SmartRegionSelector in "signature" mode --
-        shows a wire-diagram of Icon + Numbers boxes so the user
-        knows what shape to fit.  Pre-loads the previously-saved
-        region so re-edits start from where the user left off.
-        """
-        from .region_selector import SmartRegionSelector
-        self._region_selector = SmartRegionSelector(
-            mode="signature",
-            initial_region=self._config.get("ocr_region"),
-            game_resolution=self._config.get("game_resolution"),
-        )
+        callback when the user clicks OK on the tip."""
+        self._region_selector = RegionSelector()
         self._region_selector.region_selected.connect(self._on_region_selected)
         self._region_selector.show()
 
@@ -3561,24 +3515,8 @@ class MiningSignalsApp(SCWindow):
     def _open_hud_region_selector(self) -> None:
         """Actually open the HUD-region selector. Tip-gated entry
         point splits the show-tip and open-selector paths so the
-        selector waits until the user dismisses the tip.
-
-        v2.2.14: switched to SmartRegionSelector in "hud" mode --
-        shows a wire-diagram of the 5 SCAN RESULTS panel rows
-        (title, resource, MASS, RESISTANCE, INSTABILITY) so the
-        user knows what shape to fit.  Pre-loads the previously-
-        saved region so re-edits start from where the user left off.
-        Combined with the autoheal capture path (region_autoheal.py)
-        the user no longer needs pixel-perfect calibration -- the
-        wire diagram shows the rough shape and autoheal corrects
-        sub-region misalignment at scan time.
-        """
-        from .region_selector import SmartRegionSelector
-        self._hud_region_selector = SmartRegionSelector(
-            mode="hud",
-            initial_region=self._config.get("hud_region"),
-            game_resolution=self._config.get("game_resolution"),
-        )
+        selector waits until the user dismisses the tip."""
+        self._hud_region_selector = RegionSelector()
         self._hud_region_selector.region_selected.connect(self._on_hud_region_selected)
         self._hud_region_selector.show()
 
@@ -3586,65 +3524,6 @@ class MiningSignalsApp(SCWindow):
         self._config["hud_region"] = region
         _save_config(self._config)
         log.info("Mining HUD region set: %s", region)
-
-    def _on_set_game_resolution(self) -> None:
-        """Open a small dialog to set the game render resolution.
-
-        Drives SmartRegionSelector's default bubble size so the
-        wire-diagram opens at roughly the correct size on first use
-        regardless of monitor / windowed game configuration.  Saved
-        to config under ``game_resolution: {"w", "h"}``.
-
-        Auto-populated from primary screen on first run; this dialog
-        lets users override when SC runs windowed at a non-native
-        size, on a non-primary monitor, or at a custom render scale.
-        """
-        from PySide6.QtWidgets import (
-            QDialog, QVBoxLayout, QHBoxLayout, QLabel, QSpinBox,
-            QDialogButtonBox,
-        )
-        dlg = QDialog(self)
-        dlg.setWindowTitle("Game Resolution")
-        dlg.setModal(True)
-        v = QVBoxLayout(dlg)
-        v.addWidget(QLabel(
-            "Set your Star Citizen render resolution.\n"
-            "(Default = your primary monitor's resolution.)\n\n"
-            "Change this if SC runs windowed at a non-native size or\n"
-            "on a non-primary monitor."
-        ))
-        current = self._config.get("game_resolution") or {"w": 1920, "h": 1080}
-        h_row = QHBoxLayout()
-        h_row.addWidget(QLabel("Width: "))
-        w_spin = QSpinBox()
-        w_spin.setRange(960, 7680)
-        w_spin.setValue(int(current.get("w", 1920)))
-        w_spin.setSingleStep(160)
-        h_row.addWidget(w_spin)
-        h_row.addSpacing(20)
-        h_row.addWidget(QLabel("Height: "))
-        h_spin = QSpinBox()
-        h_spin.setRange(540, 4320)
-        h_spin.setValue(int(current.get("h", 1080)))
-        h_spin.setSingleStep(90)
-        h_row.addWidget(h_spin)
-        v.addLayout(h_row)
-        bb = QDialogButtonBox(
-            QDialogButtonBox.Ok | QDialogButtonBox.Cancel
-        )
-        bb.accepted.connect(dlg.accept)
-        bb.rejected.connect(dlg.reject)
-        v.addWidget(bb)
-        if dlg.exec() == QDialog.Accepted:
-            w_val = int(w_spin.value())
-            h_val = int(h_spin.value())
-            self._config["game_resolution"] = {"w": w_val, "h": h_val}
-            _save_config(self._config)
-            if hasattr(self, "_btn_set_resolution"):
-                self._btn_set_resolution.setText(
-                    f"Game Resolution: {w_val}x{h_val}"
-                )
-            log.info("Game resolution set: %dx%d", w_val, h_val)
 
     def _on_set_display(self) -> None:
         self._display_placer = DisplayPlacer()
@@ -5666,25 +5545,8 @@ class MiningSignalsApp(SCWindow):
         )
         popup.show()
 
-    @Slot()
     def _dismiss_scanning(self) -> None:
-        """Hide the 'Scanning' placeholder if it's showing.
-
-        MUST be decorated with @Slot() because the signature-scanner
-        worker thread invokes this via ``QMetaObject.invokeMethod(
-        self, "_dismiss_scanning", Qt.QueuedConnection)`` (see
-        ``ui/app.py`` around line 4467).  Without the decorator
-        PyQt's meta-object introspection doesn't expose the method
-        as invokable from cross-thread queued connections and Qt
-        logs ``QMetaObject::invokeMethod: No such method
-        MiningSignalsApp::_dismiss_scanning()`` every time the
-        signature scanner tries to clear its "Scanning..." placeholder
-        bubble.  The visible symptom: the bubble stays on screen
-        and the user thinks the scanner is hung / produces no
-        results, even though the OCR pipeline ran fine downstream.
-        Observed hundreds of times in the v2.2.12 user log
-        (mining_signals (3).log).
-        """
+        """Hide the 'Scanning' placeholder if it's showing."""
         if self._scan_bubble.isVisible() and not self._scan_bubble._matches:
             self._scan_bubble.hide()
 
@@ -6175,45 +6037,6 @@ class MiningSignalsApp(SCWindow):
 # Entry-point helper
 # ---------------------------------------------------------------------------
 
-def _check_onnxruntime_at_startup(log) -> None:
-    """Surface a user-friendly dialog (instead of silent voter failure)
-    when onnxruntime can't load -- almost always means missing or
-    incompatible Visual C++ Redistributable. Without this, the scanner
-    silently degrades and the user sees only "scan returns nothing"
-    with no explanation. v2.2.11's icon_voter logging tells us WHY in
-    the log; this dialog tells the USER what to do about it."""
-    try:
-        import onnxruntime as ort  # type: ignore
-        # Bare import isn't always enough -- the native DLLs sometimes
-        # only get touched when a provider is enumerated. Force it.
-        _ = ort.get_available_providers()
-    except Exception as exc:
-        log.error(
-            "onnxruntime failed to load at startup (%s: %s) -- "
-            "Mining Signals scanner will be unavailable. Most likely "
-            "cause: missing or outdated Visual C++ Redistributable.",
-            type(exc).__name__, exc,
-        )
-        try:
-            from PySide6.QtWidgets import QMessageBox
-            QMessageBox.warning(
-                None,
-                "Mining Signals — missing dependency",
-                "The Mining Signals OCR engine can't start because the "
-                "Microsoft Visual C++ Runtime is missing or incompatible.\n\n"
-                f"Underlying error:\n  {type(exc).__name__}: {exc}\n\n"
-                "Fix: install the Microsoft Visual C++ Redistributable "
-                "(VS 2015-2022, x64) from:\n"
-                "https://aka.ms/vs/17/release/vc_redist.x64.exe\n\n"
-                "After installing it, restart SC Toolbox.\n\n"
-                "(SC Toolbox will keep running -- non-scanner features still "
-                "work -- but mining-signal OCR will be unavailable until "
-                "this is fixed.)",
-            )
-        except Exception:
-            pass  # Qt unavailable too -- error already logged above
-
-
 def main() -> None:
     """Launch Mining Signals from the command line."""
     from shared.crash_logger import init_crash_logging
@@ -6225,13 +6048,6 @@ def main() -> None:
 
         app = QApplication(sys.argv)
         apply_theme(app)
-
-        # Sanity-check onnxruntime BEFORE creating any scanner threads,
-        # so users with missing VC++ Runtime see a clear dialog instead
-        # of silent scanner failure. See _check_onnxruntime_at_startup
-        # for the failure mode this addresses (the v2.2.10 user crash
-        # where both CNN voters reported "unavailable").
-        _check_onnxruntime_at_startup(log)
 
         window = MiningSignalsApp(
             x=parsed["x"],

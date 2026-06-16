@@ -36,6 +36,15 @@ from typing import List, Tuple
 import numpy as np
 from PIL import Image, ImageEnhance
 
+# Quarantine gate — Glyph Review decisions filter every training input.
+# Disable with SC_TRAIN_NO_GATE=1. See ocr/glyph_gate.py.
+try:
+    from ocr.glyph_gate import filter_clean as _quarantine_filter
+except Exception:  # gate unavailable -> train unfiltered (legacy behaviour)
+    def _quarantine_filter(paths, **_kw):
+        return list(paths)
+
+
 
 # ─── Paths ──────────────────────────────────────────────────────────────
 
@@ -282,7 +291,7 @@ def load_dataset() -> Tuple[np.ndarray, np.ndarray, dict]:
             log.warning("[load] missing dir for class %r: %s", ch, cls_dir)
             continue
         n = 0
-        for png in cls_dir.glob("*.png"):
+        for png in _quarantine_filter(cls_dir.glob("*.png")):
             try:
                 arr = np.asarray(
                     Image.open(png).convert("RGB").resize(

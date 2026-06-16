@@ -9,11 +9,11 @@
     40,
     28
   ],
-  "valAccuracy": 0.792,
-  "trainSamples": 2125,
-  "valSamples": 375,
+  "valAccuracy": 0.9734748010610079,
+  "trainSamples": 2134,
+  "valSamples": 377,
   "perClassCounts": {
-    "0": 250,
+    "0": 261,
     "1": 250,
     "2": 250,
     "3": 250,
@@ -25,73 +25,73 @@
     "9": 250
   },
   "perClassValAccuracy": {
-    "0": 0.717948717948718,
-    "1": 0.7105263157894737,
-    "2": 0.717948717948718,
-    "3": 0.8205128205128205,
-    "4": 0.975,
-    "5": 0.8536585365853658,
-    "6": 0.9583333333333334,
-    "7": 0.4230769230769231,
-    "8": 0.6571428571428571,
-    "9": 0.9333333333333333
+    "0": 0.9512195121951219,
+    "1": 0.9743589743589743,
+    "2": 0.9736842105263158,
+    "3": 1.0,
+    "4": 1.0,
+    "5": 0.925,
+    "6": 1.0,
+    "7": 0.9230769230769231,
+    "8": 0.9722222222222222,
+    "9": 1.0
   },
   "perClassValSamples": {
-    "0": 39,
-    "1": 38,
-    "2": 39,
+    "0": 41,
+    "1": 39,
+    "2": 38,
     "3": 39,
-    "4": 40,
-    "5": 41,
+    "4": 41,
+    "5": 40,
     "6": 48,
     "7": 26,
-    "8": 35,
-    "9": 30
+    "8": 36,
+    "9": 29
   },
   "perClassDigitSources": {
     "0": {
-      "src": 127,
-      "total_after_balance": 250
+      "src": 261,
+      "total_after_balance": 261
     },
     "1": {
-      "src": 60,
+      "src": 128,
       "total_after_balance": 250
     },
     "2": {
-      "src": 34,
+      "src": 100,
       "total_after_balance": 250
     },
     "3": {
-      "src": 9,
+      "src": 15,
       "total_after_balance": 250
     },
     "4": {
-      "src": 14,
+      "src": 22,
       "total_after_balance": 250
     },
     "5": {
-      "src": 23,
+      "src": 51,
       "total_after_balance": 250
     },
     "6": {
-      "src": 16,
+      "src": 43,
       "total_after_balance": 250
     },
     "7": {
-      "src": 30,
+      "src": 59,
       "total_after_balance": 250
     },
     "8": {
-      "src": 21,
+      "src": 34,
       "total_after_balance": 250
     },
     "9": {
-      "src": 7,
+      "src": 33,
       "total_after_balance": 250
     }
   },
-  "trainedAt": "2026-05-10T14:48:46",
-  "trainingSeconds": 23.836532831192017,
+  "trainedAt": "2026-06-10T21:25:00",
+  "trainingSeconds": 19.39092755317688,
   "modelPath": "C:\\Users\\prjgn\\AppData\\Local\\SC_Toolbox\\current\\tools\\Mining_Signals\\ocr\\models\\model_signal_rgb_aspect_40x28.onnx",
   "digitStagingDir": "C:\\Users\\prjgn\\AppData\\Local\\SC_Toolbox\\current\\tools\\Mining_Signals\\_aspect_40x28_digit_staging",
   "notes": "Aspect-matched 40x28 (HxW) experiment. SC HUD digits have a natural ~0.6 wide-to-tall aspect; v3's 28x28 square canvas distorts the glyph during the resize step. This model uses a 40-tall x 28-wide canvas so glyphs need less shape distortion. Architecture is a 3-conv + FC RGB CNN matching v3 in spirit (only the FC bottleneck dimension changes from 64*7*7 to 64*10*7 to accommodate the taller feature map). Training corpus is signature-region2 only (no @ class, no panel-font samples) \u2014 apples-to-apples with the digits-only subset of v3."

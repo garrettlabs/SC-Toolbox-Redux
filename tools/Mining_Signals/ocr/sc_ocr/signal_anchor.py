@@ -256,11 +256,20 @@ def _cnn_filter_icon_candidates(
             # structural rejection. That is the exact signature of the
             # location-pin false positive: with the signature panel
             # NOT on screen, NCC locks onto a glint / green arrow /
-            # digit cluster and the lone RGB CNN rubber-stamps it.
-            # Treat such a candidate as rejected so the icon is not
-            # "found" when it is not actually present. (A real icon
-            # passes the warm-colour geometry detector, so geometry
-            # voting 'no' is genuine evidence against the candidate.)
+            # digit cluster and the RGB CNN rubber-stamps it. Treat such
+            # a candidate as rejected so the icon is not "found" when it
+            # is not actually present.
+            #
+            # ``geometry='no'`` is GENUINE evidence against the candidate
+            # in BOTH polarities now: the geometry detector was made
+            # polarity-robust (it colour-canonicalises the crop before
+            # the warm-mask test), so a real inverted/bright-background
+            # icon reads geometry='yes' (→ primaries agree → accept,
+            # never reaching this guard), while only true non-icon HUD
+            # content reads 'no'. So the guard can stay strict — an
+            # earlier attempt to relax it (trusting contour, which
+            # coincidentally matches many HUD shapes) blew the
+            # false-positive rate from 4/40 to 31/40.
             _weak_accept = (
                 _votes.get("geometry") == "no"
                 and _votes.get("gray_cnn") in (None, "unavailable")
@@ -338,11 +347,25 @@ def _smooth_anchor_with_cache(
     def _cache_is_stable() -> bool:
         if len(_RECENT_ANCHOR_CACHE) < 3:
             return False
-        xs1 = [int(e[1]) for e in _RECENT_ANCHOR_CACHE]
+        # Gate stability on the icon's RIGHT edge (x2) and vertical
+        # centre — NOT the left edge (x1). The left edge is intrinsically
+        # noisy: the winning NCC template SCALE varies frame-to-frame
+        # (tw 40/44/48 → x1 shifts several px even when the pin hasn't
+        # moved) and _expand_to_icon_extent rewrites x1→0 on some frames
+        # but not others, so xs1 can swing 0→17px on a perfectly
+        # stationary panel and the cache NEVER stabilises → the value is
+        # read every frame but emission is suppressed forever (user
+        # 2026-06-02: signature reads 12810 each scan yet "not sending
+        # results"). The right edge sits against the leading digit — the
+        # digit cluster itself is found rock-steady — so x2 is the honest
+        # "did the panel move?" signal. A glint/arrow false positive
+        # (the case this gate defends against) jumps in BOTH x2 and y, so
+        # rejection strength is preserved.
         xs2 = [int(e[3]) for e in _RECENT_ANCHOR_CACHE]
+        ycs = [(int(e[2]) + int(e[4])) // 2 for e in _RECENT_ANCHOR_CACHE]
         return (
-            (max(xs1) - min(xs1)) <= _ANCHOR_STABILITY_TOLERANCE_PX
-            and (max(xs2) - min(xs2)) <= _ANCHOR_STABILITY_TOLERANCE_PX
+            (max(xs2) - min(xs2)) <= _ANCHOR_STABILITY_TOLERANCE_PX
+            and (max(ycs) - min(ycs)) <= _ANCHOR_STABILITY_TOLERANCE_PX
         )
 
     def _stability_gated(
@@ -595,6 +618,57 @@ def find_icon(
     adapter) keep their current behavior because ``rgb_image`` defaults
     to ``None`` and the validator is then skipped.
     """
+    # ── PRIMARY: defer to the RGB consensus localizer when available ──
+    # ``find_icon``'s grayscale multi-scale NCC reliably locates the
+    # location-pin on clean captures, but on live RGB frames it can lock
+    # onto a digit region whose circle-on-stick silhouette out-scores a
+    # chromatically-aberrated pin — the symptom in the user's 2026-05-31
+    # screenshot was the RED anchor box landing on the value digits
+    # (NCC pick x=69, over the "2") while the real orange pin at x=23
+    # stood ignored. ``localize_icon`` (warm-color geometry AND
+    # color-aware RGB NCC must agree within IoU) does NOT share that
+    # failure mode, and it is exactly the detector the production digit-
+    # crop path already trusts (api._signal_recognize_pil world-model
+    # branch). When it reports a confident consensus icon, use it
+    # directly and skip the flaky gray NCC, so the anchor — and the
+    # debugger's RED box — matches the icon the crop pipeline used.
+    #
+    # Guarded on ``rgb_image is not None`` so the gray-only caller (the
+    # auto-annotator's detect_icon adapter) keeps the legacy NCC path.
+    if rgb_image is not None:
+        try:
+            from hud_tracker.anchors.icon_voter import (
+                localize_icon as _localize_icon,
+            )
+            _loc = _localize_icon(rgb_image)
+        except Exception as _loc_exc:  # pragma: no cover - defensive
+            log.debug("find_icon: localize_icon raised: %s", _loc_exc)
+            _loc = None
+        if _loc is not None:
+            _bbox = _loc.get("bbox")
+            if _bbox is not None and len(_bbox) == 4:
+                _lx, _ly, _lw, _lh = (
+                    int(_bbox[0]), int(_bbox[1]),
+                    int(_bbox[2]), int(_bbox[3]),
+                )
+                if _lw > 0 and _lh > 0:
+                    # Consensus of two independent detectors is stronger
+                    # evidence than a lone NCC peak, so report a score
+                    # that clears the high-confidence cache-seed
+                    # threshold (``_ANCHOR_HIGH_CONF_THR``) and let the
+                    # temporal smoother lock onto the correct position.
+                    _lscore = max(float(_loc.get("score", 0.0)), 0.80)
+                    log.warning(
+                        "[ANCHOR-DIAG] signal_anchor.find_icon: using "
+                        "localize_icon consensus bbox=(%d,%d,%d,%d) "
+                        "score=%.2f (skipped gray NCC)",
+                        _lx, _ly, _lx + _lw, _ly + _lh, _lscore,
+                    )
+                    return _smooth_anchor_with_cache(
+                        (_lx, _ly, _lx + _lw, _ly + _lh, _lscore)
+                    )
+
+    # ── FALLBACK: grayscale multi-scale NCC (legacy path) ──
     cache = _ensure_cache()
     if not cache:
         return _smooth_anchor_with_cache(None)

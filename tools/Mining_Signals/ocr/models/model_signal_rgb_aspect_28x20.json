@@ -9,7 +9,7 @@
     28,
     20
   ],
-  "valAccuracy": 0.9850299401197605,
+  "valAccuracy": 0.9925149700598802,
   "trainSamples": 3782,
   "valSamples": 668,
   "perClassCounts": {
@@ -26,16 +26,16 @@
     "@": 450
   },
   "perClassValAccuracy": {
-    "0": 0.9692307692307692,
-    "1": 1.0,
+    "0": 1.0,
+    "1": 0.9814814814814815,
     "2": 0.9830508474576272,
-    "3": 1.0,
-    "4": 0.98,
-    "5": 0.9838709677419355,
-    "6": 0.9836065573770492,
-    "7": 0.9666666666666667,
+    "3": 0.9855072463768116,
+    "4": 1.0,
+    "5": 1.0,
+    "6": 1.0,
+    "7": 0.9833333333333333,
     "8": 0.9824561403508771,
-    "9": 0.9855072463768116,
+    "9": 1.0,
     "@": 1.0
   },
   "perClassValSamples": {
@@ -55,55 +55,55 @@
     "0": {
       "sig_src": 200,
       "pan_src": 189,
-      "live_28x20_src": 56,
+      "live_28x20_src": 0,
       "total_after_balance": 400
     },
     "1": {
       "sig_src": 200,
       "pan_src": 94,
-      "live_28x20_src": 27,
+      "live_28x20_src": 0,
       "total_after_balance": 400
     },
     "2": {
       "sig_src": 200,
       "pan_src": 102,
-      "live_28x20_src": 14,
+      "live_28x20_src": 0,
       "total_after_balance": 400
     },
     "3": {
       "sig_src": 200,
       "pan_src": 92,
-      "live_28x20_src": 5,
+      "live_28x20_src": 0,
       "total_after_balance": 400
     },
     "4": {
       "sig_src": 200,
       "pan_src": 123,
-      "live_28x20_src": 6,
+      "live_28x20_src": 0,
       "total_after_balance": 400
     },
     "5": {
       "sig_src": 200,
       "pan_src": 95,
-      "live_28x20_src": 10,
+      "live_28x20_src": 0,
       "total_after_balance": 400
     },
     "6": {
       "sig_src": 200,
       "pan_src": 76,
-      "live_28x20_src": 5,
+      "live_28x20_src": 0,
       "total_after_balance": 400
     },
     "7": {
       "sig_src": 200,
       "pan_src": 75,
-      "live_28x20_src": 15,
+      "live_28x20_src": 0,
       "total_after_balance": 400
     },
     "8": {
       "sig_src": 200,
       "pan_src": 69,
-      "live_28x20_src": 7,
+      "live_28x20_src": 0,
       "total_after_balance": 400
     },
     "9": {
@@ -113,8 +113,8 @@
       "total_after_balance": 400
     }
   },
-  "trainedAt": "2026-05-10T14:33:21",
-  "trainingSeconds": 41.6770384311676,
+  "trainedAt": "2026-06-10T21:21:56",
+  "trainingSeconds": 36.3574435710907,
   "modelPath": "C:\\Users\\prjgn\\AppData\\Local\\SC_Toolbox\\current\\tools\\Mining_Signals\\ocr\\models\\model_signal_rgb_aspect_28x20.onnx",
   "digitStagingDir": "C:\\Users\\prjgn\\AppData\\Local\\SC_Toolbox\\current\\tools\\Mining_Signals\\_aspect_28x20_digit_staging_rgb",
   "iconStagingDir": "C:\\Users\\prjgn\\AppData\\Local\\SC_Toolbox\\current\\tools\\Mining_Signals\\_aspect_28x20_icon_staging_rgb",
@@ -133,7 +133,7 @@
       "v3_28x28_pred": "5",
       "v3_28x28_conf": 0.9997953772544861,
       "new_28x20_pred": "5",
-      "new_28x20_conf": 0.629250168800354,
+      "new_28x20_conf": 1.0,
       "claimed_28x28_misread_as": "3",
       "x1": 121,
       "x2": 138
@@ -144,7 +144,7 @@
       "v3_28x28_pred": "0",
       "v3_28x28_conf": 1.0,
       "new_28x20_pred": "0",
-      "new_28x20_conf": 0.9999980926513672,
+      "new_28x20_conf": 1.0,
       "claimed_28x28_misread_as": "7",
       "x1": 159,
       "x2": 170
@@ -155,7 +155,7 @@
       "v3_28x28_pred": "0",
       "v3_28x28_conf": 1.0,
       "new_28x20_pred": "0",
-      "new_28x20_conf": 0.9999750852584839,
+      "new_28x20_conf": 0.999998927116394,
       "claimed_28x28_misread_as": "8",
       "x1": 157,
       "x2": 169

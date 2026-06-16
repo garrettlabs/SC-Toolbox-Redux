@@ -1308,8 +1308,12 @@ def _label_rows_from_anchor(
     try:
         from .sc_ocr import label_match as _lm_rows
         if (img.height - search_origin) >= 60:
-            below = img.crop((0, search_origin, img.width, img.height))
-            matches = _lm_rows.find_label_positions(below)
+            # y_min keeps the search below the title; coordinates come
+            # back IMAGE-ABSOLUTE (label_match owns the conversion).
+            matches = _lm_rows.find_label_positions(
+                img, y_min=search_origin,
+            )
+            matches = _repair_label_match_xs(img, matches)
             if matches and "mass" in matches:
                 # ── Auto-calibration hook ──
                 # Feed the observed (title_y, title_h, label_y_top,
@@ -1319,10 +1323,8 @@ def _label_rows_from_anchor(
                 # tracker's offset/row-mult tables — overriding the
                 # hardcoded defaults that don't match this user's HUD.
                 #
-                # The `below` crop is at y=search_origin; matches['y']
-                # is below-relative, so we add search_origin to get
-                # image-absolute. The calibration learner needs the
-                # same coordinate frame as title_y.
+                # matches['y'] is already image-absolute (label_match
+                # applied y_min internally) — same frame as title_y.
                 try:
                     from .sc_ocr import hud_panel_tracker as _hpt
                     _abs_matches: dict[str, dict] = {}
@@ -1332,7 +1334,7 @@ def _label_rows_from_anchor(
                             continue
                         _abs_matches[_fld] = {
                             "x": int(_m["x"]),
-                            "y": int(_m["y"]) + int(search_origin),
+                            "y": int(_m["y"]),
                             "w": int(_m["w"]),
                             "h": int(_m["h"]),
                         }
@@ -1346,9 +1348,9 @@ def _label_rows_from_anchor(
                         "auto-calibration observe failed: %s", _cal_exc,
                     )
 
-                # Per-row label_right = matched label bbox's right edge.
-                # Coordinates here are in ``below``'s frame, which equals
-                # ``img``'s frame (we crop only on Y, not X).
+                # Per-row label_right = matched label bbox's right edge
+                # (coordinates are image-absolute; label_match owns the
+                # y_min restriction internally).
                 per_match_lr = {
                     k: int(m["x"]) + int(m["w"]) for k, m in matches.items()
                 }
@@ -1412,7 +1414,7 @@ def _label_rows_from_anchor(
                         # the prediction can be 10-15 px off). The
                         # all-or-nothing gate below is what actually
                         # defends against snapping to non-colon glyphs.
-                        mass_y_below = int(matches["mass"]["y"])
+                        mass_y_abs = int(matches["mass"]["y"])
                         mass_h_pred = int(matches["mass"]["h"])
                         pitch_pred = max(20, int(round(mass_h_pred * 1.4)))
                         row_offsets = {
@@ -1421,7 +1423,7 @@ def _label_rows_from_anchor(
                             "instability": 2 * pitch_pred,
                         }
                         mass_cy_img = (
-                            search_origin + mass_y_below + mass_h_pred // 2
+                            mass_y_abs + mass_h_pred // 2
                         )
                         _SNAP_TOL = 20
                         used_colon_idxs: set[int] = set()
@@ -1518,7 +1520,7 @@ def _label_rows_from_anchor(
                 _PAD_Y_TOP = 8
                 _PAD_Y_BOT = 4
                 mass_match = matches["mass"]
-                mass_y_full = search_origin + int(mass_match["y"])
+                mass_y_full = int(mass_match["y"])
                 mass_h = int(mass_match["h"])
                 pitch = max(20, int(round(mass_h * 1.4)))
 
@@ -1536,10 +1538,10 @@ def _label_rows_from_anchor(
                       3. Synthesize from MASS using pitch.
                     """
                     if m is not None:
-                        y1 = max(0, search_origin + int(m["y"]) - _PAD_Y_TOP)
+                        y1 = max(0, int(m["y"]) - _PAD_Y_TOP)
                         y2 = min(
                             img.height,
-                            search_origin + int(m["y"]) + int(m["h"]) + _PAD_Y_BOT,
+                            int(m["y"]) + int(m["h"]) + _PAD_Y_BOT,
                         )
                     elif colon_cy is not None:
                         y1 = max(0, colon_cy - mass_h // 2 - _PAD_Y_TOP)
@@ -2261,7 +2263,8 @@ def _scan_label_end_x(
     row_y2: int,
     *,
     x_limit: Optional[int] = None,
-) -> Optional[int]:
+    return_start: bool = False,
+) -> "Optional[object]":
     """Scan a row strip for the image-X where the LABEL text ends.
 
     The SC mining HUD renders ``LABEL:`` on the left of each row, a
@@ -2329,6 +2332,8 @@ def _scan_label_end_x(
                 # if it is wide enough; otherwise it was speckle —
                 # discard and keep scanning for the real label.
                 if last_ink - run_start + 1 >= min_label_w:
+                    if return_start:
+                        return (int(run_start), int(last_ink) + 2)
                     return int(last_ink) + 2  # +2 px anti-alias halo
                 run_start = None
                 last_ink = -1
@@ -2341,8 +2346,63 @@ def _scan_label_end_x(
         run_start is not None
         and last_ink - run_start + 1 >= min_label_w
     ):
+        if return_start:
+            return (int(run_start), int(last_ink) + 2)
         return int(last_ink) + 2
     return None
+
+
+def _repair_label_match_xs(
+    img: Image.Image,
+    matches: dict,
+    slack: int = 10,
+) -> dict:
+    """Re-anchor label matches that landed in the VALUE column.
+
+    The label templates can false-match the value digits (live
+    2026-06-12: MASS matched at x=416 on "12334" while the row's ink
+    label-end was 82; resistance/instability were then synthesized
+    from that wrong x, mis-placing value boxes and poisoning the
+    auto-calibration and row-consensus K_x evidence). The row's
+    leftmost substantial ink cluster is ground truth for where the
+    label text lives: when a match's x lies beyond the ink-derived
+    label END, the match is on the value column — re-anchor its x to
+    the ink cluster START. The y/h are kept (they were correct even
+    in the observed failure). Pixel work runs only when matches
+    exist (~1 ms for the max-channel build + per-row scans)."""
+    if not matches:
+        return matches
+    detect = None
+    out = dict(matches)
+    for fld, m in matches.items():
+        try:
+            x = int(m["x"])
+            y1 = int(m["y"])
+            y2 = y1 + int(m["h"])
+            if detect is None:
+                detect = (
+                    np.array(img.convert("RGB"), dtype=np.uint8)
+                    .max(axis=2)
+                    .astype(np.uint8)
+                )
+            se = _scan_label_end_x(
+                detect, y1, y2, return_start=True,
+            )
+            if se is None:
+                continue
+            start, end = se
+            if x > int(end) + slack:
+                mm = dict(m)
+                mm["x"] = int(start)
+                out[fld] = mm
+                log.info(
+                    "label-x repaired field=%s x=%d -> %d (match was "
+                    "in the value column; ink label span %d..%d)",
+                    fld, x, int(start), int(start), int(end),
+                )
+        except Exception:
+            continue
+    return out
 
 
 def _scan_value_column_x(
@@ -2913,7 +2973,175 @@ def _build_manual_override_label_rows(
     return out
 
 
+def _refine_value_band_to_ink(
+    gray: np.ndarray,
+    y1: int,
+    y2: int,
+    x_left: int,
+    x_right: int,
+) -> tuple[int, int]:
+    """Snap a label-derived value band onto the ACTUAL digit-ink rows.
+
+    The HUD value crop is derived from the LABEL row geometry: each
+    field's band is centred on its label and the value digits are
+    assumed to sit at the label's vertical position. In practice the
+    value renders at a slightly different vertical offset from its label
+    baseline, and that offset varies with HUD resolution — so a label-
+    centred band clips digit tops or bottoms (the instability
+    "19.50"->19.99 / "1.43"->1.41 family of bugs). Every prior fix was a
+    per-field fixed shift/extend constant overfit to one capture.
+
+    This is the self-correcting replacement. Within a generous vertical
+    window around the coarse band, project per-row ink on the VALUE
+    column, find the contiguous ink run that best OVERLAPS the coarse
+    band (so an adjacent row's ink cannot hijack it), and return a band
+    snapped to that run plus a small margin. Falls back to the input band
+    whenever no clear, overlapping ink run is found — so it can only ever
+    tighten onto real digits, never strand a field with an empty crop.
+
+    Row profile uses a high per-row PERCENTILE (not mean) so it is
+    immune to the value's horizontal position/width: a row crossing any
+    digit stroke scores high regardless of how few columns the value
+    occupies, while a single hot pixel can't fake a row.
+
+    gray: max-channel grayscale of the (upscaled) HUD region.
+    [y1,y2]: coarse label-derived band. [x_left,x_right]: value column.
+    Returns a (y1, y2) band in the same coordinates.
+    """
+    try:
+        H, W = int(gray.shape[0]), int(gray.shape[1])
+        y1i, y2i = int(y1), int(y2)
+        bh = max(1, y2i - y1i)
+        xl = max(0, int(x_left))
+        xr = min(int(x_right), W)
+        if xr - xl < 6:
+            return y1, y2
+        # Window: ~0.55 band-height beyond each edge — enough to recover a
+        # value rendered above OR below its label baseline, short of the
+        # adjacent row. The overlap test below is the real guard against
+        # grabbing a neighbour's ink, so the window can be generous.
+        pad = max(3, int(bh * 0.55))
+        wy1 = max(0, y1i - pad)
+        wy2 = min(H, y2i + pad)
+        if wy2 - wy1 < 6:
+            return y1, y2
+        col = gray[wy1:wy2, xl:xr].astype(np.float32)
+        # Canonical polarity: ink bright (bright background -> invert).
+        if float(np.median(col)) > 140.0:
+            col = 255.0 - col
+        prof = np.percentile(col, 90, axis=1)
+        lo, hi = float(prof.min()), float(prof.max())
+        if hi - lo < 12.0:
+            return y1, y2  # flat strip, no resolvable ink
+        thr = lo + 0.33 * (hi - lo)
+        mask = prof > thr
+        # Enumerate contiguous ink runs (window-relative row indices).
+        runs: list[tuple[int, int]] = []
+        _s: Optional[int] = None
+        for _i, _v in enumerate(mask):
+            if _v and _s is None:
+                _s = _i
+            elif (not _v) and _s is not None:
+                runs.append((_s, _i))
+                _s = None
+        if _s is not None:
+            runs.append((_s, len(mask)))
+        if not runs:
+            return y1, y2
+
+        # Pick the run that overlaps the coarse band the most (absolute
+        # coords); ties break toward the longer run.
+        def _overlap(rs: int, re: int) -> int:
+            a0, a1 = wy1 + rs, wy1 + re
+            return max(0, min(a1, y2i) - max(a0, y1i))
+
+        best = max(runs, key=lambda r: (_overlap(r[0], r[1]), r[1] - r[0]))
+        if _overlap(best[0], best[1]) < 2 or (best[1] - best[0]) < 4:
+            return y1, y2  # nothing meaningfully overlaps -> keep label band
+        rs, re = best
+        margin = max(2, int((re - rs) * 0.18))
+        ny1 = max(0, wy1 + rs - margin)
+        ny2 = min(H, wy1 + re + margin)
+        if ny2 - ny1 < 6:
+            return y1, y2
+        return ny1, ny2
+    except Exception:
+        return y1, y2
+
+
 def _find_label_rows(img: Image.Image) -> dict[str, tuple[int, int, int]]:
+    """Pose-hold wrapper around the full row detection.
+
+    When the pixels under every previously-accepted anchor band are
+    unchanged (fingerprint-verified per call — see
+    ``sc_ocr.panel_pose``), the previous rows are returned WITHOUT any
+    template sweeps: the steady state verifies instead of re-searching,
+    which removes both the per-frame mis-detection opportunity and the
+    sweep cost. Any fingerprint break, image-size change, or the
+    periodic forced re-verify falls through to ``_find_label_rows_impl``
+    and re-fingerprints its result. ``SC_POSE_HOLD=0`` disables holding.
+    """
+    _pose_on = os.environ.get("SC_POSE_HOLD") != "0"
+    if _pose_on:
+        try:
+            from .sc_ocr import panel_pose as _pose_mod
+            _held = _pose_mod.observe(img)
+            if _held is not None:
+                _pose_health("HELD", _held)
+                return _held
+        except Exception as _ph_exc:
+            log.debug("pose-hold observe failed: %s", _ph_exc)
+    result = _find_label_rows_impl(img)
+    if _pose_on:
+        try:
+            from .sc_ocr import panel_pose as _pose_mod
+            _pose_mod.store(img, result)
+        except Exception as _ph_exc:
+            log.debug("pose-hold store failed: %s", _ph_exc)
+    _pose_health("DETECTED", result)
+    return result
+
+
+def _pose_health(state: str, rows: dict) -> None:
+    """One greppable line per frame into filter_events.log: the pose
+    state (HELD / DETECTED) and the row geometry it produced. Loss
+    events and flaps become data instead of anecdotes -- grep POSE
+    and diff the y's. Best-effort: never affects the scan."""
+    try:
+        from .sc_ocr import api as _api_mod
+        _m = rows.get("mass") if rows else None
+        _i = rows.get("instability") if rows else None
+        _api_mod._filter_event_log(
+            "POSE %s mass=%s instab=%s rows=%d"
+            % (
+                state,
+                ("%d-%d" % (_m[0], _m[1])) if _m else "-",
+                ("%d-%d" % (_i[0], _i[1])) if _i else "-",
+                len(rows) if rows else 0,
+            )
+        )
+    except Exception:
+        pass
+
+
+def _find_label_rows_impl(img: Image.Image) -> dict[str, tuple[int, int, int]]:
+    # Per-scan percept lifecycle: drop any cached normalization from a
+    # PRIOR frame before this call reads the shared frame_context. The
+    # cache keys on (id,size,mode); Python reuses id() after GC and
+    # region1 panels often share size+mode, so without this reset a
+    # collected prior frame's id-reuse would alias its stale max-channel
+    # onto this frame (harness 2026-06-12: instability 28->25). Within
+    # this call ``img`` is a live parameter, so its id is stable and the
+    # in-call cache hits are valid.
+    try:
+        from .sc_ocr import frame_context as _fc0
+        _fc0.reset()
+    except Exception:
+        pass
+    return _find_label_rows_impl_body(img)
+
+
+def _find_label_rows_impl_body(img: Image.Image) -> dict[str, tuple[int, int, int]]:
     """Find MASS / RESIST / INSTAB rows.
 
     Strategy:
@@ -3020,12 +3248,39 @@ def _find_label_rows(img: Image.Image) -> dict[str, tuple[int, int, int]]:
         try:
             from .sc_ocr import scan_results_match as _srm_pre
             _t_srm_import = time.monotonic()
-            _pre_anchor = _srm_pre.find_scan_results_anchor(img)
+            # LOCAL-FIRST: when the cross-frame tracker has a fresh
+            # smoothed pose, search a ±60 px window around it instead
+            # of sweeping the full frame. The full sweep re-discovered
+            # a constant small-scale false positive every cycle (the
+            # title underline + end hook at 0.6x scale, score ~0.9,
+            # logged as "tracker REJECTED outlier dist=395.7px") —
+            # cosmetically harmless but ~26 ms/scan of waste and log
+            # spam. A local window never contains that blob. A local
+            # MISS escalates to the full-frame sweep, so a real panel
+            # move is still re-acquired exactly as before.
+            _trk_center = None
+            try:
+                _trk_center = _srm_pre.get_tracked_anchor_center()
+            except Exception:
+                _trk_center = None
+            _pre_anchor = None
+            _pre_mode = "full"
+            if _trk_center is not None:
+                _pre_anchor = _srm_pre.find_scan_results_anchor(
+                    img, search_center=_trk_center, search_radius=60,
+                )
+                if _pre_anchor is not None:
+                    _pre_mode = "local"
+                else:
+                    _pre_mode = "full-escalated"
+            if _pre_anchor is None:
+                _pre_anchor = _srm_pre.find_scan_results_anchor(img)
             log.debug(
                 "_find_label_rows: PRE-ANCHOR srm.find_scan_results_anchor "
-                "took %.0fms (result=%s)",
+                "took %.0fms (result=%s, mode=%s)",
                 (time.monotonic() - _t_srm_import) * 1000.0,
                 "OK" if _pre_anchor is not None else "None",
+                _pre_mode,
             )
         except Exception as _pre_inner_exc:
             _pre_anchor = None
@@ -3130,21 +3385,25 @@ def _find_label_rows(img: Image.Image) -> dict[str, tuple[int, int, int]]:
                 )
                 _early_direct_result: Optional[dict] = None
                 if (img.height - _search_origin_cal) >= 60:
-                    _below_cal = img.crop(
-                        (0, _search_origin_cal, img.width, img.height),
+                    # y_min keeps the search below the title;
+                    # coordinates come back IMAGE-ABSOLUTE.
+                    _cal_matches = _lm_cal.find_label_positions(
+                        img, y_min=_search_origin_cal,
                     )
-                    _cal_matches = _lm_cal.find_label_positions(_below_cal)
+                    _cal_matches = _repair_label_match_xs(
+                        img, _cal_matches,
+                    )
                     if _cal_matches:
                         _abs_matches: dict[str, dict] = {}
                         for _fld in ("mass", "resistance", "instability"):
                             _m = _cal_matches.get(_fld)
                             if not _m:
                                 continue
-                            # Add the crop offset back so the y is
-                            # image-absolute (matches title_y's frame).
+                            # y is already image-absolute (label_match
+                            # applied y_min internally).
                             _abs_matches[_fld] = {
                                 "x": int(_m["x"]),
-                                "y": int(_m["y"]) + _search_origin_cal,
+                                "y": int(_m["y"]),
                                 "w": int(_m["w"]),
                                 "h": int(_m["h"]),
                             }
@@ -3336,6 +3595,40 @@ def _find_label_rows(img: Image.Image) -> dict[str, tuple[int, int, int]]:
                             _row_bands: dict[
                                 str, tuple[int, int]
                             ] = {}
+                            # ── RIGID-POSE AUTHORITY ──
+                            # Solve ONE panel pose from the title + label
+                            # observations and derive every row CENTER
+                            # from it, so the rows are a single rigid
+                            # body that cannot independently disagree —
+                            # and an anchor that doesn't fit (a dust
+                            # title, a stray label) is rejected as an
+                            # outlier and the pose re-solved from the
+                            # rest. Proven on 66 annotated panels: pose
+                            # row-centers land within ~1px median.
+                            # The band THICKNESS keeps the tuned
+                            # ``_half_h_direct`` (pose validated centers,
+                            # not band height). Falls back to per-label
+                            # centers only when the pose is
+                            # under-determined (<2 anchors).
+                            _panel_pose = None
+                            try:
+                                from .sc_ocr import panel_solve as _psolve
+                                _lbls_solve = {
+                                    _f: _abs_matches[_f]
+                                    for _f in _required
+                                    if _f in _abs_matches
+                                }
+                                _panel_pose = _psolve.solve(
+                                    _pre_anchor, _lbls_solve,
+                                )
+                            except Exception as _pexc:
+                                log.debug(
+                                    "EARLY-DIRECT pose solve failed: %s",
+                                    _pexc,
+                                )
+                                _panel_pose = None
+                            # Independent per-label band is the starting
+                            # point (the value reader is tuned to it).
                             for _fld in _required:
                                 _m_abs = _abs_matches[_fld]
                                 _lc = (
@@ -3343,11 +3636,64 @@ def _find_label_rows(img: Image.Image) -> dict[str, tuple[int, int, int]]:
                                     + int(_m_abs["h"]) // 2
                                 )
                                 _y1 = max(0, _lc - _half_h_direct)
-                                _y2 = min(
-                                    img.height, _lc + _half_h_direct,
-                                )
+                                _y2 = min(img.height, _lc + _half_h_direct)
                                 if _y2 - _y1 >= 4:
                                     _row_bands[_fld] = (_y1, _y2)
+                            # The rigid pose now CORRECTS strays, it does
+                            # not override good detail: a row whose
+                            # independent center disagrees with the
+                            # pose-predicted center by more than
+                            # _POSE_SNAP_PX is the part trying to wander
+                            # (a dust/jump detection) — snap it back onto
+                            # the body. A row that already agrees is left
+                            # exactly as the tuned value reader expects,
+                            # so clean stills are unchanged. This is the
+                            # skeleton holding each part in place without
+                            # forcibly moving the ones already seated.
+                            _POSE_SNAP_PX = 12
+                            if _panel_pose is not None:
+                                _snapped = []
+                                for _fld in _required:
+                                    _pcy = int(round(
+                                        _panel_pose["y"]
+                                        + _panel_pose["scale"]
+                                        * _psolve.ROW_CENTER_MULTS[_fld]
+                                    ))
+                                    _cur = _row_bands.get(_fld)
+                                    _cur_cy = (
+                                        (_cur[0] + _cur[1]) // 2
+                                        if _cur else None
+                                    )
+                                    if (_cur_cy is None
+                                            or abs(_cur_cy - _pcy)
+                                            > _POSE_SNAP_PX):
+                                        _y1 = max(0, _pcy - _half_h_direct)
+                                        _y2 = min(
+                                            img.height, _pcy + _half_h_direct,
+                                        )
+                                        if _y2 - _y1 >= 4:
+                                            _row_bands[_fld] = (_y1, _y2)
+                                            _snapped.append(_fld)
+                                log.info(
+                                    "_find_label_rows: RIGID POSE x=%.0f "
+                                    "y=%.0f scale=%.1f anchors=%s "
+                                    "rejected=%s snapped=%s",
+                                    _panel_pose["x"], _panel_pose["y"],
+                                    _panel_pose["scale"],
+                                    _panel_pose["anchors"],
+                                    _panel_pose["rejected"], _snapped,
+                                )
+                                # Overlay: draw the title from the POSE
+                                # so the gold box stops hopping between
+                                # the raw detection and the frozen
+                                # snapshot (the ~14px jump the user
+                                # recorded) — one rigid source.
+                                try:
+                                    _set_cached_title_box(
+                                        _psolve.title_box(_panel_pose)
+                                    )
+                                except Exception:
+                                    pass
                             # ── Value-column X (label_right) ──
                             # Every field's value crop starts at this
                             # X. Derive it from where the VALUE INK
@@ -3372,14 +3718,8 @@ def _find_label_rows(img: Image.Image) -> dict[str, tuple[int, int, int]]:
                             _value_starts: list[int] = []
                             _label_ends: list[int] = []
                             try:
-                                _detect_ed = (
-                                    np.array(
-                                        img.convert("RGB"),
-                                        dtype=np.uint8,
-                                    )
-                                    .max(axis=2)
-                                    .astype(np.uint8)
-                                )
+                                from .sc_ocr import frame_context as _fc
+                                _detect_ed = _fc.max_channel(img)
                                 for _fld in _required:
                                     _bnd = _row_bands.get(_fld)
                                     if _bnd is None:
@@ -3444,14 +3784,71 @@ def _find_label_rows(img: Image.Image) -> dict[str, tuple[int, int, int]]:
                                 sorted(_label_ends),
                                 img.width,
                             )
+                            # Max-channel grayscale for the ink-projection
+                            # band refiner (same recipe as _detect_ed; built
+                            # here so the refiner doesn't depend on the
+                            # value-column scan's try-block scope).
+                            try:
+                                from .sc_ocr import frame_context as _fc
+                                _gray_ink = _fc.max_channel(img)
+                            except Exception:
+                                _gray_ink = None
                             _direct: dict[str, tuple[int, int, int]] = {}
                             for _fld in _required:
                                 _bnd = _row_bands.get(_fld)
                                 if _bnd is None:
                                     continue
-                                _direct[_fld] = (
-                                    _bnd[0], _bnd[1], _label_right,
-                                )
+                                _y1d, _y2d = int(_bnd[0]), int(_bnd[1])
+                                # Snap the label-derived band onto the actual
+                                # digit ink. SCOPED TO INSTABILITY: across all
+                                # 130 annotated region panels (full pipeline,
+                                # not pre-cropped) the instability label band
+                                # is only ~6% correct — its value renders well
+                                # off its label baseline and clips badly — and
+                                # the ink refiner ~triples it (recovering
+                                # clipped leading digits on values like 282.02
+                                # / 126.02 / 19.08 that the label band read as
+                                # 47.42 / 12.02 / 1.96). Mass and resistance,
+                                # by contrast, read fine from the label band
+                                # and the refiner REGRESSES them (it snapped
+                                # onto wrong/noise ink: resistance 0%->55,
+                                # mass 15683->5883), so they keep the label
+                                # band. The refiner still self-corrects across
+                                # resolutions and falls back to the label band
+                                # when no clear overlapping ink run is found.
+                                # See _refine_value_band_to_ink + the
+                                # full-panel A/B in task notes.
+                                if _gray_ink is not None and _fld == "instability":
+                                    _ry1, _ry2 = _refine_value_band_to_ink(
+                                        _gray_ink, _y1d, _y2d,
+                                        _label_right, img.width,
+                                    )
+                                    # Height sanity: digits are label-
+                                    # height-ish. A refined band much
+                                    # shorter than the label band is
+                                    # PARTIAL ink (clipped digits), not
+                                    # a better band — live 2026-06-12 a
+                                    # 16px sliver of a 44px band read
+                                    # 1.43 as '4.%3' -> 4.3 and the
+                                    # frozen layer locked it.
+                                    if (_ry2 - _ry1) < 0.5 * (_y2d - _y1d):
+                                        log.info(
+                                            "_find_label_rows: ink-refine "
+                                            "REJECTED (h=%d < 50%% of "
+                                            "label band h=%d) — keeping "
+                                            "label band",
+                                            _ry2 - _ry1, _y2d - _y1d,
+                                        )
+                                        _ry1, _ry2 = _y1d, _y2d
+                                    if (_ry1, _ry2) != (_y1d, _y2d):
+                                        log.info(
+                                            "_find_label_rows: EARLY-DIRECT "
+                                            "ink-refine field=%s label-band="
+                                            "(%d,%d) -> ink-band=(%d,%d)",
+                                            _fld, _y1d, _y2d, _ry1, _ry2,
+                                        )
+                                        _y1d, _y2d = _ry1, _ry2
+                                _direct[_fld] = (_y1d, _y2d, _label_right)
                             # Mineral row sits between the title and
                             # the mass label. In ``title`` mode we use
                             # the detected title bottom; in ``label-
@@ -3462,7 +3859,22 @@ def _find_label_rows(img: Image.Image) -> dict[str, tuple[int, int, int]]:
                             # pitch UP from mass — same spacing the
                             # HUD itself uses between rows.
                             _mass_top = int(_abs_matches["mass"]["y"])
-                            if _geometry_source == "title":
+                            # Mineral row from the SAME rigid pose when
+                            # available — one body, so the name band
+                            # can't drift relative to the rows. Its
+                            # center is a fixed offset above MASS;
+                            # bottom is pinned just above the mass label.
+                            if _panel_pose is not None:
+                                _min_cy = int(round(
+                                    _panel_pose["y"]
+                                    + _panel_pose["scale"]
+                                    * _psolve.ROW_CENTER_MULTS["_mineral_row"]
+                                ))
+                                _mineral_y1 = max(
+                                    0,
+                                    _min_cy - int(_panel_pose["scale"] * 0.7),
+                                )
+                            elif _geometry_source == "title":
                                 _mineral_y1 = max(
                                     0,
                                     _title_y_int + _title_h_int + 4,
@@ -3506,6 +3918,29 @@ def _find_label_rows(img: Image.Image) -> dict[str, tuple[int, int, int]]:
                         _mineral_band = _early_direct_result.get(
                             "_mineral_row", (0, 0, 0),
                         )
+                        # Overlay honesty: the synthesized _mineral_row
+                        # is the whole title→MASS gap (a generous SEARCH
+                        # strip, kept as-is for downstream consumers).
+                        # The band OCR actually READS is the structural
+                        # refine (bottom-line-above-MASS + paren anchor)
+                        # — draw THAT, so the green MINERAL box matches
+                        # reality instead of swallowing the panel.
+                        try:
+                            from .sc_ocr import api as _api_band
+                            _rb_ov = (
+                                _api_band
+                                ._refine_mineral_band_above_mass(
+                                    img,
+                                    int(_abs_matches["mass"]["y"]),
+                                )
+                            )
+                            if _rb_ov is not None:
+                                _mineral_band = (
+                                    _rb_ov[0], _rb_ov[1],
+                                    _mineral_band[2],
+                                )
+                        except Exception:
+                            pass
                         _dbg_early.set_panel_finder(
                             top_y=_title_y_int,
                             mineral_y_top=_mineral_band[0] or None,
@@ -4443,6 +4878,11 @@ def scan_hud_onnx(region: dict) -> dict[str, Optional[float]]:
             sc_result.get("mass"), sc_result.get("resistance"),
             sc_result.get("instability"), elapsed,
         )
+        try:
+            from .sc_ocr import scan_record as _srec
+            _srec.write(sc_result if isinstance(sc_result, dict) else {}, elapsed)
+        except Exception:
+            pass
         return sc_result
     except Exception as exc:
         # Include the full traceback so we can locate the actual line

@@ -17,6 +17,24 @@ Architecture:
 """
 from __future__ import annotations
 
+# ---------------------------------------------------------------------------
+# WORKAROUND (Python 3.14 + this host): importing ``scipy.ndimage`` (pulled in
+# by ``hud_color_finder`` via ``_find_pill_for_signal`` and the region1 HUD
+# path) imports ``numpy.testing``, which calls ``platform`` at import time.
+# On 3.14 that routes ``platform.win32_ver`` -> ``_wmi_query`` -> a WMI COM
+# query that HANGS for minutes on this machine. The first signature/HUD read
+# then stalls 90s+, so the live pipeline looks "frozen / not sending results".
+# ``platform._win32_ver`` already catches ``OSError`` from ``_wmi_query`` and
+# falls back to a fast registry path, so we force that path by disabling the
+# WMI accessor. Effect is cosmetic (Windows version string comes from the
+# registry instead of WMI); ``platform.machine()`` is unaffected. Must run
+# before any ``scipy``/``numpy.testing`` import, hence the top of this module.
+try:  # pragma: no cover - defensive, never fatal
+    import platform as _platform_nowmi
+    _platform_nowmi._wmi = None
+except Exception:
+    pass
+
 import logging
 import os
 import re
@@ -29,70 +47,8 @@ import numpy as np
 from PIL import Image
 
 from . import capture, fallback, preprocess, validate
-from . import region_autoheal as _region_autoheal
 
 log = logging.getLogger(__name__)
-
-
-# ─────────────────────────────────────────────────────────────────────
-# Feature flag: self-healing region capture (v2.2.14+).
-#
-# When True (the default), ``scan_hud_onnx`` runs ``autoheal_capture``
-# instead of a bare ``capture.grab``. The autoheal layer enlarges the
-# user-supplied region, runs the RGB color-mask HUD locator on the
-# bigger grab, and crops back to the located panel — which rescues
-# users whose user-drawn region is too small to contain the full
-# SCAN RESULTS panel and was producing garbage values (the
-# "44 mass / 444,444" failure mode in v2.2.13).
-#
-# Three ways to override (checked in this order, first non-None wins):
-#   1. Environment variable ``SC_OCR_AUTO_HEAL_REGION`` set to one of
-#      "0"/"false"/"no"/"off" (disable) or "1"/"true"/"yes"/"on".
-#   2. Per-user JSON sidecar at
-#      ``%LOCALAPPDATA%/SC_Toolbox/sc_ocr/settings.json`` containing
-#      ``{"auto_heal_region": false}`` (or ``true``).
-#   3. Built-in default (True).
-#
-# The flag is read once per scan call so users can flip the JSON
-# sidecar without restarting the app. Lookups are caught defensively;
-# any failure falls back to the default.
-# ─────────────────────────────────────────────────────────────────────
-
-_AUTO_HEAL_DEFAULT = True
-
-
-def _read_auto_heal_region_flag() -> bool:
-    """Resolve the ``auto_heal_region`` feature flag.
-
-    See the module-level comment above for precedence and override
-    surface. Returns ``True``/``False`` — never raises.
-    """
-    env = os.environ.get("SC_OCR_AUTO_HEAL_REGION")
-    if env is not None:
-        v = env.strip().lower()
-        if v in {"0", "false", "no", "off"}:
-            return False
-        if v in {"1", "true", "yes", "on"}:
-            return True
-        # Unrecognized env value — log once and ignore.
-        log.warning(
-            "sc_ocr: ignoring unrecognized SC_OCR_AUTO_HEAL_REGION=%r",
-            env,
-        )
-
-    try:
-        from . import config as _cfg
-        import json as _json
-        from pathlib import Path as _Path
-        sidecar = _Path(_cfg.USER_ROOT) / "settings.json"
-        if sidecar.is_file():
-            data = _json.loads(sidecar.read_text(encoding="utf-8"))
-            if isinstance(data, dict) and "auto_heal_region" in data:
-                return bool(data["auto_heal_region"])
-    except Exception as exc:
-        log.debug("sc_ocr: settings.json lookup failed: %s", exc)
-
-    return _AUTO_HEAL_DEFAULT
 
 # Pre-compiled regex patterns (module scope)
 _RE_NUMERIC_TOKEN = re.compile(r"\d[\d.,]*%?")
@@ -945,6 +901,44 @@ def _reset_consensus_buffers() -> None:
         )
 
 
+# ── Cross-scan value-consistency reflex (field-generic) ──────────────
+# Live 2026-06-12: resistance flapped 34 -> 100 -> 11 -> 54 across scans
+# of an UNCHANGED panel because the HUD-RGB CRNN gate accepted weak
+# reads (down to 0.49 "plausible") and bypassed the per-glyph vote.
+# The flap signature is already encoded in the existing buffers:
+# window reads DISAGREE (unanimous is None) while the crop pixels are
+# STABLE (crop_ok). When that happens, the field loses its gate-bypass
+# privileges for a few scans and every read goes through the full
+# vote — one mechanism for ALL fields, replacing per-field patches.
+_BYPASS_REVOKE_SCANS = 10
+_bypass_revoked_until: dict = {}
+_consistency_scan_n: dict = {}
+
+
+def _consistency_reflex(field, unanimous, crop_ok, crop_sim) -> None:
+    """Note one scan's (field, agreement, crop-stability) and revoke
+    gate bypasses when reads flap on visually-stable pixels."""
+    n = _consistency_scan_n.get(field, 0) + 1
+    _consistency_scan_n[field] = n
+    if crop_ok and unanimous is None:
+        prev = _bypass_revoked_until.get(field, 0)
+        _bypass_revoked_until[field] = n + _BYPASS_REVOKE_SCANS
+        if prev <= n:
+            log.info(
+                "sc_ocr: CONSISTENCY REFLEX field=%s — reads disagree "
+                "on a visually-stable crop (sim=%.2f): gate bypasses "
+                "revoked for %d scans (full vote required)",
+                field, crop_sim, _BYPASS_REVOKE_SCANS,
+            )
+
+
+def _bypass_revoked(field) -> bool:
+    return (
+        _consistency_scan_n.get(field, 0)
+        < _bypass_revoked_until.get(field, 0)
+    )
+
+
 def reset_all_consensus() -> None:
     """Public escape hatch — clear ALL module-level consensus and lock
     state so the next scan starts completely fresh.
@@ -960,6 +954,8 @@ def reset_all_consensus() -> None:
     them from scratch. No locks held.
     """
     _reset_consensus_buffers()
+    _bypass_revoked_until.clear()
+    _consistency_scan_n.clear()
     log.info("sc_ocr.api: reset_all_consensus() — buffers/caches cleared")
 
 
@@ -1271,6 +1267,19 @@ def _lock_reverify_field(
         agrees = float(fresh_val) == float(locked_val)
     except (TypeError, ValueError):
         agrees = False
+    if not agrees and field == "instability" and "." not in text:
+        # DOT-DROPPED reads (live 2026-06-10): instability renders with
+        # exactly two decimals, so a dotless OCR string whose value is
+        # locked*100 is the known lost-dot signature, not disagreement.
+        # The main path repairs this via proactive-decimal-recover
+        # AFTER validation; this helper compared the RAW value and
+        # false-invalidated 1.43 vs '143' every reverify cycle —
+        # clearing the lock and emitting instability=143.0 for a frame.
+        try:
+            if abs(float(fresh_val) - float(locked_val) * 100.0) < 1e-6:
+                return ("CONFIRMED", float(locked_val), mean_conf)
+        except (TypeError, ValueError):
+            pass
     if agrees:
         return ("CONFIRMED", float(fresh_val), mean_conf)
     if mean_conf >= _REVERIFY_CONF_MIN:
@@ -4861,6 +4870,64 @@ def _tight_repad_glyph(
     return canvas
 
 
+def _aspect_pad_resize_28(padded: np.ndarray, bg: int = 255) -> np.ndarray:
+    """Aspect-preserving alternative to ``resize((28, 28))`` for glyphs.
+
+    The OLD-STYLE crop tail (pad the digit bbox with a 2-px ``bg`` ring,
+    then ``PIL.resize((28, 28))``) STRETCHES the box to a square. A thin
+    digit like ``1`` (≈6×24 ink) becomes ≈3× too wide — the "smushed 1"
+    the per-glyph viewer shows — which is wildly out of the training
+    distribution (where ``1`` is a thin, centered stroke with padding on
+    both sides). This helper instead scales the already-padded crop
+    UNIFORMLY so its larger dimension is 28, then centers it on a 28×28
+    canvas filled with the SAME ``bg`` the ring already uses.
+
+    Polarity-safe by construction: identical input array, identical bg
+    value, identical dtype path as the stretch — the ONLY difference is
+    the smaller dimension gets ``bg`` padding instead of being stretched.
+    So clean glyphs (already near-square) are essentially unchanged,
+    while thin/odd-aspect glyphs land in-distribution. No ink detection,
+    so no over-crop regression (the failure mode that got
+    ``_tight_repad_glyph`` disabled).
+
+    Args:
+        padded: HxW (gray) or HxWx3 (RGB) uint8/float crop, already
+            ``bg``-padded by the caller.
+        bg: background fill value (255 = the white pad the OLD tail uses).
+
+    Returns:
+        28×28 (gray) or 28×28×3 (RGB) uint8 array.
+    """
+    if padded is None or padded.size == 0:
+        is_rgb0 = padded is not None and padded.ndim == 3
+        shape0 = (28, 28, 3) if is_rgb0 else (28, 28)
+        return np.full(shape0, bg, dtype=np.uint8)
+    h, w = padded.shape[:2]
+    is_rgb = padded.ndim == 3
+    m = max(int(h), int(w))
+    if m <= 0:
+        shape0 = (28, 28, 3) if is_rgb else (28, 28)
+        return np.full(shape0, bg, dtype=np.uint8)
+    scale = 28.0 / float(m)
+    nh = max(1, min(28, int(round(h * scale))))
+    nw = max(1, min(28, int(round(w * scale))))
+    try:
+        pil = Image.fromarray(
+            padded.astype(np.uint8), mode="RGB" if is_rgb else "L",
+        ).resize((nw, nh), Image.BILINEAR)
+        small = np.asarray(pil, dtype=np.uint8)
+    except Exception:
+        shape0 = (28, 28, 3) if is_rgb else (28, 28)
+        return np.full(shape0, bg, dtype=np.uint8)
+    canvas = np.full(
+        (28, 28, 3) if is_rgb else (28, 28), bg, dtype=np.uint8,
+    )
+    y0 = (28 - nh) // 2
+    x0 = (28 - nw) // 2
+    canvas[y0:y0 + nh, x0:x0 + nw] = small
+    return canvas
+
+
 def _tight_repad_glyph_rgb(
     crop_canonical: np.ndarray,
     *,
@@ -5283,15 +5350,29 @@ def _classify_crops_signal(
     batch = np.array(routed, dtype=np.float32).reshape(-1, 1, 28, 28)
     try:
         logits = _signal_session.run(None, {inp_name: batch})[0]
+        # ── POLARITY-ROBUST SELF-CORRECTION (2026-05) ──────────────────
+        # _route_to_dark_on_light's polarity DETECTION misfires on some
+        # captures — notably higher-resolution HUDs whose value pills have
+        # near-pure-white backgrounds — and hands the model the INVERTED
+        # crop, producing confident-looking but wrong reads (live 21,350
+        # -> "40919"). The CNN is only confident (>0.9) on the CORRECT
+        # polarity, so we also classify the inverse and, per glyph, keep
+        # whichever polarity the model is more confident about. This is a
+        # no-op when detection was already right (routed crop wins), and
+        # it self-heals any future canonicalization drift.
+        logits_inv = _signal_session.run(None, {inp_name: (1.0 - batch)})[0]
     except Exception as exc:
         log.debug("sc_ocr.signal: _classify_crops_signal infer failed: %s", exc)
         return []
     results: list[tuple[str, float]] = []
     n_classes = len(_signal_classes)
     for i in range(len(crops)):
-        row = logits[i]
-        probs = np.exp(row - np.max(row))
+        probs = np.exp(logits[i] - np.max(logits[i]))
         probs /= probs.sum()
+        probs_inv = np.exp(logits_inv[i] - np.max(logits_inv[i]))
+        probs_inv /= probs_inv.sum()
+        if float(probs_inv.max()) > float(probs.max()):
+            probs = probs_inv
         idx = int(np.argmax(probs))
         if not (0 <= idx < n_classes):
             results.append(("?", 0.0))
@@ -5592,6 +5673,8 @@ def _classify_crops_signal_rgb(
         return []
     try:
         logits = _signal_rgb_session.run(None, {inp_name: batch})[0]
+        # Polarity-robust self-correction (see _classify_crops_signal).
+        logits_inv = _signal_rgb_session.run(None, {inp_name: (1.0 - batch)})[0]
     except Exception as exc:
         log.debug(
             "sc_ocr.signal: _classify_crops_signal_rgb infer failed: %s",
@@ -5601,9 +5684,12 @@ def _classify_crops_signal_rgb(
     results: list[tuple[str, float]] = []
     n_classes = len(_signal_rgb_classes)
     for i in range(len(rgb_crops)):
-        row = logits[i]
-        probs = np.exp(row - np.max(row))
+        probs = np.exp(logits[i] - np.max(logits[i]))
         probs /= probs.sum()
+        probs_inv = np.exp(logits_inv[i] - np.max(logits_inv[i]))
+        probs_inv /= probs_inv.sum()
+        if float(probs_inv.max()) > float(probs.max()):
+            probs = probs_inv
         idx = int(np.argmax(probs))
         if not (0 <= idx < n_classes):
             results.append(("?", 0.0))
@@ -5729,6 +5815,8 @@ def _classify_crops_signal_rgb_inv(
         return []
     try:
         logits = _signal_rgb_inv_session.run(None, {inp_name: batch})[0]
+        # Polarity-robust self-correction (see _classify_crops_signal).
+        logits_inv = _signal_rgb_inv_session.run(None, {inp_name: (1.0 - batch)})[0]
     except Exception as exc:
         log.debug(
             "sc_ocr.signal: _classify_crops_signal_rgb_inv infer "
@@ -5738,9 +5826,12 @@ def _classify_crops_signal_rgb_inv(
     results: list[tuple[str, float]] = []
     n_classes = len(_signal_rgb_inv_classes)
     for i in range(len(rgb_inv_crops)):
-        row = logits[i]
-        probs = np.exp(row - np.max(row))
+        probs = np.exp(logits[i] - np.max(logits[i]))
         probs /= probs.sum()
+        probs_inv = np.exp(logits_inv[i] - np.max(logits_inv[i]))
+        probs_inv /= probs_inv.sum()
+        if float(probs_inv.max()) > float(probs.max()):
+            probs = probs_inv
         idx = int(np.argmax(probs))
         if not (0 <= idx < n_classes):
             results.append(("?", 0.0))
@@ -5845,6 +5936,8 @@ def _classify_crops_signal_inv(
     batch = np.array(routed, dtype=np.float32).reshape(-1, 1, 28, 28)
     try:
         logits = _signal_inv_session.run(None, {inp_name: batch})[0]
+        # Polarity-robust self-correction (see _classify_crops_signal).
+        logits_inv = _signal_inv_session.run(None, {inp_name: (1.0 - batch)})[0]
     except Exception as exc:
         log.debug(
             "sc_ocr.signal: _classify_crops_signal_inv infer failed: %s",
@@ -5854,9 +5947,12 @@ def _classify_crops_signal_inv(
     results: list[tuple[str, float]] = []
     n_classes = len(_signal_inv_classes)
     for i in range(len(crops)):
-        row = logits[i]
-        probs = np.exp(row - np.max(row))
+        probs = np.exp(logits[i] - np.max(logits[i]))
         probs /= probs.sum()
+        probs_inv = np.exp(logits_inv[i] - np.max(logits_inv[i]))
+        probs_inv /= probs_inv.sum()
+        if float(probs_inv.max()) > float(probs.max()):
+            probs = probs_inv
         idx = int(np.argmax(probs))
         if not (0 <= idx < n_classes):
             results.append(("?", 0.0))
@@ -6382,6 +6478,88 @@ def _dump_signature_winner(
         log.debug("api: _dump_signature_winner swallowed: %s", exc)
 
 
+# ── Filter-event publishing for the live glyph viewer ──────────────
+# Every box the runtime filter chain removes (chroma ghost, pitch
+# ghost, quarantine veto, envelope) is published as a per-field
+# "dropped" tile row in the live viewer (reason code as the tile
+# label: C=chroma  P=pitch  V=quarantine-veto  E=envelope), and EVERY
+# event — drops, suspicious-keeps, recenter shifts — is appended to
+# debug_glyphs/filter_events.log regardless of whether the viewer is
+# open, so post-hoc debugging has a timeline even for headless runs.
+_FILTER_EVENT_LOG = None  # resolved lazily next to the glyph dump dir
+_filter_drops_acc: "dict[str, list]" = {}
+
+
+def _filter_event_log(line: str) -> None:
+    """Append one timestamped line to debug_glyphs/filter_events.log.
+    Always on (cheap); self-rotates at ~1 MB keeping the newest half."""
+    global _FILTER_EVENT_LOG
+    try:
+        import time as _t
+        if _FILTER_EVENT_LOG is None:
+            os.makedirs(_GLYPH_DUMP_DIR, exist_ok=True)
+            _FILTER_EVENT_LOG = os.path.join(
+                _GLYPH_DUMP_DIR, "filter_events.log",
+            )
+        try:
+            if (os.path.isfile(_FILTER_EVENT_LOG)
+                    and os.path.getsize(_FILTER_EVENT_LOG) > 1_000_000):
+                with open(_FILTER_EVENT_LOG, encoding="utf-8",
+                          errors="replace") as _f:
+                    _keep = _f.readlines()[-2000:]
+                with open(_FILTER_EVENT_LOG, "w", encoding="utf-8") as _f:
+                    _f.writelines(_keep)
+        except Exception:
+            pass
+        with open(_FILTER_EVENT_LOG, "a", encoding="utf-8") as _f:
+            _f.write(
+                _t.strftime("%H:%M:%S") + f".{int(_t.time()*1000)%1000:03d} "
+                + line + "\n"
+            )
+    except Exception:
+        pass
+
+
+def _filter_drops_begin(field: str) -> None:
+    """Reset the per-field drop accumulator at the start of a filter
+    chain and clear any stale viewer row from the previous frame."""
+    try:
+        _filter_drops_acc[field] = []
+        from . import debug_overlay as _dbg_fd
+        if _dbg_fd.diagnostics_active():
+            _clear_viewer_entry(field, "dropped")
+    except Exception:
+        pass
+
+
+def _record_filter_drops(field: str, filter_name: str, items) -> None:
+    """Publish dropped boxes: viewer tiles (when the viewer is live)
+    + always-on event log.
+
+    ``items``: list of (crop, reason_code, detail_str). reason_code is
+    the single-letter tile label; detail goes to the log file."""
+    if not items:
+        return
+    try:
+        for _crop, _code, _detail in items:
+            _filter_event_log(
+                f"DROP field={field} filter={filter_name} "
+                f"reason={_code} {_detail}"
+            )
+        from . import debug_overlay as _dbg_rd
+        if not _dbg_rd.diagnostics_active():
+            return
+        _acc = _filter_drops_acc.setdefault(field, [])
+        _acc.extend(items)
+        _dump_glyphs(
+            field, "dropped",
+            [_c for _c, _, _ in _acc],
+            [(_code, 0.0) for _, _code, _ in _acc],
+        )
+    except Exception as _exc:
+        log.debug("sc_ocr.hud: _record_filter_drops swallowed: %s", _exc)
+
+
 def _dump_glyphs(
     field: str,
     source: str,
@@ -6523,6 +6701,584 @@ def _clear_viewer_entry(field: str, source: str) -> None:
             os.replace(tmp, _GLYPH_DUMP_INDEX)
     except Exception as exc:
         log.debug("api: _clear_viewer_entry swallowed: %s", exc)
+
+
+def _filter_runtime_junk_boxes(crops, boxes, field: str = ""):
+    """Segmenter runtime ladder, steps 1+2 (user-approved 2026-06-10).
+
+    VETO (disable: SC_NO_BOX_VETO) — drop boxes whose crop is a
+    near-duplicate of a Glyph-Review-quarantined tile (ocr.glyph_gate):
+    the user's 2,629 hand-rejections become a runtime junk detector for
+    icon fragments / glow blobs / merged pairs that geometry can't
+    describe.
+
+    ENVELOPE (disable: SC_NO_BOX_ENVELOPE) — drop digit-sized boxes
+    violating the measured ink-geometry envelope from the 8,879-tile
+    geometry report: no SC digit's ink is wider than tall (max w/h
+    ~0.85; merged pairs run >= ~1.2), and a box under 0.55x the tallest
+    box is a stroke fragment. Both ratios are scale-free. Dot-sized
+    boxes (w < 0.55x median) are exempt.
+
+    Safety: never empties the set; if more than half the boxes would
+    drop, keeps the originals (that smells like a bad frame, and
+    honest downstream Nones beat mass-vetoed guesses).
+    """
+    try:
+        if field not in ("mass", "resistance", "instability"):
+            return crops, boxes
+        if not boxes or not crops or len(crops) != len(boxes):
+            return crops, boxes
+        # LADDER + LIVE VERDICT: ALL three runtime filters are opt-in.
+        # The ENVELOPE regressed the 130-panel harness (mass -1,
+        # instability -1 and +2 confident-wrong). The VETO was
+        # harness-neutral but REGRESSED LIVE (2026-06-10, caught by the
+        # filter_events log on its first night): it false-matched the
+        # narrow leading '1' of instability 1.43 against the quarantine
+        # every scan — the quarantine contains QUALITY-rejects of real
+        # digits, so a live narrow '1' legitimately near-dups a blurry
+        # rejected '1'; low-detail glyphs can't be safely near-dup
+        # vetoed. [.][4][3] then read '743'/'243' -> structural reject
+        # -> instability=None on a rock that read 1.43 without it.
+        # A future veto needs junk-only references (icons/fragments),
+        # not the full quarantine. Enable: SC_BOX_VETO=1 /
+        # SC_BOX_ENVELOPE=1.
+        _veto_on = bool(os.environ.get("SC_BOX_VETO"))
+        _env_on = bool(os.environ.get("SC_BOX_ENVELOPE"))
+        if not (_veto_on or _env_on):
+            return crops, boxes
+        _gate_fn = None
+        if _veto_on:
+            try:
+                from ..glyph_gate import (
+                    is_quarantine_lookalike as _gate_fn,
+                )
+            except Exception:
+                _gate_fn = None
+        _ws = sorted(int(_b[2]) for _b in boxes)
+        _med_w = _ws[len(_ws) // 2]
+        _max_h = max(int(_b[3]) for _b in boxes)
+        _keep: list[int] = []
+        _drops: list = []  # (idx, reason, box)
+        for _i, (_bx, _c) in enumerate(zip(boxes, crops)):
+            _w, _h = int(_bx[2]), int(_bx[3])
+            _is_dot = _med_w > 0 and _w < 0.55 * _med_w
+            if not _is_dot and _env_on:
+                if _h > 0 and _w / float(_h) > 1.2:
+                    _drops.append((_i, "env-wide", tuple(_bx)))
+                    continue
+                if _max_h > 0 and _h < 0.55 * _max_h:
+                    _drops.append((_i, "env-frag", tuple(_bx)))
+                    continue
+            if not _is_dot and _veto_on and _gate_fn is not None:
+                try:
+                    _a = np.asarray(_c, dtype=np.float32)
+                    if _a.ndim == 2 and _a.size:
+                        if float(_a.max()) <= 1.5:
+                            _a = _a * 255.0
+                        if _gate_fn(_a.astype(np.uint8), near=True):
+                            _drops.append((_i, "veto", tuple(_bx)))
+                            continue
+                except Exception:
+                    pass
+            _keep.append(_i)
+        if not _drops:
+            return crops, boxes
+        if not _keep or len(_drops) > len(boxes) // 2:
+            log.info(
+                "sc_ocr.hud: runtime box filters would drop %d/%d "
+                "(field=%s) — suspicious, keeping originals: %s",
+                len(_drops), len(boxes), field, _drops,
+            )
+            _filter_event_log(
+                f"SUSPICIOUS-KEEP field={field} filter=veto/envelope "
+                f"would_drop={len(_drops)}/{len(boxes)} "
+                f"{[(r, b) for _, r, b in _drops]}"
+            )
+            return crops, boxes
+        log.info(
+            "sc_ocr.hud: runtime box filters dropped %d/%d (field=%s): %s",
+            len(_drops), len(boxes), field,
+            [(r, b) for _, r, b in _drops],
+        )
+        _record_filter_drops(field, "veto/envelope", [
+            (crops[_i], "V" if _r == "veto" else "E",
+             f"box={_b} rule={_r}")
+            for _i, _r, _b in _drops
+        ])
+        return [crops[_i] for _i in _keep], [boxes[_i] for _i in _keep]
+    except Exception as _exc:
+        log.debug("sc_ocr.hud: runtime box filters failed: %s", _exc)
+        return crops, boxes
+
+
+def _recenter_crops_to_centroid(crops, field: str = ""):
+    """Segmenter runtime ladder, step 3 (disable: SC_NO_RECENTER).
+
+    LADDER VERDICT (130-panel harness, 2026-06-10): REGRESSED HARD
+    (mass 52->49, resistance 27->24) — the production CNNs are trained
+    on tiles from the SAME extraction pipeline that serves them, so
+    they already learned the pipeline's placement; recentering at
+    serving time moves crops OUT of the learned distribution. The skew
+    the geometry report measured was pipeline-tiles vs the synthetic
+    sets, not train-vs-serve. Opt-IN only (SC_RECENTER=1); if ever
+    revisited, recenter the TRAINING tiles and the serving crops
+    symmetrically, then retrain.
+    """
+    if not os.environ.get("SC_RECENTER") or not crops:
+        return crops
+    _out = []
+    for _c in crops:
+        try:
+            _a = np.asarray(_c, dtype=np.float32)
+            if _a.ndim != 2 or not _a.size:
+                _out.append(_c)
+                continue
+            _h, _w = _a.shape
+            _r = 2
+            _ring = np.concatenate([
+                _a[:_r].ravel(), _a[-_r:].ravel(),
+                _a[:, :_r].ravel(), _a[:, -_r:].ravel(),
+            ])
+            _bg = float(np.median(_ring))
+            _diff = np.abs(_a - _bg)
+            _scale = 1.0 if float(_a.max()) <= 1.5 else 255.0
+            _thr = max(0.12 * _scale, 0.30 * float(_diff.max()))
+            _mask = _diff > _thr
+            if not _mask.any():
+                _out.append(_c)
+                continue
+            _ys, _xs = np.nonzero(_mask)
+            _dy = int(round((_h - 1) / 2.0 - float(_ys.mean())))
+            _dx = int(round((_w - 1) / 2.0 - float(_xs.mean())))
+            _dy = max(-4, min(4, _dy))
+            _dx = max(-4, min(4, _dx))
+            if _dx == 0 and _dy == 0:
+                _out.append(_c)
+                continue
+            _filter_event_log(
+                f"RECENTER field={field} tile={len(_out)} "
+                f"dx={_dx:+d} dy={_dy:+d}"
+            )
+            _sh = np.full_like(_a, _bg)
+            _sh[max(0, _dy):_h + min(0, _dy),
+                max(0, _dx):_w + min(0, _dx)] = (
+                _a[max(0, -_dy):_h + min(0, -_dy),
+                   max(0, -_dx):_w + min(0, -_dx)]
+            )
+            _out.append(_sh)
+        except Exception:
+            _out.append(_c)
+    return _out
+
+
+def _filter_pitch_ghost_boxes(
+    crops: list,
+    boxes: list,
+    field: str = "",
+) -> "tuple[list, list]":
+    """Drop pitch-breaking ghost boxes (instability only).
+
+    Live 2026-06-09 (true 14.21, 7 boxes): chromatic aberration can emit
+    ghost copies with WHITE cores that every CNN reads as a confident
+    real digit (the duplicated '2' @ 1.00) — no classifier or chroma
+    signal separates them. Geometry does: panel digits are fixed-pitch,
+    and an inserted ghost splits one pitch interval into two sub-pitch
+    gaps. Iteratively remove the interior box whose removal most reduces
+    the spread of center-to-center deltas, while removal produces a
+    DRAMATIC improvement (spread > 0.25x pitch before, < 0.60x of the
+    prior spread after). A uniform row (all real digits, e.g. 103.10's
+    six boxes) offers no such improvement, so nothing is removed.
+    Never drops below 4 boxes (D.DD) and never touches the dot-sized
+    box (the decimal breaks pitch legitimately — it is half-width and
+    sits low; its slot still holds a center, so deltas use centers).
+    """
+    try:
+        # GATE AT 7+ BOXES: the widest legitimate instability form is
+        # DDD.DD = 6 boxes, so a 7-box segmentation PROVABLY contains
+        # phantoms, and a legit row can never be touched. (A first cut
+        # gated at 5 regressed the harness: a narrow leading '1' in
+        # '126.02' sits off the center-grid — its ink-center shifts
+        # within the monospace cell — and got culled as a ghost.)
+        if field != "instability" or not boxes or len(boxes) < 7:
+            return crops, boxes
+        if not crops or len(crops) != len(boxes):
+            return crops, boxes
+        _ws = sorted(int(_b[2]) for _b in boxes)
+        _med_w = _ws[len(_ws) // 2]
+        _c = [float(_b[0]) + float(_b[2]) / 2.0 for _b in boxes]
+        _n = len(_c)
+        _d = [_c[_i + 1] - _c[_i] for _i in range(_n - 1)]
+        # GRID FIT (not greedy removal): with two ghosts, removing either
+        # one alone doesn't reduce delta-spread (the other still breaks
+        # pitch), so a greedy loop never starts. Instead, try candidate
+        # pitches (each delta and each adjacent-pair sum — a ghost splits
+        # one pitch into two sub-deltas that SUM to the pitch), anchor
+        # the grid at each box, and keep the (pitch, anchor) fitting the
+        # most boxes. Real digits land on the grid; ghosts don't.
+        _cands = sorted({round(_x, 1) for _x in _d}
+                        | {round(_d[_i] + _d[_i + 1], 1)
+                           for _i in range(len(_d) - 1)})
+        # The pitch floor must come from the WIDEST box: a monospace
+        # cell is never narrower than its widest glyph. A median-width
+        # floor broke when narrow '1's dragged the median down — that
+        # admitted half-pitch grids, and a dense-enough grid trivially
+        # fits EVERY box, masking the ghosts ("all on grid" bail).
+        _max_w = max(int(_b[2]) for _b in boxes)
+        _min_p = max(4.0, 0.9 * _max_w)
+        _best = (0, None, None)  # (fit_count, on_grid_mask, pitch)
+        for _p in _cands:
+            if _p < _min_p:
+                continue  # sub-cell pitch is structural nonsense
+            for _a in range(_n):
+                _mask = []
+                for _bi, _x in enumerate(_c):
+                    _k = round((_x - _c[_a]) / _p)
+                    # narrow glyphs ('1') hug their ink: the box center
+                    # may shift within the monospace cell by up to half
+                    # the width deficit — widen their tolerance.
+                    _tol = 0.25 * _p + max(
+                        0.0, (_med_w - float(boxes[_bi][2])) / 2.0
+                    )
+                    _mask.append(abs(_x - (_c[_a] + _k * _p)) <= _tol)
+                _fit = sum(_mask)
+                if _fit > _best[0]:
+                    _best = (_fit, _mask, _p)
+        _fit, _mask, _p = _best
+        # Only act on a decisive verdict: nearly all boxes on one grid,
+        # at most 2 stragglers, and never drop the dot-sized box.
+        if _mask is None or _fit == _n or (_n - _fit) > 2 or _fit < 4:
+            return crops, boxes
+        _idx = [
+            _i for _i in range(_n)
+            if _mask[_i]
+            or (_med_w > 0 and int(boxes[_i][2]) < 0.55 * _med_w)
+        ]
+        _removed = [_i for _i in range(_n) if _i not in set(_idx)]
+        if not _removed or len(_idx) < 4:
+            return crops, boxes
+        log.info(
+            "sc_ocr.hud: pitch-ghost filter dropped %d/%d instability "
+            "boxes %s (pitch outliers)",
+            len(_removed), len(boxes),
+            [boxes[_i] for _i in sorted(_removed)],
+        )
+        _record_filter_drops(field, "pitch-ghost", [
+            (crops[_i], "P",
+             f"box={tuple(boxes[_i])} off-grid pitch={_p:.1f}")
+            for _i in sorted(_removed)
+        ])
+        return (
+            [crops[_i] for _i in _idx],
+            [boxes[_i] for _i in _idx],
+        )
+    except Exception as _exc:
+        log.debug("sc_ocr.hud: pitch-ghost filter failed: %s", _exc)
+        return crops, boxes
+
+
+def _filter_chromatic_ghost_boxes(
+    value_crop,
+    crops: list,
+    boxes: list,
+    field: str = "",
+) -> "tuple[list, list]":
+    """Drop chromatic-aberration ghost boxes (instability only).
+
+    Heavy RGB fringing on the SCAN RESULTS panel splits each white glyph
+    into offset single-channel ghost copies; the segmenter then emits
+    PHANTOM boxes between/after real digits (live 2026-06-09: '14.21'
+    segmented into 7 boxes — a junk tile after the '4' plus a duplicated
+    '2' — voters read '1464221'/'141221'). Real glyphs have an ACHROMATIC
+    bright core (all channels high together); ghosts are single-channel
+    fringes with no white core. Score each box by its achromatic-core
+    fraction and drop boxes far below the median box. Scoring is
+    RELATIVE, so all-red renders (the red '0.99') score uniformly low
+    and nothing is dropped.
+    """
+    try:
+        if field != "instability" or not boxes or len(boxes) < 3:
+            return crops, boxes
+        if not crops or len(crops) != len(boxes):
+            return crops, boxes
+        _rgb = np.asarray(value_crop.convert("RGB"), dtype=np.float32)
+        _H, _W = _rgb.shape[0], _rgb.shape[1]
+        _scores: list[float] = []
+        for (_x, _y, _w, _h) in boxes:
+            if _w < 1 or _h < 1 or _x + _w > _W or _y + _h > _H:
+                return crops, boxes  # geometry mismatch — don't touch
+            _t = _rgb[_y:_y + _h, _x:_x + _w]
+            _mn = _t.min(axis=2)
+            _mx = _t.max(axis=2)
+            _core = float(((_mn > 0.55 * _mx) & (_mx > 120.0)).mean())
+            _scores.append(_core)
+        # The decimal DOT is a few bright pixels in a mostly-background
+        # box, so its core FRACTION is naturally near zero — it must
+        # never be a ghost candidate, or the consensus string loses its
+        # dot and degenerates to the CRNN's own dotless read (which
+        # would silently disable the '0.99' vs '099' override). Use the
+        # pipeline's canonical dot test (w < 0.55x median width) and
+        # judge only digit-sized boxes, against a digit-only median.
+        _ws_f = sorted(int(_b[2]) for _b in boxes)
+        _med_w = _ws_f[len(_ws_f) // 2]
+        _is_dot = [
+            _med_w > 0 and int(_b[2]) < 0.55 * _med_w for _b in boxes
+        ]
+        _digit_scores = sorted(
+            _s for _s, _d in zip(_scores, _is_dot) if not _d
+        )
+        if not _digit_scores:
+            return crops, boxes
+        _med = _digit_scores[len(_digit_scores) // 2]
+        if _med <= 0.03:
+            return crops, boxes  # uniformly chromatic render — no-op
+        _keep = [
+            _i for _i, _s in enumerate(_scores)
+            if _is_dot[_i] or _s >= 0.25 * _med
+        ]
+        if len(_keep) == len(boxes) or len(_keep) < 3:
+            return crops, boxes
+        _kept_set = set(_keep)
+        _dropped = [
+            (boxes[_i], round(_scores[_i], 3))
+            for _i in range(len(boxes)) if _i not in _kept_set
+        ]
+        log.info(
+            "sc_ocr.hud: chroma-ghost filter dropped %d/%d instability "
+            "boxes %s (median core=%.3f)",
+            len(boxes) - len(_keep), len(boxes), _dropped, _med,
+        )
+        _record_filter_drops(field, "chroma-ghost", [
+            (crops[_i], "C",
+             f"box={tuple(boxes[_i])} core={_scores[_i]:.3f} med={_med:.3f}")
+            for _i in range(len(boxes)) if _i not in _kept_set
+        ])
+        return (
+            [crops[_i] for _i in _keep],
+            [boxes[_i] for _i in _keep],
+        )
+    except Exception as _exc:
+        log.debug("sc_ocr.hud: chroma-ghost filter failed: %s", _exc)
+        return crops, boxes
+
+
+def _perglyph_consensus_digits(field: str, value_crop) -> "Optional[str]":
+    """Return the per-glyph CONSENSUS digit string, or None.
+
+    For mass/resistance: segment + classify the crop with the gray
+    PRIMARY CNN and the inverted-polarity SECONDARY CNN. If the two
+    decorrelated voters INDEPENDENTLY agree on the same digit string at
+    high confidence, return it. Callers use this to override a confident-
+    but-wrong CRNN gate read — the CRNN confuses look-alike digits
+    (6/8, 3/8) while both per-glyph voters read it right (user
+    2026-06-01: CRNN "3738" vs per-glyph "3736", both voters @ 1.00).
+
+    Now also covers instability (X.XX): the per-glyph tiles read the
+    decimal point as its own '.' tile, so the consensus string preserves
+    it. Callers override the CRNN on ANY disagreement — a length mismatch
+    (the CRNN dropping a digit/decimal, e.g. 3384->994 or 1.43->143) is
+    even stronger evidence the CRNN is wrong than a same-length swap, so
+    the old same-length guard was dropped (it blocked exactly those).
+    """
+    if field not in ("mass", "resistance", "instability"):
+        return None
+    try:
+        _g = _canonicalize_polarity(
+            np.asarray(value_crop.convert("L"), dtype=np.uint8)
+        )
+        _b = _adaptive_binarize(_g)
+        _crops, _boxes = _segment_glyphs(_g, _b, field=field)
+        # NOTE: no _filter_drops_begin here — the consensus helper runs
+        # INSIDE a scan whose cascade/shadow chain owns the viewer row;
+        # resetting would wipe their published drops mid-frame. Drops
+        # found here still merge into the same row + event log.
+        _crops, _boxes = _filter_chromatic_ghost_boxes(
+            value_crop, _crops, _boxes, field=field,
+        )
+        _crops, _boxes = _filter_pitch_ghost_boxes(
+            _crops, _boxes, field=field,
+        )
+        _crops, _boxes = _filter_runtime_junk_boxes(
+            _crops, _boxes, field=field,
+        )
+        _crops = _recenter_crops_to_centroid(_crops, field=field)
+        if not _crops:
+            return None
+        _pri = _classify_crops(_crops)
+        _sec = _classify_crops_inv(
+            [np.clip(1.0 - c, 0.0, 1.0).astype(np.float32) for c in _crops]
+        )
+        # GEOMETRY DOT OVERRIDE (live 2026-06-10): the cascade replaces
+        # the dot-sized box's CNN read via box_size_dot, but this helper
+        # classified raw — the instability dot tile read '7' (primary)
+        # vs '2' (secondary), breaking exact agreement on a tile whose
+        # identity GEOMETRY already proves, so the CRNN's '13' survived
+        # into a structural reject (instability=None on a clean 1.43).
+        # Apply the cascade's own rule: w < 0.55x median width -> '.'.
+        _dot_med = 0
+        if _boxes and len(_boxes) == len(_crops):
+            _bws = sorted(int(_b[2]) for _b in _boxes)
+            _dot_med = _bws[len(_bws) // 2]
+            for _di, _bx in enumerate(_boxes):
+                if _dot_med > 0 and int(_bx[2]) < 0.55 * _dot_med:
+                    if _di < len(_pri):
+                        _pri[_di] = (".", 1.0)
+                    if _di < len(_sec):
+                        _sec[_di] = (".", 1.0)
+
+        def _dc(_res):
+            if not _res:
+                return "", 0.0
+            # keep digits AND the decimal point (instability X.XX); the
+            # trailing '%' on resistance is neither, so it drops out
+            return ("".join(c for c, _ in _res if c.isdigit() or c == "."),
+                    sum(cf for _, cf in _res) / len(_res))
+
+        _pd, _pm = _dc(_pri)
+        _sd, _sm = _dc(_sec)
+        # EXACT string agreement between the two polarity-decorrelated
+        # voters is the load-bearing signal; the confidence bars only
+        # screen out mutual garbage. The secondary (inverted) model runs
+        # systematically less confident on blurry live frames even when
+        # right (user 2026-06-09: resistance 1@0.86, instability mean
+        # 0.945, both correct and agreeing while the CRNN winner was
+        # wrong) — a symmetric 0.97 bar silently disabled the override
+        # on exactly those frames, so the secondary bar is lower.
+        if _pd and _pd == _sd and _pm >= 0.95 and _sm >= 0.85:
+            return _pd
+        # The inverted SECONDARY sometimes fumbles a single glyph at low
+        # confidence on live frames (0->4@0.52, 4->6@0.46 — user
+        # 2026-06-09) which kills the exact-agreement above even though
+        # the RGB per-glyph CNN agrees with the PRIMARY at 1.00. The RGB
+        # model is an equally decorrelated partner (different weights,
+        # different input space), so accept PRIMARY+RGB agreement as the
+        # consensus pair too. Crop recipe mirrors the viewer's hud_rgb
+        # row (_shadow_perglyph_dump), which is the combination the
+        # screenshots validated.
+        if _pd and _pm >= 0.95 and _boxes:
+            _rgb = np.asarray(value_crop.convert("RGB"), dtype=np.uint8)
+            _Hc, _Wc = _rgb.shape[0], _rgb.shape[1]
+            _rgb_crops: list = []
+            for (_bx, _by, _bw, _bh) in _boxes:
+                if _bw < 1 or _bh < 1 or _bx + _bw > _Wc or _by + _bh > _Hc:
+                    _rgb_crops = []
+                    break
+                _gl = _rgb[_by:_by + _bh, _bx:_bx + _bw].astype(np.float32)
+                _padc = np.full(
+                    (_bh + 4, _bw + 4, 3), 255.0, dtype=np.float32
+                )
+                _padc[2:-2, 2:-2] = _gl
+                _rgb_crops.append(
+                    _aspect_pad_resize_28(_padc.astype(np.uint8), bg=255)
+                )
+            if _rgb_crops:
+                _rres = _classify_crops_signal_rgb(_rgb_crops)
+                # same geometry dot override as the gray voters
+                for _di, _bx in enumerate(_boxes):
+                    if (_dot_med > 0
+                            and int(_bx[2]) < 0.55 * _dot_med
+                            and _di < len(_rres)):
+                        _rres[_di] = (".", 1.0)
+                _rd, _rm = _dc(_rres)
+                if _pd == _rd and _rm >= 0.85:
+                    return _pd
+    except Exception as _exc:
+        log.debug("sc_ocr.hud: per-glyph consensus failed: %s", _exc)
+    return None
+
+
+def _shadow_perglyph_dump(field: str, value_crop) -> None:
+    """Refresh the glyph viewer's per-glyph tiles when a CRNN gate
+    short-circuited the real per-glyph path.
+
+    The HUD-RGB / legacy CRNN gates skip the per-glyph CNN cascade for
+    speed, so its dump entries (``primary`` / ``secondary`` / ``hud_rgb``)
+    never refresh and the live ``glyph_reader_viewer`` freezes on stale
+    crops — the "glyph reader not updating for the mining HUD" symptom.
+
+    Rather than just clearing those tiles (which makes the rows vanish),
+    we run a fresh per-glyph SEGMENTATION + CLASSIFICATION of the SAME
+    value crop the CRNN just won on and publish it as the ``primary``
+    voter. The user sees the per-glyph CNN's read of the current frame
+    side-by-side with the CRNN winner (e.g. CRNN ``4343`` vs per-glyph
+    ``3384``), which is exactly the cross-check they want.
+
+    This is DISPLAY-ONLY — it never changes the OCR result, and no-ops
+    entirely unless a glyph viewer is active (heartbeat fresh).
+    """
+    try:
+        from . import debug_overlay as _dbg_sg
+        if not _dbg_sg.diagnostics_active():
+            return
+        _sg_rgb = np.asarray(value_crop.convert("RGB"), dtype=np.uint8)
+        _sg_gray = _canonicalize_polarity(
+            np.array(value_crop.convert("L"), dtype=np.uint8)
+        )
+        _sg_bin = _adaptive_binarize(_sg_gray)
+        _sg_crops, _sg_boxes = _segment_glyphs(_sg_gray, _sg_bin, field=field)
+        # Keep the viewer honest: apply the same ghost filters the
+        # functional paths use, so the tiles shown match what the
+        # pipeline actually classifies.
+        _filter_drops_begin(field)
+        _sg_crops, _sg_boxes = _filter_chromatic_ghost_boxes(
+            value_crop, _sg_crops, _sg_boxes, field=field,
+        )
+        _sg_crops, _sg_boxes = _filter_pitch_ghost_boxes(
+            _sg_crops, _sg_boxes, field=field,
+        )
+        _sg_crops, _sg_boxes = _filter_runtime_junk_boxes(
+            _sg_crops, _sg_boxes, field=field,
+        )
+        _sg_crops = _recenter_crops_to_centroid(_sg_crops, field=field)
+        if not _sg_crops:
+            for _s in ("primary", "secondary", "hud_rgb", "vote"):
+                _clear_viewer_entry(field, _s)
+            return
+        # primary — grayscale per-glyph CNN
+        _sg_pri = _classify_crops(_sg_crops)
+        _dump_glyphs(field, "primary", _sg_crops, _sg_pri)
+        # secondary — inverted-polarity grayscale CNN. Must feed the
+        # INVERTED crops exactly as the real cascade does (api.py ~9927:
+        # `_classify_crops_inv([1.0 - c for c in primary_crops])`).
+        # Feeding the non-inverted crops makes the inv-model read digits
+        # as '%' — the "secondary corrupt?" symptom (user 2026-06-01).
+        try:
+            _sg_sec = _classify_crops_inv(
+                [np.clip(1.0 - c, 0.0, 1.0).astype(np.float32)
+                 for c in _sg_crops]
+            )
+        except Exception:
+            _sg_sec = []
+        if _sg_sec and len(_sg_sec) == len(_sg_crops):
+            _dump_glyphs(field, "secondary", _sg_crops, _sg_sec)
+        else:
+            _clear_viewer_entry(field, "secondary")
+        # hud_rgb — RGB per-glyph CNN on colour tiles built from the boxes
+        _sg_rgb_crops: list = []
+        try:
+            _Hr, _Wr = _sg_rgb.shape[0], _sg_rgb.shape[1]
+            for (_bx, _by, _bw, _bh) in _sg_boxes:
+                if _bw < 1 or _bh < 1 or _bx + _bw > _Wr or _by + _bh > _Hr:
+                    _sg_rgb_crops = []
+                    break
+                _gl = _sg_rgb[_by:_by + _bh, _bx:_bx + _bw].astype(np.float32)
+                _pd = np.full((_bh + 4, _bw + 4, 3), 255.0, dtype=np.float32)
+                _pd[2:-2, 2:-2] = _gl
+                _sg_rgb_crops.append(
+                    _aspect_pad_resize_28(_pd.astype(np.uint8), bg=255)
+                )
+            _sg_rgbres = (
+                _classify_crops_signal_rgb(_sg_rgb_crops)
+                if _sg_rgb_crops else []
+            )
+        except Exception:
+            _sg_rgb_crops, _sg_rgbres = [], []
+        if _sg_rgbres and len(_sg_rgbres) == len(_sg_rgb_crops):
+            _dump_glyphs(field, "hud_rgb", _sg_rgb_crops, _sg_rgbres)
+        else:
+            _clear_viewer_entry(field, "hud_rgb")
+        _clear_viewer_entry(field, "vote")
+    except Exception as _sg_exc:
+        log.debug("sc_ocr.hud: shadow per-glyph dump failed: %s", _sg_exc)
 
 
 # ── Signal RGB CRNN (gate 0 in the signal recognition hierarchy) ──
@@ -8632,6 +9388,42 @@ def _ocr_value_crop(value_crop: Image.Image, field: str = "") -> tuple[str, list
                 )
                 _hudr_pass = False
 
+            # ── Per-glyph CONSENSUS cross-check vs the CRNN ──
+            # The CRNN gate is the authoritative primary, but it has two
+            # failure modes the per-glyph CNNs catch: a relaxed-gate guess
+            # (mass "4343" @ 0.39, lexicon-accepted, vs per-glyph "3384" @
+            # 1.00) and a STRICT-but-wrong read (resistance "1%" decoded as
+            # "0" @ 0.98 while every per-glyph voter says "1" — user
+            # 2026-06-01). A single per-glyph voter can be noisy, so we
+            # require the gray PRIMARY and the inverted-polarity SECONDARY
+            # CNNs to INDEPENDENTLY agree on the same same-length value at
+            # high confidence before overriding. Two decorrelated voters
+            # agreeing is a stronger signal than the CRNN's lone read, and
+            # requiring the agreement is what keeps this from regressing the
+            # harness (a primary-only deferral on strict reads did regress
+            # it; the consensus form holds the 290/377 baseline).
+            #
+            # Scoped to mass/resistance: instability is X.XX, and its
+            # per-glyph reads currently fuse the leading "1." into a "%"
+            # tile, so its consensus is unreliable — leave instability to
+            # the CRNN + count-oracle cascade.
+            if _hudr_pass and field in ("mass", "resistance", "instability"):
+                _hudr_digits = "".join(
+                    c for c in _hudr_text if c.isdigit() or c == "."
+                )
+                _cons = _perglyph_consensus_digits(field, value_crop)
+                if (
+                    _cons
+                    and _cons != _hudr_digits
+                ):
+                    log.info(
+                        "sc_ocr.hud: field=%s CRNN read=%r mean=%.2f "
+                        "OVERRIDDEN — per-glyph primary+secondary agree on "
+                        "%r — deferring to per-glyph CNN",
+                        field, _hudr_text, _hudr_mean, _cons,
+                    )
+                    _hudr_pass = False
+
             # NOTE: a low-content gate (reject CRNN="0" reads when
             # the crop has contrast<30 AND edge_frac<0.04) was
             # attempted here to catch the "0/0/0 flicker on partially-
@@ -8990,6 +9782,14 @@ def _ocr_value_crop(value_crop: Image.Image, field: str = "") -> tuple[str, list
                         _cm_exc, _hudr_pass,
                     )
 
+            if _hudr_pass and _bypass_revoked(field):
+                log.info(
+                    "sc_ocr.hud: HUD-RGB CRNN gate SKIPPED field=%s — "
+                    "consistency reflex active (recent reads flapped "
+                    "on stable pixels); falling through to full vote",
+                    field,
+                )
+                _hudr_pass = False
             if _hudr_pass:
                 if _hudr_mean >= 0.85:
                     _hudr_gate = "rgb-crnn-strict"
@@ -9012,6 +9812,12 @@ def _ocr_value_crop(value_crop: Image.Image, field: str = "") -> tuple[str, list
                     _clear_viewer_entry(field, "cnn")
                     _clear_viewer_entry(field, "tesseract")
                     _clear_viewer_entry(field, "crnn")
+                    # The per-glyph CNN cascade is skipped on this CRNN-
+                    # accept fast path, so its viewer tiles would freeze
+                    # stale ("glyph reader not updating for the mining
+                    # HUD"). Refresh them with a fresh per-glyph shadow
+                    # read of THIS frame's value crop (display-only).
+                    _shadow_perglyph_dump(field, value_crop)
                 except Exception as _hudr_dump_exc:
                     log.debug(
                         "sc_ocr.hud: HUD-RGB gate viewer dump failed: %s",
@@ -9069,9 +9875,32 @@ def _ocr_value_crop(value_crop: Image.Image, field: str = "") -> tuple[str, list
                 sum(_hud_crnn_pre_confs) / len(_hud_crnn_pre_confs)
                 if _hud_crnn_pre_confs else 0.0
             )
+            # Per-glyph CONSENSUS cross-check (same as the HUD-RGB gate).
+            # This legacy gate also short-circuits the cascade, so it
+            # needs the same guard: if the gray PRIMARY and inverted
+            # SECONDARY CNNs independently agree on a different same-length
+            # digit string at high confidence, the CRNN lost a look-alike
+            # digit (user 2026-06-01: CRNN "3738" @ 0.97 while every
+            # per-glyph voter reads "3736" @ 1.00) — defer to per-glyph.
+            _legacy_digits = "".join(
+                c for c in _hud_crnn_pre_text if c.isdigit() or c == "."
+            )
+            _legacy_cons = _perglyph_consensus_digits(field, value_crop)
+            _legacy_override = bool(
+                _legacy_cons
+                and _legacy_cons != _legacy_digits
+            )
+            if _legacy_override:
+                log.info(
+                    "sc_ocr.hud: LEGACY CRNN gate field=%s read=%r mean=%.2f "
+                    "OVERRIDDEN — per-glyph primary+secondary agree on %r — "
+                    "deferring to per-glyph CNN", field, _hud_crnn_pre_text,
+                    _hud_crnn_pre_mean, _legacy_cons,
+                )
             if (
                 len(_hud_crnn_pre_text) >= 2
                 and _hud_crnn_pre_mean >= 0.95
+                and not _legacy_override
             ):
                 log.info(
                     "sc_ocr.hud: LEGACY CRNN gate accepted field=%s "
@@ -9086,6 +9915,10 @@ def _ocr_value_crop(value_crop: Image.Image, field: str = "") -> tuple[str, list
                     )
                     _clear_viewer_entry(field, "cnn")
                     _clear_viewer_entry(field, "tesseract")
+                    # Per-glyph skipped on this fast path too — refresh
+                    # its viewer tiles with a fresh shadow read (see the
+                    # HUD-RGB gate above).
+                    _shadow_perglyph_dump(field, value_crop)
                 except Exception as _hud_crnn_pre_dump_exc:
                     log.debug(
                         "sc_ocr.hud: legacy gate viewer dump failed: %s",
@@ -9429,6 +10262,30 @@ def _ocr_value_crop(value_crop: Image.Image, field: str = "") -> tuple[str, list
             _primary_crops, _primary_boxes = _segment_glyphs(
                 _gray_pri, _bin_pri, field=field,
             )
+            # Chromatic-ghost phantom boxes (instability only) — drop
+            # single-channel fringe boxes before the count logic sees
+            # them, so the CRNN's ghost-inflated count can't validate a
+            # phantom-inflated segmentation. NOTE: boxes are in the
+            # (possibly Lanczos-upscaled) _vc_for_cnn coordinate space,
+            # so the RGB must come from the SAME image — passing the
+            # native value_crop makes the geometry check bail silently.
+            _filter_drops_begin(field)
+            _primary_crops, _primary_boxes = _filter_chromatic_ghost_boxes(
+                _vc_for_cnn, _primary_crops, _primary_boxes, field=field,
+            )
+            # White-core ghosts (every CNN reads them as real digits) are
+            # only separable by GEOMETRY — fixed-pitch violation.
+            _primary_crops, _primary_boxes = _filter_pitch_ghost_boxes(
+                _primary_crops, _primary_boxes, field=field,
+            )
+            # Runtime ladder: quarantine veto + geometry envelope on the
+            # boxes, then centroid recentering on the surviving crops.
+            _primary_crops, _primary_boxes = _filter_runtime_junk_boxes(
+                _primary_crops, _primary_boxes, field=field,
+            )
+            _primary_crops = _recenter_crops_to_centroid(
+                _primary_crops, field=field,
+            )
             # Diagnostic: log how many glyphs the segmenter found.
             # Distinguishes "segmenter dropped digits" (pipeline issue)
             # from "classifier misread clean digits" (training issue).
@@ -9460,27 +10317,83 @@ def _ocr_value_crop(value_crop: Image.Image, field: str = "") -> tuple[str, list
             # "27265" correctly. On captures where the CRNN gate's
             # confidence falls below the accept bar, the per-glyph path
             # silently emits the truncated read.
+            # The CRNN count oracle counts DIGITS, but instability always
+            # renders exactly one decimal point that the segmenter emits as
+            # its OWN span. So for instability the expected SEGMENT count is
+            # digits + 1 whenever a dot-sized span is actually present.
+            # Without this, a correct 4-span "1.43" ([1][.][4][3]) is
+            # force-MERGED down to the 3-digit oracle count, collapsing the
+            # leading digit into the decimal ([1.][4][3]); that merged "1."
+            # blob misreads as "%", the % is stripped as a non-digit, and
+            # the value loses its leading digit (user 2026-06-02, on
+            # current-resolution 448x670 panels: "1.43"->"4.3",
+            # "0.99"->"9.9", "21.47"->"2.47"). Gated on a narrow span
+            # existing so we only add the dot slot when the segmenter
+            # genuinely separated it. Only the SEGMENT-count target moves;
+            # _hud_expected_count (the digit cascade target downstream) is
+            # untouched.
+            _seg_expected = _hud_expected_count
             if (
-                _hud_expected_count is not None
+                field == "instability"
+                and _hud_expected_count is not None
                 and _primary_boxes
-                and abs(len(_primary_boxes) - _hud_expected_count) <= 3
-                and len(_primary_boxes) != _hud_expected_count
+            ):
+                _seg_ws = sorted(int(_b[2]) for _b in _primary_boxes)
+                _seg_med = _seg_ws[len(_seg_ws) // 2] if _seg_ws else 0
+                _has_dot_span = any(
+                    _seg_med > 0 and _w < 0.55 * _seg_med for _w in _seg_ws
+                )
+                if _has_dot_span:
+                    _seg_expected = _hud_expected_count + 1
+            if (
+                _seg_expected is not None
+                and _primary_boxes
+                and abs(len(_primary_boxes) - _seg_expected) <= 3
+                and len(_primary_boxes) != _seg_expected
             ):
                 try:
                     from . import segment_helpers as _seg_helpers
                     _n_seg = len(_primary_boxes)
-                    if _n_seg < _hud_expected_count:
-                        _new_boxes = _seg_helpers.split_wide_spans_to_count(
-                            _primary_boxes,
-                            target_count=_hud_expected_count,
-                            binary=_bin_pri,
+                    if _n_seg < _seg_expected:
+                        # COUNT-ORACLE SANITY (live 2026-06-09): splitting
+                        # needs EVIDENCE of a fusion — a span markedly wider
+                        # than the median. The CRNN read a red-glow "0.99"
+                        # crop as '4099', the dot logic then expected 5
+                        # segments, and the splitter halved the perfectly
+                        # segmented '0' into two garbage tiles that every
+                        # voter misread ('44.99'/'46.99'/'40.99', winner
+                        # '4099'). If no span is >= 1.45x the median there
+                        # is nothing fused to split — the segmenter's count
+                        # is right and the CRNN count is poisoned, so keep
+                        # the segmenter's boxes.
+                        _split_ws = sorted(
+                            int(_b[2]) for _b in _primary_boxes
                         )
-                        if _new_boxes and len(_new_boxes) == _hud_expected_count:
+                        _sw_med = _split_ws[len(_split_ws) // 2]
+                        if _sw_med > 0 and _split_ws[-1] >= 1.45 * _sw_med:
+                            _new_boxes = (
+                                _seg_helpers.split_wide_spans_to_count(
+                                    _primary_boxes,
+                                    target_count=_seg_expected,
+                                    binary=_bin_pri,
+                                )
+                            )
+                        else:
+                            _new_boxes = None
+                            log.info(
+                                "sc_ocr.hud: PROPORTIONAL split SKIPPED "
+                                "(field=%s, %d boxes, expected=%d): widest "
+                                "span %.2fx median — no fusion evidence, "
+                                "trusting segmenter count over CRNN",
+                                field, _n_seg, _seg_expected,
+                                (_split_ws[-1] / _sw_med) if _sw_med else 0.0,
+                            )
+                        if _new_boxes and len(_new_boxes) == _seg_expected:
                             log.info(
                                 "sc_ocr.hud: PROPORTIONAL split %d -> %d "
-                                "boxes (field=%s, expected=%d from oracle)",
+                                "boxes (field=%s, expected=%d seg-count)",
                                 _n_seg, len(_new_boxes), field,
-                                _hud_expected_count,
+                                _seg_expected,
                             )
                             _new_crops = _seg_helpers.extract_crops_from_boxes(
                                 _gray_pri, _bin_pri, _new_boxes,
@@ -9495,17 +10408,17 @@ def _ocr_value_crop(value_crop: Image.Image, field: str = "") -> tuple[str, list
                                     "keeping original segmenter output",
                                     len(_new_boxes), len(_new_crops),
                                 )
-                    else:  # _n_seg > _hud_expected_count
+                    else:  # _n_seg > _seg_expected
                         _new_boxes = _seg_helpers.merge_narrow_spans_to_count(
                             _primary_boxes,
-                            target_count=_hud_expected_count,
+                            target_count=_seg_expected,
                         )
-                        if _new_boxes and len(_new_boxes) == _hud_expected_count:
+                        if _new_boxes and len(_new_boxes) == _seg_expected:
                             log.info(
                                 "sc_ocr.hud: PROPORTIONAL merge %d -> %d "
-                                "boxes (field=%s, expected=%d from oracle)",
+                                "boxes (field=%s, expected=%d seg-count)",
                                 _n_seg, len(_new_boxes), field,
-                                _hud_expected_count,
+                                _seg_expected,
                             )
                             _new_crops = _seg_helpers.extract_crops_from_boxes(
                                 _gray_pri, _bin_pri, _new_boxes,
@@ -11148,6 +12061,30 @@ def _signal_recognize_pil(img, region: Optional[dict] = None) -> Optional[int]:
                         "pill=(%d,%d,%dx%d); derived digit crop_box=%s",
                         _px, _py, _pw, _ph, crop_box,
                     )
+                    # Finding the PILL itself is structural proof the
+                    # signature panel is on screen — refresh the
+                    # scanning-timeout from it. _find_pill_for_signal
+                    # (hud_color_finder, strict cyan/green + aspect +
+                    # area filters) only fires on the distinctive
+                    # saturated pill shape and returns None when the
+                    # player looks away, so the timeout still trips
+                    # correctly when the panel is truly gone.
+                    #
+                    # Previously this path required the SEPARATE, much
+                    # flakier localize_icon voter (icon NCC + geometry
+                    # consensus) to ALSO confirm before crediting the
+                    # tick. In the field that voter rejects every
+                    # candidate on perfectly-present panels (user
+                    # 2026-06-02: pill locked rock-steady at ~(45,32,
+                    # 117x32) every frame and a value was read each
+                    # tick, yet "voter accepted 0 of N candidates" so
+                    # _icon_seen_this_tick never set → SCANNING TIMEOUT
+                    # climbed forever → panel stuck "scanning", no
+                    # result emitted). The pill is the reliable anchor;
+                    # the icon voter is not, so the pill alone refreshes
+                    # the timeout now. (The icon refinement above still
+                    # runs when it CAN, purely to sharpen the LHS crop.)
+                    _icon_seen_this_tick = True
 
     # ── SECONDARY: localize_icon (RGB-aware structural detector) ──
     # Used when the world-model path didn't fire (pill detection
@@ -11805,9 +12742,52 @@ def _signal_recognize_pil(img, region: Optional[dict] = None) -> Optional[int]:
                 _prop_result.get("gray_canon_used")
                 if _prop_result is not None else None
             )
+            # Acceptance bar for adopting the proportional segmenter's
+            # bboxes over the column-projection fallback. Default 0.5 on
+            # the segmenter's per-glyph CLASSIFICATION confidence.
+            #
+            # COMMA-GATED LOWERING: when the comma is confidently
+            # localized in this crop, the proportional segmenter's SLOT
+            # STRUCTURE (evenly pitched from the comma, D,DDD / DD,DDD)
+            # is trustworthy even when per-glyph classification confidence
+            # is low — which it is on blurry / chromatically-aberrated
+            # captures. In that regime the column-projection fallback
+            # MERGES adjacent digits (no clean gap in the low-contrast
+            # binary, e.g. "10,620" fused into a "10" box), producing
+            # structurally WORSE boxes than the comma-pitched slots. So
+            # when the comma anchor is solid we trust the structure and
+            # adopt the proportional boxes at a much lower bar. The boxes
+            # are re-classified downstream by the 4 voters, so this
+            # improves their inputs (and the live viewer's tiles).
+            # Corpus-validated: no regression on the 170-panel set.
+            _prop_accept_thr = 0.5
+            try:
+                _pat_env = os.environ.get("SC_PROP_THR")
+                if _pat_env:
+                    _prop_accept_thr = float(_pat_env)
+                else:
+                    from hud_tracker.anchors.comma_finder import (
+                        find_comma_voted as _fcv_gate,
+                    )
+                    _carr_gate = np.asarray(_prop_pil)
+                    if _carr_gate.ndim == 3:
+                        _cres_gate = _fcv_gate(
+                            np.ascontiguousarray(
+                                _carr_gate[..., :3]
+                            ).astype(np.uint8)
+                        )
+                        if (
+                            _cres_gate is not None
+                            and float(_cres_gate.get("confidence", 0.0))
+                            >= 0.9
+                        ):
+                            _prop_accept_thr = 0.25
+            except Exception:
+                _prop_accept_thr = 0.5
             if (
                 _prop_result is not None
-                and float(_prop_result.get("confidence", 0.0)) >= 0.5
+                and float(_prop_result.get("confidence", 0.0))
+                >= _prop_accept_thr
             ):
                 # Adopt proportional bboxes. Convert to the
                 # ``_segment_glyphs`` output shape (28×28 float32 [0,1]
@@ -11917,12 +12897,24 @@ def _signal_recognize_pil(img, region: Optional[dict] = None) -> Optional[int]:
                             _pad:_pad + _g_crop.shape[0],
                             _pad:_pad + _g_crop.shape[1],
                         ] = _g_crop
-                        _pil = Image.fromarray(
-                            _padded.astype(np.uint8),
-                        ).resize((28, 28), Image.BILINEAR)
-                        _hud_pri_crops.append(
-                            np.array(_pil, dtype=np.float32) / 255.0,
-                        )
+                        if not os.environ.get("SC_NO_ASPECT_REPAD"):
+                            # Aspect-preserving repad (fixes smushed thin
+                            # glyphs); polarity/bg-identical to the stretch.
+                            # Default ON; set SC_NO_ASPECT_REPAD=1 to use
+                            # the legacy stretch-to-square tail.
+                            _canvas = _aspect_pad_resize_28(
+                                _padded.astype(np.uint8), bg=255,
+                            )
+                            _hud_pri_crops.append(
+                                _canvas.astype(np.float32) / 255.0,
+                            )
+                        else:
+                            _pil = Image.fromarray(
+                                _padded.astype(np.uint8),
+                            ).resize((28, 28), Image.BILINEAR)
+                            _hud_pri_crops.append(
+                                np.array(_pil, dtype=np.float32) / 255.0,
+                            )
                         _hud_pri_boxes.append((int(bx), int(by), int(bw), int(bh)))
                     _proportional_used = True
                     log.info(
@@ -12333,12 +13325,33 @@ def _signal_recognize_pil(img, region: Optional[dict] = None) -> Optional[int]:
                         255.0, dtype=np.float32,
                     )
                     _padded[_pad:_pad + _bh, _pad:_pad + _bw] = _glyph_rgb
-                    _pil_rgb_glyph = _PILImage_rgb.fromarray(
-                        _padded.astype(np.uint8), mode="RGB",
-                    ).resize((28, 28), _PILImage_rgb.BILINEAR)
-                    _hud_rgb_crops.append(
-                        np.asarray(_pil_rgb_glyph, dtype=np.uint8),
-                    )
+                    if not os.environ.get("SC_NO_ASPECT_REPAD"):
+                        _hud_rgb_crops.append(
+                            _aspect_pad_resize_28(
+                                _padded.astype(np.uint8), bg=255,
+                            )
+                        )
+                    else:
+                        _pil_rgb_glyph = _PILImage_rgb.fromarray(
+                            _padded.astype(np.uint8), mode="RGB",
+                        ).resize((28, 28), _PILImage_rgb.BILINEAR)
+                        _hud_rgb_crops.append(
+                            np.asarray(_pil_rgb_glyph, dtype=np.uint8),
+                        )
+                if _hud_rgb_crops and os.environ.get("SC_DUMP_GLYPHS"):
+                    try:
+                        _gn = len(_hud_rgb_crops)
+                        _mont = np.full((28, _gn * 30 + 2, 3), 40, np.uint8)
+                        for _gi, _gc in enumerate(_hud_rgb_crops):
+                            _mont[0:28, _gi * 30:_gi * 30 + 28] = _gc.astype(
+                                np.uint8,
+                            )
+                        from PIL import Image as _DG
+                        _DG.fromarray(_mont, "RGB").resize(
+                            (_mont.shape[1] * 5, 28 * 5), _DG.NEAREST,
+                        ).save(os.environ["SC_DUMP_GLYPHS"])
+                    except Exception:
+                        pass
                 if _hud_rgb_crops:
                     _hud_rgb_results = _classify_crops_signal_rgb(_hud_rgb_crops)
                     if _hud_rgb_results:
@@ -14029,6 +15042,270 @@ def _signal_cnn_per_digit(
         return None
 
 
+# ── Paren anchor for the mineral-name row ────────────────────────────────
+#
+# The mineral name is the ONLY line in the scan panel whose text carries a
+# "(ORE)" / "(RAW)"-style parenthesized suffix (86 of the 129 annotated
+# panels; RAW ICE and bare names have none). A high-confidence NCC match
+# of BOTH parens, correctly ordered with a suffix-sized gap, is therefore
+# a near-unambiguous "this line is the name" signal — stronger than the
+# bottom-most-run heuristic when transient ink (particles, composition
+# rows inside a mis-anchored cap) adds junk lines.
+#
+# Calibrated 2026-06-11 on the annotated corpus: true name parens score
+# open 0.96-0.99 / close 0.87-0.93; the best impostor (the 'C' of RAW
+# ICE) tops out at 0.80; the difficulty meter's real "( EASY )" parens
+# score only ~0.59 (different glyph scale) AND sit ~25 template-widths
+# apart vs 4-5 for "(ORE)" — rejected by score and by gap. Washed-out
+# panels (0916xx cluster) render glyphs embossed (dark core/bright halo)
+# and cap at ~0.66 — undetectable without admitting RAW ICE impostors,
+# so those intentionally fall through to the legacy heuristic.
+_PAREN_TPL_CACHE: "Optional[dict]" = None
+
+
+def _paren_templates() -> "Optional[dict]":
+    """Load + cache zero-mean/unit-var paren templates (open/close).
+    Returns None when the npz is missing — every caller falls back to
+    the legacy bottom-most-run behavior."""
+    global _PAREN_TPL_CACHE
+    if _PAREN_TPL_CACHE is not None:
+        return _PAREN_TPL_CACHE or None
+    try:
+        _p = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "sc_templates", "paren.npz",
+        )
+        _d = np.load(_p)
+        _out = {}
+        for _cls in _d.files:
+            if _cls == "height":
+                continue
+            _t = _d[_cls].astype(np.float32)
+            _out[_cls] = (_t - _t.mean()) / (_t.std() + 1e-6)
+        _PAREN_TPL_CACHE = _out
+    except Exception as _exc:
+        log.debug("sc_ocr: paren templates unavailable: %s", _exc)
+        _PAREN_TPL_CACHE = {}
+    return _PAREN_TPL_CACHE or None
+
+
+def _match_paren_pair(
+    strip: "np.ndarray",
+    refs: dict,
+) -> "Optional[tuple[float, int, float, int]]":
+    """Test ONE text-line strip (2D uint8, max-of-RGB, any polarity) for
+    the name's parenthesized suffix. Two independent detectors, OR'd:
+
+    1. PAREN PAIR — confident ordered ``(`` + ``)``, thresholds
+       0.90/0.85 with gap in [1.2, 9] template-widths. Content-blind
+       but suffix-agnostic (catches an unseen "(GEM)" etc.). The
+       per-run strip + gap cap make a cross-row pairing (name ``(``
+       with the EASY meter's ``)``) impossible.
+    2. WHOLE SUFFIX — ``(ORE)`` / ``(RAW)`` matched as one unit,
+       threshold 0.80. Five glyphs of joint signal: verifies the
+       content BETWEEN the parens and survives scale drift the pair
+       can miss (0.845 at 1.83x live upscale), while the pair covers
+       polarity/letter-spacing cases the suffix fumbles (bright-sky
+       COPPER: suffix 0.46, pair 0.96/0.93).
+
+    Returns ``(score_open, x_open, score_close, x_close)`` in native
+    strip coordinates (suffix hits synthesize the pair span), or None.
+
+    Do not lower the thresholds: RAW ICE's 'C' reaches 0.80 against a
+    bare paren, and RAW ICE's own R-A-W letters reach 0.699 against
+    the "(RAW)" suffix — the margins above those ARE the design."""
+    try:
+        _h, _w = strip.shape
+        if _h < 8 or _h > 80 or _w < 60:
+            return None
+        _s8 = _canonicalize_polarity(strip)
+        _H = 28
+        _neww = max(20, int(round(_w * _H / float(_h))))
+        if _neww < 60:
+            return None
+        _s = np.asarray(
+            Image.fromarray(_s8).resize((_neww, _H), Image.BILINEAR),
+            dtype=np.float32,
+        )
+        _best: dict = {}
+        for _cls, _t in refs.items():
+            _th, _tw = _t.shape
+            if _neww < _tw + 2:
+                continue
+            _win = np.lib.stride_tricks.sliding_window_view(
+                _s, (_th, _tw)
+            )[0]
+            _wf = _win.reshape(_win.shape[0], -1)
+            _nf = (_wf - _wf.mean(axis=1, keepdims=True)) / (
+                _wf.std(axis=1, keepdims=True) + 1e-6
+            )
+            _sc = _nf @ (_t.reshape(-1) / float(_t.size))
+            _bi = int(np.argmax(_sc))
+            _best[_cls] = (float(_sc[_bi]), _bi, _tw)
+        _fx = _w / float(_neww)
+        # Detector 1: ordered pair with sane gap.
+        if "open" in _best and "close" in _best:
+            _so, _xo, _two = _best["open"]
+            _scl, _xc, _ = _best["close"]
+            if _so >= 0.90 and _scl >= 0.85:
+                _gap = _xc - _xo
+                if 1.2 * _two <= _gap <= 9.0 * _two:
+                    return (
+                        _so, int(round(_xo * _fx)),
+                        _scl, int(round(_xc * _fx)),
+                    )
+        # Detector 2: whole "(XXX)" suffix as one unit.
+        for _cls, (_ss, _xs, _tws) in _best.items():
+            if _cls.startswith("suffix_") and _ss >= 0.80:
+                return (
+                    _ss, int(round(_xs * _fx)),
+                    _ss, int(round((_xs + _tws) * _fx)),
+                )
+        return None
+    except Exception:
+        return None
+
+
+def _refine_mineral_band_above_mass(
+    img: Image.Image,
+    mass_y1: Optional[int],
+) -> "Optional[tuple[int, int, int]]":
+    """Locate the mineral-name line as the BOTTOM-MOST text line above
+    the MASS row top. Returns ``(y1, y2, x_left)`` or None.
+
+    Why (live 2026-06-09, COPPER rock, mineral '?'/garbage for 37s): the
+    color detector misses copper-toned names (palette gap) and sometimes
+    locks the COMPOSITION list's colored entries far below; the legacy
+    projection fallback drifts onto composition rows too; either way the
+    OCR crop ends up spanning the SCAN RESULTS title + name (2 lines) or
+    the wrong row entirely — single-line readers then emit 'CCIT'/'aee'.
+    Structurally the name is the ONLY text line between the title (and
+    its underline) and the MASS row, both of which are anchored every
+    scan — so the bottom-most ink line above MASS *is* the name,
+    regardless of color, panel scale, or which detector misfired.
+    """
+    try:
+        if mass_y1 is None or int(mass_y1) <= 12:
+            return None
+        _w, _h = img.size
+        _cap = min(int(mass_y1) - 4, _h)
+        if _cap <= 12 or _w <= 0:
+            return None
+        _strip = np.asarray(
+            img.crop((0, 0, _w, _cap)).convert("L"), dtype=np.uint8
+        )
+        _gs = _canonicalize_polarity(_strip)
+        _bs = _adaptive_binarize(_gs)
+        _ink = (_bs > 0).mean(axis=1)
+        # contiguous ink-row runs >= 5 px tall
+        _runs: list[tuple[int, int]] = []
+        _start: Optional[int] = None
+        for _yy in range(_cap):
+            _on = bool(_ink[_yy] > 0.02)
+            if _on and _start is None:
+                _start = _yy
+            elif not _on and _start is not None:
+                if _yy - _start >= 5:
+                    _runs.append((_start, _yy))
+                _start = None
+        if _start is not None and _cap - _start >= 5:
+            _runs.append((_start, _cap))
+        if not _runs:
+            return None
+        # ── PAREN ANCHOR ──
+        # Stage A: among the candidate runs (bottom→top), prefer the one
+        # carrying a confident "(...)" pair — the name's suffix. The
+        # plain bottom-most rule mis-picks when transient ink or (with a
+        # mis-anchored MASS cap) composition rows enter the strip.
+        # Stage B: no pair anywhere above the cap AND the cap looks like
+        # it may be wrong → extend the run search below the cap; the
+        # strict pair gate (score+order+gap) is what makes looking below
+        # MASS safe (values rows / "( EASY )" meter never pass it).
+        _pick: "Optional[tuple[int, int, tuple]]" = None
+        _refs = _paren_templates()
+        _mx_full: "Optional[np.ndarray]" = None
+        if _refs is not None:
+            try:
+                _mx_full = np.asarray(
+                    img.convert("RGB"), dtype=np.uint8
+                ).max(axis=2)
+                # ±3 row pad: the templates were cut from bands carrying
+                # the refine's own ±3 padding — tighter strips shrink the
+                # parens ~5% in canonical scale and shave ~0.08 off NCC.
+                for _ra, _rb in reversed(_runs[-6:]):
+                    _hit = _match_paren_pair(
+                        _mx_full[max(0, _ra - 3):min(_cap, _rb + 3)],
+                        _refs,
+                    )
+                    if _hit is not None:
+                        _pick = (_ra, _rb, _hit)
+                        break
+                if _pick is None and _cap < _h - 12:
+                    _gs2 = _canonicalize_polarity(
+                        np.asarray(img.convert("L"), dtype=np.uint8)[_cap:]
+                    )
+                    _bs2 = _adaptive_binarize(_gs2)
+                    _ink2 = (_bs2 > 0).mean(axis=1)
+                    _runs2: "list[tuple[int, int]]" = []
+                    _st2: Optional[int] = None
+                    for _y2 in range(_ink2.shape[0]):
+                        _on2 = bool(_ink2[_y2] > 0.02)
+                        if _on2 and _st2 is None:
+                            _st2 = _y2
+                        elif not _on2 and _st2 is not None:
+                            if _y2 - _st2 >= 5:
+                                _runs2.append((_st2 + _cap, _y2 + _cap))
+                            _st2 = None
+                    for _ra, _rb in _runs2[:6]:
+                        _hit = _match_paren_pair(
+                            _mx_full[max(0, _ra - 3):min(_h, _rb + 3)],
+                            _refs,
+                        )
+                        if _hit is not None:
+                            _pick = (_ra, _rb, _hit)
+                            break
+            except Exception as _pexc:
+                log.debug("sc_ocr: paren anchor swallowed: %s", _pexc)
+                _pick = None
+        if _pick is not None and _pick[:2] != _runs[-1]:
+            try:
+                _filter_event_log(
+                    "PAREN-ANCHOR mineral band y%d-%d open=%.2f@%d "
+                    "close=%.2f@%d (default run y%d-%d overridden)"
+                    % (
+                        _pick[0], _pick[1],
+                        _pick[2][0], _pick[2][1],
+                        _pick[2][2], _pick[2][3],
+                        _runs[-1][0], _runs[-1][1],
+                    )
+                )
+            except Exception:
+                pass
+        if _pick is not None:
+            _ry1, _ry2 = _pick[0], _pick[1]
+            _ylim = _h
+        else:
+            _ry1, _ry2 = _runs[-1]
+            _ylim = _cap
+        _ry1 = max(0, _ry1 - 3)
+        _ry2 = min(_ylim, _ry2 + 3)
+        if _pick is not None and _ry1 >= _cap and _mx_full is not None:
+            # Stage-B band lies below the original strip — derive the
+            # left edge from its own rows, not the (out-of-range) strip.
+            _band = _adaptive_binarize(
+                _canonicalize_polarity(_mx_full[_ry1:_ry2])
+            ) > 0
+        else:
+            _band = _bs[_ry1:_ry2] > 0
+        _colf = _band.mean(axis=0)
+        _xs = np.flatnonzero(_colf > 0.05)
+        _xl = int(_xs[0]) if _xs.size else 0
+        return (_ry1, _ry2, max(0, _xl - 6))
+    except Exception as _exc:
+        log.debug("sc_ocr: mineral band refine failed: %s", _exc)
+        return None
+
+
 def _ocr_mineral_name(
     img: "Image.Image",
     y1: int,
@@ -14076,6 +15353,33 @@ def _ocr_mineral_name(
     crop = img.crop((crop_x_left, y1, img.width, y2))
     if crop.width < 20 or crop.height < 8:
         return None
+
+    # ── Trim the empty space to the RIGHT of the mineral text ──
+    # The crop spans crop_x_left -> img.width to cover long mineral names,
+    # but short names ("Aluminum (Ore)") leave most of it empty. That wide
+    # blank strip (a) reads as "grabbing the whole image" in the debug
+    # overlay and (b) shrinks the text under Tesseract's fixed-height
+    # resize so each pass runs slow enough to blow the slow-path TIME
+    # BUDGET — the read then bails to None even though the text is sharp
+    # (user 2026-06-02: "Aluminum (Ore)" -> mineral=? while the same crop
+    # reads fine given unlimited time). Find where the bright text ends and
+    # trim to there + a generous margin; fall back to full width on no
+    # clear edge so long names are never clipped.
+    try:
+        _ct = np.array(crop.convert("RGB"), dtype=np.uint8).max(axis=2)
+        _ctc = _canonicalize_polarity(_ct).astype(np.float32)
+        _col = _ctc.max(axis=0)  # brightest pixel per column
+        _clo, _chi = float(_col.min()), float(_col.max())
+        if _chi - _clo > 25.0:
+            _cthr = _clo + 0.45 * (_chi - _clo)
+            _cink = np.where(_col > _cthr)[0]
+            if _cink.size:
+                _cmargin = max(50, int((y2 - y1) * 2.5))
+                _cneww = min(crop.width, int(_cink[-1]) + _cmargin)
+                if 20 <= _cneww < crop.width:
+                    crop = crop.crop((0, 0, _cneww, crop.height))
+    except Exception:
+        pass
 
     # ── Preprocessing helpers ──
     rgb = np.array(crop.convert("RGB"), dtype=np.uint8)
@@ -14255,7 +15559,17 @@ def _ocr_mineral_name(
         return None
 
     import time as _time
-    _SLOW_BUDGET_S = 0.6
+    # Budget for the multi-pass Tesseract vote. Was 0.6s, which is enough
+    # in isolation (it collects candidates within ~600ms) but NOT under
+    # live load — there the per-pass Tesseract spawn is slow enough that
+    # the budget expires with 0 candidates collected and the read drops to
+    # None, even on a perfectly sharp crop (user 2026-06-02: "Aluminum
+    # (Ore)" -> mineral=?). Mineral name is read ONCE per rock and then
+    # latched into the frozen reference (it stops re-running once
+    # resolved), so a longer one-shot budget buys correctness without a
+    # recurring per-scan cost. Paired with the right-trim above (smaller
+    # crop -> faster passes) so this rarely needs the full window.
+    _SLOW_BUDGET_S = 1.5
     _slow_t0 = _time.monotonic()
     candidates: list[tuple[str, float, str, str]] = []  # (canonical, sim, raw, source_tag)
     _aborted = False
@@ -14449,42 +15763,23 @@ def scan_hud_onnx(
     if _img_override is not None:
         img = _img_override
     else:
-        # Self-healing capture (v2.2.14+). When the feature flag is
-        # enabled (default), expand the user region by a margin,
-        # capture that larger area, run the RGB color-mask HUD
-        # locator on it, and crop back to the detected panel. When
-        # the flag is disabled or the locator can't find the panel,
-        # this collapses to the pre-v2.2.14 behavior: a plain
-        # ``capture.grab(region)`` with a one-shot retry.
-        if _read_auto_heal_region_flag():
-            healed_img, _actual_region, _heal_diag = (
-                _region_autoheal.autoheal_capture(region)
-            )
-            if healed_img is None:
-                # Autoheal failed at the capture layer entirely —
-                # fall through to the legacy double-grab so behavior
-                # matches the pre-v2.2.14 retry semantics.
-                healed_img = capture.grab(region)
-                if healed_img is None:
-                    healed_img = capture.grab(region)
-                if healed_img is None:
-                    return empty
-            else:
-                log.debug(
-                    "sc_ocr: autoheal_capture heal=%s reason=%s "
-                    "capture_size=%s cropped_size=%s",
-                    _heal_diag.get("heal"),
-                    _heal_diag.get("fallback_reason"),
-                    _heal_diag.get("captured_size"),
-                    _heal_diag.get("cropped_size"),
-                )
-            img = healed_img
-        else:
+        img = capture.grab(region)
+        if img is None:
             img = capture.grab(region)
-            if img is None:
-                img = capture.grab(region)
-            if img is None:
-                return empty
+        if img is None:
+            return empty
+    # One-shot CLEAN capture dump (no overlay annotations) so the exact
+    # input the reader sees can be replayed offline to fix crop geometry
+    # against real data instead of guessing. Gated on a viewer heartbeat
+    # so production with no viewer open pays nothing.
+    try:
+        from . import debug_overlay as _dbg_clean
+        if _dbg_clean.diagnostics_active() and img is not None:
+            img.save(os.path.join(
+                os.path.dirname(_GLYPH_DUMP_DIR), "debug_clean_region.png"
+            ))
+    except Exception:
+        pass
     if _dbg is not None:
         _dbg.set_image(img)
         # Write IMMEDIATELY so the viewer reflects the latest capture
@@ -14557,6 +15852,11 @@ def scan_hud_onnx(
     # When ``_panel_bbox_for_region1`` is available the detector's
     # position prior is tightened to the panel's vertical span.
     mineral_row: Optional[tuple[int, int]] = None
+    # Left edge of the mineral-name text, from the color detector's bbox.
+    # The shared "_mineral_row" entry carries the NUMERIC value-column x
+    # (~180px in), which crops off the whole mineral name; this is the
+    # real text start so the OCR crop begins in the right place.
+    _mineral_text_x: Optional[int] = None
     try:
         from hud_tracker.anchors.mineral_name_color import (
             find_mineral_name_row as _find_mineral_color,
@@ -14567,6 +15867,7 @@ def scan_hud_onnx(
         if _color_res is not None:
             _bx, _by, _bw, _bh = _color_res["bbox"]
             mineral_row = (int(_by), int(_by) + int(_bh))
+            _mineral_text_x = int(_bx)
             log.info(
                 "sc_ocr: mineral_name_color picked y=(%d, %d) hue=%.1f conf=%.2f",
                 mineral_row[0], mineral_row[1],
@@ -14928,24 +16229,83 @@ def scan_hud_onnx(
             if _dbg is not None:
                 _dbg.set_lock(_field, _locked_val)
         else:
-            # No invalidation — all locks hold. Cache mineral name
-            # (one-shot OCR) and return.
+            # No invalidation — all locks hold. Cache mineral name with
+            # PERIODIC REVERIFY (live 2026-06-10: a one-shot fast-path
+            # misread cached 'Stannite' forever while every full-path
+            # vote said 'Aluminum' — the cache had no verification and
+            # no expiry, and the full path never runs while ALL LOCKED).
+            # Same cadence as the numeric lock reverify; a disagreeing
+            # fresh read replaces the cache, a NO_READ keeps it.
             _cached_mineral = _locks.get("_mineral_name")
-            if _cached_mineral is not None:
+            _min_ctr = _scans_since_lock_verify.get("_mineral_name", 0) + 1
+            _scans_since_lock_verify["_mineral_name"] = _min_ctr
+            if (_cached_mineral is not None
+                    and _min_ctr < _REVERIFY_THRESHOLD):
                 result["mineral_name"] = _cached_mineral[0]
             else:
                 _mineral_entry = _label_rows_for_validation.get("_mineral_row")
                 if _mineral_entry is not None:
                     try:
                         _my1, _my2, _mlr = _mineral_entry
+                        # Same structural band re-derivation as the full
+                        # path. The raw _mineral_row entry comes from the
+                        # color/projection detector and can sit on a
+                        # label row — reverifying from THAT band CONFIRMS
+                        # the very stale value this cadence exists to
+                        # catch (live 2026-06-11: reverify read
+                        # 'anne'->'Stannite' off a label row every cycle
+                        # while the full path's paren-anchored band read
+                        # 'ALUMINUMORE'->'Aluminum').
+                        _mass_e2 = _label_rows_for_validation.get("mass")
+                        _rb2 = _refine_mineral_band_above_mass(
+                            img,
+                            int(_mass_e2[0]) if _mass_e2 else None,
+                        )
+                        # X priority mirrors the full path: calibration
+                        # box, else the refine's text-left edge, else
+                        # full row width. The entry's own third element
+                        # is the NUMERIC VALUE-COLUMN x (~mid-panel) —
+                        # passing it cropped the name out of the OCR
+                        # entirely, so the reverify read fragments of
+                        # whatever sat right of mid-row.
+                        try:
+                            from . import calibration as _cal_mod2
+                            _mbox2 = _cal_mod2.get_row(
+                                region, "_mineral_row")
+                        except Exception:
+                            _mbox2 = None
+                        if _mbox2 is not None:
+                            try:
+                                _mlr = max(0, int(_mbox2["x"]) + 20)
+                            except Exception:
+                                _mlr = 0
+                        elif _rb2 is not None:
+                            _mlr = _rb2[2]
+                        else:
+                            _mlr = 0
+                        if _rb2 is not None:
+                            _my1, _my2 = _rb2[0], _rb2[1]
                         _mname = _ocr_mineral_name(img, _my1, _my2, _mlr)
                         if _mname:
+                            if (_cached_mineral is not None
+                                    and _mname != _cached_mineral[0]):
+                                log.info(
+                                    "sc_ocr: mineral lock REVERIFY %r -> "
+                                    "%r (stale cache replaced)",
+                                    _cached_mineral[0], _mname,
+                                )
                             _locks["_mineral_name"] = (_mname, None)
+                            _scans_since_lock_verify["_mineral_name"] = 0
                             result["mineral_name"] = _mname
                             if _dbg is not None:
                                 _dbg.set_ocr_text("mineral", _mname, [1.0])
+                        elif _cached_mineral is not None:
+                            # NO_READ — keep the cache, retry next cycle
+                            result["mineral_name"] = _cached_mineral[0]
                     except Exception as _exc:
                         log.debug("mineral OCR fast-path failed: %s", _exc)
+                        if _cached_mineral is not None:
+                            result["mineral_name"] = _cached_mineral[0]
             elapsed_ms = (time.time() - t0) * 1000
             log.info(
                 "sc_ocr: ALL LOCKED mineral=%s mass=%s resistance=%s instability=%s in %.0fms",
@@ -15950,6 +17310,7 @@ def scan_hud_onnx(
         if field not in _locks:
             _unanimous = _value_buffer_unanimous(field)
             _crop_ok, _crop_sim = _crop_buffer_consistent(field)
+            _consistency_reflex(field, _unanimous, _crop_ok, _crop_sim)
             _displayed = result.get(field)
             if (
                 _unanimous is not None
@@ -15996,16 +17357,23 @@ def scan_hud_onnx(
     if _mineral_entry is not None:
         try:
             _my1, _my2, _mlr = _mineral_entry
-            # CALIBRATION OVERRIDE for mineral row: prefer the user's
-            # locked box when present. The shared value_column_left
-            # `_mlr` is derived from the NUMERIC rows (mass/resistance/
-            # instability label ends), which sit ~180 px into the panel
-            # — way to the right of where the mineral name text starts
-            # (usually x=11). Passing that lr into _ocr_mineral_name
-            # crops from x=_mlr-20, which chops off the entire mineral
-            # name and leaves only the trailing ")" or "(ORE)" — hence
-            # garbage reads like 'Elo' or 'Eg fT'. When the user has
-            # locked the mineral row, its box['x'] is the real start.
+            # The shared value_column_left `_mlr` is derived from the
+            # NUMERIC rows (mass/resistance/instability label ends), which
+            # sit ~180 px into the panel — way to the right of where the
+            # mineral name text starts (usually x=11). Passing that lr into
+            # _ocr_mineral_name crops from x=_mlr-20, which chops off the
+            # entire mineral name and leaves only the trailing ")" or
+            # "(ORE)" — hence garbage reads like 'Elo' / 'PR' and a
+            # dropped mineral_name (user 2026-06-02).
+            #
+            # Prefer, in order of authority:
+            #   1. the user's locked calibration box (explicit), else
+            #   2. the COLOR DETECTOR's text-left edge (automatic, found
+            #      every scan the mineral row is detected) — this is the
+            #      fix that makes the common, un-calibrated case work, else
+            #   3. the numeric _mlr (last resort).
+            if _mineral_text_x is not None:
+                _mlr = max(0, int(_mineral_text_x))
             try:
                 from . import calibration as _cal_mod
                 _mineral_box = _cal_mod.get_row(region, "_mineral_row")
@@ -16016,8 +17384,53 @@ def scan_hud_onnx(
                     _mlr = max(0, int(_mineral_box["x"]) + 20)
                 except Exception as exc:
                     log.debug("api: scan_hud_onnx swallowed: %s", exc)
+            # STRUCTURAL BAND REFINE: the name is the bottom-most text
+            # line above the MASS row — re-derive the band from that
+            # anchor so a mis-locked color/projection band (title
+            # included, or composition rows below) can't reach the OCR.
+            # The user's explicit calibration X keeps priority.
+            _mass_entry_for_name = label_rows.get("mass")
+            _refined_band = _refine_mineral_band_above_mass(
+                img,
+                int(_mass_entry_for_name[0])
+                if _mass_entry_for_name else None,
+            )
+            if _refined_band is not None:
+                _ry1, _ry2, _rxl = _refined_band
+                if (_ry1, _ry2) != (_my1, _my2):
+                    log.info(
+                        "sc_ocr: mineral band refined (%d,%d)->(%d,%d) "
+                        "x_left=%d (bottom-line-above-MASS)",
+                        _my1, _my2, _ry1, _ry2, _rxl,
+                    )
+                _my1, _my2 = _ry1, _ry2
+                if _mineral_box is None:
+                    _mlr = _rxl
             _mineral_name = _ocr_mineral_name(img, _my1, _my2, _mlr)
             result["mineral_name"] = _mineral_name
+            if _mineral_name:
+                # Seed/replace the ALL-LOCKED mineral cache with this
+                # full-path read. The cache used to be written ONLY by
+                # the fast-path reverify, so a correct full-path read
+                # never displaced a stale cache and the published name
+                # flapped between the two paths (live 2026-06-11:
+                # 'Aluminum' on full scans, locked 'Stannite' on
+                # ALL-LOCKED scans of the same rock).
+                try:
+                    _mlk = _field_lock_cache.get(_region_key(region))
+                    if _mlk is not None:
+                        _prev_m = _mlk.get("_mineral_name")
+                        if (_prev_m is not None
+                                and _prev_m[0] != _mineral_name):
+                            log.info(
+                                "sc_ocr: mineral cache %r -> %r "
+                                "(full-path read replaces stale)",
+                                _prev_m[0], _mineral_name,
+                            )
+                        _mlk["_mineral_name"] = (_mineral_name, None)
+                        _scans_since_lock_verify["_mineral_name"] = 0
+                except Exception as exc:
+                    log.debug("api: scan_hud_onnx swallowed: %s", exc)
             if _dbg is not None and _mineral_name:
                 _dbg.set_ocr_text("mineral", _mineral_name, [1.0])
             # Save the mineral row crop so the calibration dialog can
@@ -16063,6 +17476,21 @@ def scan_hud_onnx(
     try:
         from . import frozen_panel as _fp
         _frozen = _fp.get_frozen_ref(region)
+        # ── Debug toggle: SC_HUD_NO_FREEZE ──
+        # When set, disable the auto-freeze / frozen-publish entirely:
+        # every scan publishes the LIVE read instead of a locked snapshot.
+        # Useful for watching raw per-frame reads while debugging (the
+        # freeze otherwise holds a stable value and ignores flaky live
+        # frames). NOT for normal play — the freeze is what suppresses
+        # value flicker. Mirrors the _suppress_freeze early-return.
+        import os as _os_nofreeze
+        if _os_nofreeze.environ.get("SC_HUD_NO_FREEZE"):
+            try:
+                if _frozen.is_frozen:
+                    _frozen.clear()
+            except Exception:
+                pass
+            return result
         _rk_frozen = _region_key(region)
         _title_seen_this_scan = bool(
             label_rows and (

@@ -53,6 +53,15 @@ from ocr.training_registry import (        # noqa: E402
     assert_path_belongs_to,
 )
 
+# Quarantine gate — Glyph Review decisions filter every training input.
+# Disable with SC_TRAIN_NO_GATE=1. See ocr/glyph_gate.py.
+try:
+    from ocr.glyph_gate import filter_clean as _quarantine_filter
+except Exception:  # gate unavailable -> train unfiltered (legacy behaviour)
+    def _quarantine_filter(paths, **_kw):
+        return list(paths)
+
+
 REGION_KIND = "hud_rgb"
 SPEC = _registry_get(REGION_KIND)
 
@@ -178,7 +187,7 @@ def _enumerate_class_files(staging: Path) -> dict[str, List[Path]]:
             )
             continue
         assert_path_belongs_to(REGION_KIND, cls_dir)
-        for png in sorted(cls_dir.glob("*.png")):
+        for png in _quarantine_filter(sorted(cls_dir.glob("*.png"))):
             assert_path_belongs_to(REGION_KIND, png)
             out[label_ch].append(png)
     return out

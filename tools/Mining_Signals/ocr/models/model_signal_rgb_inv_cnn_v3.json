@@ -27,11 +27,11 @@
   },
   "perClassValAccuracy": {
     "0": 1.0,
-    "1": 0.9814814814814815,
+    "1": 1.0,
     "2": 1.0,
     "3": 0.9855072463768116,
     "4": 1.0,
-    "5": 1.0,
+    "5": 0.9838709677419355,
     "6": 0.9836065573770492,
     "7": 1.0,
     "8": 0.9824561403508771,
@@ -103,8 +103,8 @@
       "total_after_balance": 400
     }
   },
-  "trainedAt": "2026-05-10T09:45:28",
-  "trainingSeconds": 38.08105659484863,
+  "trainedAt": "2026-06-10T21:24:38",
+  "trainingSeconds": 12.350011348724365,
   "modelPath": "C:\\Users\\prjgn\\AppData\\Local\\SC_Toolbox\\current\\tools\\Mining_Signals\\ocr\\models\\model_signal_rgb_inv_cnn_v3.onnx",
   "digitStagingDir": "C:\\Users\\prjgn\\AppData\\Local\\SC_Toolbox\\current\\tools\\Mining_Signals\\_v3_digit_staging_rgb",
   "iconStagingDir": "C:\\Users\\prjgn\\AppData\\Local\\SC_Toolbox\\current\\tools\\Mining_Signals\\_v3_icon_staging_rgb",

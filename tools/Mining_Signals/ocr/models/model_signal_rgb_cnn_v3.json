@@ -9,7 +9,7 @@
     28,
     28
   ],
-  "valAccuracy": 0.9970059880239521,
+  "valAccuracy": 0.9955089820359282,
   "trainSamples": 3782,
   "valSamples": 668,
   "perClassCounts": {
@@ -27,14 +27,14 @@
   },
   "perClassValAccuracy": {
     "0": 1.0,
-    "1": 1.0,
+    "1": 0.9814814814814815,
     "2": 1.0,
     "3": 0.9855072463768116,
     "4": 1.0,
-    "5": 0.9838709677419355,
+    "5": 1.0,
     "6": 1.0,
     "7": 1.0,
-    "8": 1.0,
+    "8": 0.9824561403508771,
     "9": 1.0,
     "@": 1.0
   },
@@ -103,8 +103,8 @@
       "total_after_balance": 400
     }
   },
-  "trainedAt": "2026-05-10T09:27:55",
-  "trainingSeconds": 75.98286032676697,
+  "trainedAt": "2026-06-10T21:24:25",
+  "trainingSeconds": 31.015311002731323,
   "modelPath": "C:\\Users\\prjgn\\AppData\\Local\\SC_Toolbox\\current\\tools\\Mining_Signals\\ocr\\models\\model_signal_rgb_cnn_v3.onnx",
   "digitStagingDir": "C:\\Users\\prjgn\\AppData\\Local\\SC_Toolbox\\current\\tools\\Mining_Signals\\_v3_digit_staging_rgb",
   "iconStagingDir": "C:\\Users\\prjgn\\AppData\\Local\\SC_Toolbox\\current\\tools\\Mining_Signals\\_v3_icon_staging_rgb",

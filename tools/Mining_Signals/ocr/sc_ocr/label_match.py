@@ -582,8 +582,19 @@ def find_label_positions(
     *,
     search_centers: Optional[dict] = None,
     search_radius: int = _DEFAULT_LOCAL_RADIUS,
+    y_min: int = 0,
 ) -> dict[str, dict]:
     """NCC-match the three label templates against the panel image.
+
+    ``y_min`` restricts the search to rows at or below that image-Y
+    (e.g. "labels live below the title"). The restriction is applied
+    INTERNALLY and the returned coordinates are STILL image-absolute.
+    This replaces the old pattern where callers cropped the image
+    themselves and re-added the offset at every consumer — each
+    consumer was a chance for a missed or doubled conversion, and the
+    per-label log lines printed crop-frame Y's next to other modules'
+    image-frame Y's (the live-log "two coordinate spaces" confusion).
+    The crop and the conversion now live in exactly one place: here.
 
     Returns a dict mapping label name → match info::
 
@@ -634,6 +645,39 @@ def find_label_positions(
     return stale data to each other.
     """
     global _LAST_CALL_CACHE, _LAST_FULL_FRAME_MATCHES
+    if y_min:
+        _y0 = max(0, int(y_min))
+        if img.height - _y0 < 40:
+            return {}
+        _sub = img.crop((0, _y0, img.width, img.height))
+        # Shift any caller-supplied absolute centers into the crop
+        # frame for the inner search; results are shifted back below.
+        _sc_shift = None
+        if search_centers:
+            _sc_shift = {
+                k: (int(c[0]), int(c[1]) - _y0)
+                for k, c in search_centers.items() if c is not None
+            }
+        _out = find_label_positions(
+            _sub, search_centers=_sc_shift, search_radius=search_radius,
+        )
+        _shifted: dict[str, dict] = {}
+        for _k, _m in _out.items():
+            _mm = dict(_m)
+            _mm["y"] = int(_mm["y"]) + _y0
+            _shifted[_k] = _mm
+        if _shifted:
+            log.info(
+                "label_match: y_min=%d rows (image-absolute): %s",
+                _y0,
+                {k: (m["x"], m["y"]) for k, m in _shifted.items()},
+            )
+        # Re-stamp the shared full-frame state in ABSOLUTE
+        # coordinates so get_last_full_frame_matches() consumers
+        # never see a crop frame.
+        if search_centers is None:
+            _LAST_FULL_FRAME_MATCHES = dict(_shifted)
+        return _shifted
     sc_key = _normalize_search_centers(search_centers)
     sr_norm = int(search_radius)
     cache_key = (id(img), img.size, img.mode, sc_key, sr_norm)

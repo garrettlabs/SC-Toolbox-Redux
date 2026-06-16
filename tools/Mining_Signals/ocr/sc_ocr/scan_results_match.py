@@ -316,11 +316,39 @@ def _smooth_anchor(raw: Optional[dict], now: float) -> Optional[dict]:
                     ema_blend = False
                 else:
                     ema_blend = False
-                    streak = int(
-                        _anchor_tracker_state.get("outlier_streak") or 0
-                    ) + 1
-                    _anchor_tracker_state["outlier_streak"] = streak
-                    if streak < _TRACK_OUTLIER_HYSTERESIS:
+                    # Size consistency: real panel MOTION preserves the
+                    # title's render scale — panels translate between
+                    # frames, they don't rescale 1.8x. A jump candidate
+                    # whose width differs >33% from the tracked
+                    # reference is a lookalike (live 2026-06-12: a
+                    # persistent title+underline composite at ~2.8x,
+                    # 446px vs ref 253px, score 0.450, satisfied the
+                    # 2-frame hysteresis when the real title dipped
+                    # twice -> re-baseline -> field locks invalidated
+                    # -> a scan of Nones). Such candidates never
+                    # accumulate streak. Genuine scale changes still
+                    # enter via the strong-dominant override above or
+                    # post-freshness re-acquisition.
+                    _raw_w = max(1, int(raw.get("title_w", 1)))
+                    _prev_w = max(1, int(prev.get("title_w", 1)))
+                    _wr = _raw_w / float(_prev_w)
+                    if _wr < 0.75 or _wr > 1.33:
+                        _anchor_tracker_state["outlier_streak"] = 0
+                        log.info(
+                            "scan_results_match: tracker REJECTED jump "
+                            "candidate on size (w=%d vs ref=%d, "
+                            "dist=%.1fpx) — lookalike, streak reset",
+                            _raw_w, _prev_w, dist,
+                        )
+                        result = dict(prev)
+                        # Skip the streak/accept logic entirely.
+                        streak = None
+                    else:
+                        streak = int(
+                            _anchor_tracker_state.get("outlier_streak") or 0
+                        ) + 1
+                        _anchor_tracker_state["outlier_streak"] = streak
+                    if streak is not None and streak < _TRACK_OUTLIER_HYSTERESIS:
                         log.info(
                             "scan_results_match: tracker REJECTED outlier "
                             "(dist=%.1fpx streak=%d/%d) raw=(%d,%d) using "
@@ -334,7 +362,7 @@ def _smooth_anchor(raw: Optional[dict], now: float) -> Optional[dict]:
                         # to accumulate toward the hysteresis threshold
                         # quickly.
                         result = dict(prev)
-                    else:
+                    elif streak is not None:
                         # Confirmed real motion. Snap to the raw value.
                         out = dict(raw)
                         _anchor_tracker_state["smoothed"] = out
@@ -386,6 +414,35 @@ def reset_anchor_tracker() -> None:
         _anchor_tracker_state["smoothed"] = None
         _anchor_tracker_state["ts"] = 0.0
         _anchor_tracker_state["outlier_streak"] = 0
+
+
+def get_tracked_anchor_center() -> Optional[tuple[int, int]]:
+    """Last smoothed title CENTER in image-absolute pixels, or None
+    when the tracker is empty or stale (> ``_TRACK_FRESH_SEC``).
+
+    Lets callers run ``find_scan_results_anchor`` in LOCAL mode around
+    the last known pose instead of paying a full-frame multi-scale
+    sweep. The full sweep is also where small-scale false positives
+    get re-discovered every frame: the title's own underline + end
+    hook correlates with the 0.6x template (score ~0.9) whenever the
+    title's NCC is locally depressed — e.g. the debug overlay's gold
+    box captured around it — producing the constant rejected-outlier
+    log spam at a fixed position. A 60 px local window simply never
+    contains that blob."""
+    with _anchor_tracker_lock:
+        sm = _anchor_tracker_state.get("smoothed")
+        ts = float(_anchor_tracker_state.get("ts") or 0.0)
+    if not sm:
+        return None
+    if (time.monotonic() - ts) > _TRACK_FRESH_SEC:
+        return None
+    try:
+        return (
+            int(sm["title_x"]) + int(sm["title_w"]) // 2,
+            int(sm["title_y"]) + int(sm["title_h"]) // 2,
+        )
+    except Exception:
+        return None
 
 
 def _load_template() -> Optional[list[tuple[np.ndarray, int, int]]]:
@@ -462,6 +519,127 @@ def reset_cache() -> None:
     global _TEMPLATE_CACHE, _LAST_CALL_CACHE
     _TEMPLATE_CACHE = None
     _LAST_CALL_CACHE = None
+
+
+def _row_consensus_title(
+    img: Image.Image,
+    all_hits: list,
+    off_x: int,
+    off_y: int,
+) -> "Optional[tuple[float, int, int, int, int]]":
+    """Validate, rescue, or synthesize the title pose from label-row
+    evidence. Called ONLY when the template sweep's winner is
+    suspicious (full-frame mode).
+
+    The label rows independently establish the panel's scale and
+    pitch, and the title's pose relative to them is a constant of the
+    panel layout. Measured on 40 annotated panels in the unified
+    coordinate space (post-P0): title_top = mass_label_y - 2.59*pitch
+    (p10-p90 spread 2.56-2.62), title_x ~= mass_label_x (+-0.07*pitch),
+    title_h = 1.406*label_h (constant), template aspect 158/28=5.643.
+
+    Three tiers, strongest evidence first:
+      1. RESCUE - among ALL sweep hits (including sub-floor ones down
+         to 0.28), prefer the strongest whose geometry agrees with the
+         rows. This recovers faded-but-real titles the flat accept
+         floor rejected - safe where floor-lowering alone was not,
+         because acceptance is gated on INDEPENDENT row evidence, not
+         on the score that already failed.
+      2. SYNTHESIZE - no agreeing hit at all: derive the pose from the
+         rows outright (score 0.45, marked in the log). Strictly
+         better than the alternatives in this branch: a sub-native
+         lookalike or None.
+      3. None - fewer than two labels, or insane pitch: stay out.
+
+    Returns a candidate tuple in the sweep's crop frame
+    ``(raw, x, y, w, h)`` or None."""
+    try:
+        m = _lm.find_label_positions(img)
+    except Exception:
+        return None
+    mass = m.get("mass")
+    res = m.get("resistance")
+    ins = m.get("instability")
+    if mass is None or (res is None and ins is None):
+        return None
+    if ins is not None:
+        pitch = (float(ins["y"]) - float(mass["y"])) / 2.0
+    else:
+        pitch = float(res["y"]) - float(mass["y"])
+    if not (10.0 <= pitch <= 200.0):
+        return None
+    lh = float(mass["h"])
+    if lh < 6:
+        return None
+
+    def _agrees(c):
+        _s, _x, _y, _w, _h = c
+        ax = _x + off_x
+        ay = _y + off_y
+        rh = _h / lh
+        ky = (float(mass["y"]) - ay) / pitch
+        kx = abs((ax - float(mass["x"])) / pitch)
+        return 1.0 <= rh <= 1.8 and 1.8 <= ky <= 3.4 and kx <= 1.5
+
+    valid = [c for c in all_hits if c[0] >= 0.28 and _agrees(c)]
+    if valid:
+        best = max(valid, key=lambda c: c[0])
+        log.info(
+            "scan_results_match: row-consensus RESCUED title "
+            "(score=%.2f w=%d, rows pitch=%.1f)",
+            best[0], best[3], pitch,
+        )
+        return best
+    # ── Title geometry: prefer the auto-cal learner (per-capture) ──
+    # The global constants below (K_y 2.59, R_h 1.406) were measured at
+    # HARNESS geometry and do NOT transfer across label-template scale
+    # quantization: at some live scales 1.406*label_h equals the
+    # title+UNDERLINE composite height, so the global synth would
+    # endorse that lookalike (live 2026-06-12, capture 21:42: global ->
+    # h=79 top=104 == the 446px composite the tracker then re-baselined
+    # onto; learned -> h=46 top=46 == the real title). The auto-cal
+    # learner publishes title-h-unit ratios for THIS capture; two of
+    # them — label-TOP offset and row-CENTER mult for mass — recover
+    # this capture's title_h and title_top algebraically from the live
+    # mass label box, with no dependence on the scale-variant label_h.
+    #   off = (label_top    - title_top) / title_h
+    #   rc  = (label_center - title_top) / title_h
+    #   => title_h   U = (label_h / 2) / (rc - off)
+    #   => title_top   = label_top - off * U
+    _learned_used = False
+    try:
+        from . import hud_panel_tracker as _hpt
+        _lo = _hpt.get_learned_offsets()
+        _lrm = _hpt.get_learned_row_mults()
+        if _lo and _lrm and "label_mass" in _lo and "mass" in _lrm:
+            _off = float(_lo["label_mass"][1])
+            _rc = float(_lrm["mass"])
+            _den = _rc - _off
+            if _den > 0.05:
+                _U = (float(mass["h"]) / 2.0) / _den
+                if 8.0 <= _U <= 200.0:
+                    th_ = int(round(_U))
+                    tw_ = int(round(5.6429 * th_))
+                    ty = int(round(float(mass["y"]) - _off * _U))
+                    tx = int(round(float(mass["x"]) - 0.026 * _U))
+                    _learned_used = True
+    except Exception:
+        _learned_used = False
+    if not _learned_used:
+        th_ = int(round(1.406 * lh))
+        tw_ = int(round(5.6429 * th_))
+        ty = int(round(float(mass["y"]) - 2.59 * pitch))
+        tx = int(round(float(mass["x"]) - 0.026 * pitch))
+    W, H = img.size
+    if th_ < 8 or ty < 0 or ty + th_ > H or tx < 0 or tx + tw_ > W:
+        return None
+    log.info(
+        "scan_results_match: row-consensus SYNTHESIZED title "
+        "(%d,%d,%d,%d) from rows (pitch=%.1f label_h=%d src=%s)",
+        tx, ty, tw_, th_, pitch, lh,
+        "auto-cal" if _learned_used else "global-constants",
+    )
+    return (0.45, tx - off_x, ty - off_y, tw_, th_)
 
 
 def find_scan_results_anchor(
@@ -609,10 +787,12 @@ def find_scan_results_anchor(
     target_h = max(1, target.shape[0])
 
     candidates: list[tuple[float, int, int, int, int]] = []  # (raw, x, y, w, h)
+    _all_hits: list[tuple[float, int, int, int, int]] = []
     for tmpl, tw, th in variants:
         if tw > target.shape[1] or th > target.shape[0]:
             continue
         score, x, y = _lm._ncc_search(target, tmpl)
+        _all_hits.append((float(score), int(x), int(y), int(tw), int(th)))
         if score < _MIN_MATCH_SCORE:
             continue
         candidates.append((float(score), int(x), int(y), int(tw), int(th)))
@@ -647,13 +827,16 @@ def find_scan_results_anchor(
             )
         candidates = filtered
 
-    if not candidates:
-        log.debug(
-            "scan_results_match: no scale cleared threshold=%.2f",
-            _MIN_MATCH_SCORE,
-        )
-        _LAST_CALL_CACHE = (*cache_key, None)
-        return None
+    _best_tuple: Optional[tuple[float, int, int, int, int]] = None
+    if sc_norm is None:
+        # Native template width (scale 1.0) for the suspicion check.
+        _native_w = None
+        for _t, _tw, _th in variants:
+            if _th == _TEMPLATE_NATIVE_HEIGHT:
+                _native_w = _tw
+                break
+        if _native_w is None:
+            _native_w = sorted(t[1] for t in variants)[len(variants) // 2]
 
     # Pick the candidate with the highest BIASED rank. Top-bias dominates
     # tight raw-score competitions; raw threshold has already filtered
@@ -669,13 +852,43 @@ def find_scan_results_anchor(
         raw, _x, y, _w, _h = c
         return raw + _Y_BIAS_MAX * (1.0 - (y / target_h))
 
-    candidates.sort(key=_biased, reverse=True)
-    best_score, _bx, _by, _bw, _bh = candidates[0]
+    if candidates:
+        candidates.sort(key=_biased, reverse=True)
+        _best_tuple = candidates[0]
+    if sc_norm is None:
+        # ── Row-consensus assist (cold-acquisition fix) ──
+        # The sweep alone cold-acquires the title correctly on only
+        # ~2/3 of the annotated corpus: degraded titles fall under the
+        # accept floor and a 0.6x-scale lookalike (95x17) wins, or
+        # nothing does. The label rows are independently reliable
+        # (~90%) and pin the panel's scale and pitch — so when the
+        # sweep's winner looks SUSPICIOUS (missing, sub-native scale,
+        # or weak), consult the rows: validate/rescue a candidate that
+        # agrees with the row geometry, else synthesize the pose from
+        # it. Healthy panels (native scale, decent score) never enter
+        # this branch — their path and cost are unchanged.
+        _sus = (
+            _best_tuple is None
+            or _best_tuple[3] < _native_w
+            or _best_tuple[0] < 0.55
+        )
+        if _sus:
+            _co = _row_consensus_title(img, _all_hits, off_x, off_y)
+            if _co is not None:
+                _best_tuple = _co
+    if _best_tuple is None:
+        log.debug(
+            "scan_results_match: no scale cleared threshold=%.2f",
+            _MIN_MATCH_SCORE,
+        )
+        _LAST_CALL_CACHE = (*cache_key, None)
+        return None
+    best_score, _bx, _by, _bw, _bh = _best_tuple
     best_pos = (_bx, _by, _bw, _bh)
 
     # Diagnostic: if the topmost-by-bias differs from the topmost-by-raw,
     # log both so we can see when the bias is actually doing work.
-    if len(candidates) > 1:
+    if len(candidates) > 1 and _best_tuple is candidates[0]:
         raw_winner = max(candidates, key=lambda c: c[0])
         if raw_winner is not candidates[0]:
             log.debug(
@@ -686,6 +899,36 @@ def find_scan_results_anchor(
             )
 
     x, y, w, h = best_pos
+    # ── Local-mode acceptance guard ──
+    # A local window can contain panel text that weakly correlates with
+    # the template while the REAL title fails to register in that crop
+    # (live 2026-06-11: 'ALUMINUM (ORE)' matched the native-scale
+    # template at 0.502 inside the ±60 px window while the title —
+    # scoring 1.356 in the same frame's full sweep — never cleared the
+    # candidate threshold there; the bogus pose then drew the gold box
+    # on the name row and tripped EARLY-DIRECT's ratio bounds every
+    # cycle). When the cross-frame tracker holds a FRESH reference, a
+    # legitimate local hit must look like it: same render scale (width
+    # within ±33%) and no score collapse (≥60% of the reference's).
+    # Anything else returns None so the caller escalates to the
+    # full-frame sweep, which carries the tracker + outlier hysteresis.
+    if sc_norm is not None:
+        with _anchor_tracker_lock:
+            _ref = _anchor_tracker_state.get("smoothed")
+            _ref_ts = float(_anchor_tracker_state.get("ts") or 0.0)
+        if _ref and (time.monotonic() - _ref_ts) <= _TRACK_FRESH_SEC:
+            _ref_w = max(1, int(_ref.get("title_w", 1)))
+            _ref_s = float(_ref.get("score", 0.0))
+            _wr = float(w) / float(_ref_w)
+            if _wr < 0.75 or _wr > 1.33 or best_score < 0.6 * _ref_s:
+                log.debug(
+                    "scan_results_match: local candidate rejected by "
+                    "tracker-reference guard (w=%d vs ref=%d, "
+                    "score=%.3f vs ref=%.3f) — treating as miss",
+                    int(w), _ref_w, best_score, _ref_s,
+                )
+                _LAST_CALL_CACHE = (*cache_key, None)
+                return None
     # Convert window-local match position back to image-absolute
     # coordinates. In full-frame mode off_x/off_y are (0, 0), so this
     # is a no-op for the legacy code path.
