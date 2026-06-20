@@ -14,7 +14,12 @@ if os.name == "nt" and not os.environ.get("QT_MEDIA_BACKEND"):
     os.environ["QT_MEDIA_BACKEND"] = "windows"
 
 # Bootstrap project root and skill directory
-sys.path.insert(0, os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..')))
+_SKILL_DIR = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.normpath(os.path.join(_SKILL_DIR, '..', '..'))
+for _path in (_PROJECT_ROOT, _SKILL_DIR):
+    if _path not in sys.path:
+        sys.path.insert(0, _path)
+
 from shared.app_bootstrap import bootstrap_skill  # noqa: E402
 bootstrap_skill(__file__)
 

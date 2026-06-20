@@ -22,7 +22,7 @@ import subprocess
 import sys
 import threading
 import time
-from typing import Dict, Optional
+from typing import Dict, Iterable, Optional
 
 # Ensure shared/ and project root are importable
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -65,24 +65,50 @@ def _find_skill_log(skill_id: str) -> str | None:
 
 # ── Settings persistence ────────────────────────────────────────────────────
 
-def _load_settings_raw() -> dict:
+def _load_settings_raw(settings_file: str = SETTINGS_FILE) -> dict:
     try:
-        if os.path.isfile(SETTINGS_FILE):
-            with open(SETTINGS_FILE, encoding="utf-8") as f:
+        if os.path.isfile(settings_file):
+            with open(settings_file, encoding="utf-8") as f:
                 return json.load(f)
     except (json.JSONDecodeError, OSError) as exc:
-        logger.warning("Could not load settings: %s", exc)
+        logger.warning("Could not load settings from %s: %s", settings_file, exc)
     return {}
 
 
-def _save_settings_raw(data: dict) -> None:
+def _save_settings_raw(data: dict, settings_file: str = SETTINGS_FILE) -> None:
     try:
-        tmp = SETTINGS_FILE + ".tmp"
+        tmp = settings_file + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
-        os.replace(tmp, SETTINGS_FILE)
+        os.replace(tmp, settings_file)
     except (OSError, TypeError) as exc:
-        logger.warning("Could not save settings: %s", exc)
+        logger.warning("Could not save settings to %s: %s", settings_file, exc)
+
+
+def filter_skills_for_launcher(
+    skills: Iterable[SkillConfig],
+    allowed_skill_ids: Iterable[str] | None = None,
+) -> list[SkillConfig]:
+    """Return skills allowed for this launcher entrypoint.
+
+    ``None`` preserves the legacy full launcher.  A provided allowlist is a
+    hard boundary: every requested ID must exist in discovery, and the returned
+    list preserves discovery order so downstream settings, hotkeys, process
+    registration, and UI layout see the same ordered subset.
+    """
+    discovered = list(skills)
+    if allowed_skill_ids is None:
+        return discovered
+
+    allowed = {str(skill_id) for skill_id in allowed_skill_ids}
+    found = {skill.id for skill in discovered}
+    missing = sorted(allowed - found)
+    if missing:
+        raise ValueError(
+            "Required launcher skill id(s) not discovered: "
+            + ", ".join(missing)
+        )
+    return [skill for skill in discovered if skill.id in allowed]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -92,8 +118,17 @@ def _save_settings_raw(data: dict) -> None:
 class SCToolboxApp:
     """Wires together process management, skill registry, and the UI."""
 
-    def __init__(self, geometry: WindowGeometry, cmd_file: str) -> None:
+    def __init__(
+        self,
+        geometry: WindowGeometry,
+        cmd_file: str,
+        *,
+        allowed_skill_ids: Iterable[str] | None = None,
+        settings_file: str = SETTINGS_FILE,
+    ) -> None:
         self.cmd_file = cmd_file
+        self._settings_file = settings_file
+        self._launcher_script = os.path.abspath(sys.argv[0])
         self._running = threading.Event()
         self._running.set()
 
@@ -106,10 +141,16 @@ class SCToolboxApp:
             self._python_info = ""
 
         # ── Discover skills ──
-        self._skills = discover_skills(_skill_dir)
+        discovered_skills = discover_skills(_skill_dir)
+        self._skills = filter_skills_for_launcher(discovered_skills, allowed_skill_ids)
+        if allowed_skill_ids is not None:
+            logger.info(
+                "Launcher allowlist active: %s",
+                ", ".join(skill.id for skill in self._skills) or "<none>",
+            )
 
         # ── Load settings ──
-        raw_settings = _load_settings_raw()
+        raw_settings = _load_settings_raw(self._settings_file)
         self._settings = LauncherSettings.from_dict(raw_settings, self._skills)
 
         # ── Restore saved launcher opacity ──
@@ -455,7 +496,7 @@ class SCToolboxApp:
     def _save_launcher_opacity(self) -> None:
         """Persist the current window opacity to the settings file."""
         self._settings.launcher_opacity = self._window.windowOpacity()
-        _save_settings_raw(self._settings.to_dict())
+        _save_settings_raw(self._settings.to_dict(), self._settings_file)
 
     def _apply_settings(self, settings_dict: dict) -> None:
         """Called by the settings popup when Apply is clicked.
@@ -510,7 +551,7 @@ class SCToolboxApp:
         self._settings.launcher_opacity = self._window.windowOpacity()
 
         # Save to disk
-        _save_settings_raw(self._settings.to_dict())
+        _save_settings_raw(self._settings.to_dict(), self._settings_file)
 
         # UI scale requires a full process restart (QT_SCALE_FACTOR is read
         # once at QApplication creation).  Everything else can be rebuilt
@@ -602,7 +643,7 @@ class SCToolboxApp:
         # Build the command to relaunch
         args = [
             sys.executable,
-            os.path.abspath(__file__),
+            self._launcher_script,
             str(pos.x()), str(pos.y()),
             str(size.width()), str(size.height()),
             str(opacity),
@@ -712,15 +753,20 @@ class SCToolboxApp:
 # Entry point
 # ══════════════════════════════════════════════════════════════════════════════
 
-def main() -> None:
+def main(
+    *,
+    allowed_skill_ids: Iterable[str] | None = None,
+    settings_file: str = SETTINGS_FILE,
+    logging_name: str = "skill_launcher",
+) -> None:
     from shared.platform_utils import set_dpi_awareness
     set_dpi_awareness()
-    setup_logging(name="skill_launcher")
+    setup_logging(name=logging_name)
 
     # ── Launcher self-crash dialog ──
     # If an unhandled exception escapes to the top level, show the log before
     # Python exits so the user can copy and report it.
-    _launcher_log = os.path.join(_skill_dir, "logs", "skill_launcher.log")
+    _launcher_log = os.path.join(_skill_dir, "logs", f"{logging_name}.log")
     _orig_excepthook = sys.excepthook
 
     def _launcher_excepthook(exc_type, exc_value, exc_tb):
@@ -765,7 +811,7 @@ def main() -> None:
     cmd_file = args[5] if len(args) > 5 else os.devnull
 
     # Apply UI scale factor before QApplication is created
-    raw = _load_settings_raw()
+    raw = _load_settings_raw(settings_file)
     ui_scale = raw.get("ui_scale", 1.0)
     try:
         ui_scale = max(0.75, min(3.0, float(ui_scale)))
@@ -793,7 +839,12 @@ def main() -> None:
         sg = screen.availableGeometry()
         geom = geom.clamp_to_screen(sg.width(), sg.height())
 
-    app = SCToolboxApp(geom, cmd_file)
+    app = SCToolboxApp(
+        geom,
+        cmd_file,
+        allowed_skill_ids=allowed_skill_ids,
+        settings_file=settings_file,
+    )
     app.run()
 
 

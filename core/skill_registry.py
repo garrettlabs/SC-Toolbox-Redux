@@ -10,68 +10,72 @@ from __future__ import annotations
 import json
 import logging
 import os
+from collections.abc import Mapping
 
 from shared.config_models import SkillConfig
 from shared.i18n import N_
 
 log = logging.getLogger(__name__)
 
+_DEFAULT_LAUNCHER_ENTRY_IDS: dict[str, str] = {
+    'mining': 'mining-loadout',
+    'mining_signals': 'mining-signals',
+}
+
+
+def _apply_launcher_entry_default(config: SkillConfig) -> SkillConfig:
+    if not config.launcher_entry_id:
+        config.launcher_entry_id = _DEFAULT_LAUNCHER_ENTRY_IDS.get(config.id, "")
+    return config
+
+
+def load_launcher_entry_ids_from_install_state(install_state) -> set[str] | None:
+    """Load an optional launcher-entry allowlist from installer state.
+
+    ``None`` and missing ``launcher_entry_ids`` preserve legacy full-launcher
+    discovery.  A supplied allowlist is intentionally strict so corrupted local
+    installer metadata cannot silently broaden launcher visibility.
+    """
+    if install_state is None:
+        return None
+
+    if isinstance(install_state, (str, os.PathLike)):
+        try:
+            with open(install_state, "r", encoding="utf-8") as fh:
+                state = json.load(fh)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"install_state is not valid JSON: {exc}") from exc
+    else:
+        state = install_state
+
+    if not isinstance(state, Mapping):
+        raise ValueError("install_state must be a JSON object")
+
+    raw_ids = state.get("launcher_entry_ids")
+    if raw_ids is None:
+        return None
+    if not isinstance(raw_ids, list):
+        raise ValueError("install_state launcher_entry_ids must be a list")
+
+    launcher_entry_ids: set[str] = set()
+    for raw_id in raw_ids:
+        if not isinstance(raw_id, str) or not raw_id:
+            raise ValueError("install_state launcher_entry_ids must contain only non-empty strings")
+        launcher_entry_ids.add(raw_id)
+    return launcher_entry_ids
+
 # Built-in defaults — used when a skill folder has no skill.json
 _BUILTIN_SKILLS: list[dict] = [
     {
-        "id": "dps", "name": N_("DPS Calculator"), "icon": "\u2694",
-        "color": "#ff7733", "folder": "DPS_Calculator",
-        "script": "dps_calc_app.py", "hotkey": "<shift>+1",
-        "settings_key": "hotkey_dps",
-    },
-    {
-        "id": "cargo", "name": N_("Cargo Loader"), "icon": "\U0001f4e6",
-        "color": "#33ccdd", "folder": "Cargo_loader",
-        "script": "cargo_app.py", "hotkey": "<shift>+2",
-        "settings_key": "hotkey_cargo",
-    },
-    {
-        "id": "missions", "name": N_("Mission/Craft DB"), "icon": "\U0001f4cb",
-        "color": "#33dd88", "folder": "Mission_Database",
-        "script": "mission_db_app.py", "hotkey": "<shift>+3",
-        "settings_key": "hotkey_missions",
-    },
-    {
-        "id": "mining", "name": N_("Mining Loadout"), "icon": "\u26cf",
-        "color": "#ffaa22", "folder": "Mining_Loadout",
-        "script": "mining_loadout_app.py", "hotkey": "<shift>+4",
-        "settings_key": "hotkey_mining",
-    },
-    {
-        "id": "market", "name": N_("Market Finder"), "icon": "\U0001f6d2",
-        "color": "#aa66ff", "folder": "Market_Finder",
-        "script": "uex_item_browser.py", "hotkey": "<shift>+5",
-        "settings_key": "hotkey_market",
-    },
-    {
-        "id": "trade", "name": N_("Trade Hub"), "icon": "\U0001f4b0",
-        "color": "#ffcc00", "folder": "Trade_Hub",
-        "script": "trade_hub_app.py", "hotkey": "<shift>+6",
-        "settings_key": "hotkey_trade",
-        "custom_args": ["300", "500"],
-    },
-    {
-        "id": "craft_db", "name": N_("Craft Database"), "icon": "\U0001f3ed",
-        "color": "#44ccbb", "folder": "Craft_Database",
-        "script": "craft_db_app.py", "hotkey": "<shift>+7",
-        "settings_key": "hotkey_craft_db",
-    },
-    {
-        "id": "battle_buddy", "name": N_("Battle Buddy"), "icon": "\U0001f396",
-        "color": "#dd4444", "folder": "Battle_Buddy",
-        "script": "hud_app.py", "hotkey": "<shift>+8",
-        "settings_key": "hotkey_battle_buddy",
-    },
-    {
-        "id": "mouse_blocker", "name": N_("Mouse Blocker"), "icon": "\U0001f6ab",
-        "color": "#ff3355", "folder": "Mouse_Blocker",
-        "script": "mouse_blocker_app.py", "hotkey": "<shift>+0",
-        "settings_key": "hotkey_mouse_blocker",
+        'id': 'mining',
+        'name': 'Mining Loadout',
+        'icon': '⛏',
+        'color': '#ffaa22',
+        'folder': 'Mining_Loadout',
+        'script': 'mining_loadout_app.py',
+        'hotkey': '<shift>+4',
+        'settings_key': 'hotkey_mining',
+        'launcher_entry_id': 'mining-loadout',
     },
 ]
 
@@ -90,7 +94,7 @@ def _try_load_skill_json(skill_dir: str) -> SkillConfig | None:
         if not cfg.id or not cfg.script:
             log.warning("skill_registry: invalid skill.json in %s (missing id/script)", skill_dir)
             return None
-        return cfg
+        return _apply_launcher_entry_default(cfg)
     except (json.JSONDecodeError, OSError, KeyError, TypeError) as exc:
         log.warning("skill_registry: failed to load %s: %s", path, exc)
         return None

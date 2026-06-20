@@ -37,9 +37,11 @@ def bootstrap_skill(entry_file: str) -> str:
     # shadow the project-root ui/ (which is the launcher's UI).
     shared.path_setup.ensure_path(skill_dir, first=True)
 
-    # Evict any cached 'ui' module from the project root so the skill's
-    # own ui/ package is found on the next import.
-    sys.modules.pop("ui", None)
+    # Evict cached skill-local packages from prior same-process imports so
+    # the current skill's local ui/, services/, data/, controllers/, and models/
+    # packages shadow similarly named packages from other skills.
+    for package_name in ("ui", "services", "data", "controllers", "models"):
+        sys.modules.pop(package_name, None)
 
     # ── i18n: load global + skill-specific translation catalogs ──
     from shared import i18n

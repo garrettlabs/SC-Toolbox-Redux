@@ -1,27 +1,16 @@
 <p align="center">
-  <a href="https://robertsspaceindustries.com/community-hub/post/sc-toolbox-v2-is-released-42-testers-and-counting-aUYFfLH5ecHkh">
-    <img src="assets/cig_staff_pick.png" alt="CIG Staff Pick" width="600">
-  </a>
-</p>
-
-<p align="center">
-  <strong>We got featured by CIG!!! Thank you everyone! We wouldn't be here if it wasn't for your testing, feedback and support!!!</strong>
-</p>
-
-<p align="center">
   <img src="assets/sc_toolbox_logo.png" alt="SC Toolbox" width="128">
 </p>
 
-<h1 align="center">SC Toolbox</h1>
+<h1 align="center">SC Toolbox Redux Mining</h1>
 
 <p align="center">
-  A lightweight desktop overlay suite for <strong>Star Citizen</strong>.<br>
-  Nine gameplay tools — always on top, one hotkey away, no alt-tab required.
+  A mining-focused Star Citizen desktop toolkit built from the SC Toolbox codebase.
 </p>
 
 <p align="center">
-  <a href="https://github.com/ScPlaceholder/SC-Toolbox-Beta-V2/releases/latest">
-    <img src="https://img.shields.io/github/v/release/ScPlaceholder/SC-Toolbox-Beta-V2?label=Download&style=for-the-badge" alt="Download">
+  <a href="https://github.com/garrettlabs/SC-Toolbox-Redux/releases/latest">
+    <img src="https://img.shields.io/badge/Download-Latest%20Release-00D4FF?style=for-the-badge&logo=github" alt="Download latest release">
   </a>
   <a href="https://discord.gg/D3hqGU5hNt">
     <img src="https://img.shields.io/badge/Discord-Join-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Discord">
@@ -30,148 +19,110 @@
 
 ---
 
-## Download & Install
+## What this repo is
 
-**[Download the latest installer](https://github.com/ScPlaceholder/SC-Toolbox-Beta-V2/releases/latest)** — no Python required, everything is bundled.
+This repository is the Redux mining edition of SC Toolbox. It keeps the mining workflows and shared runtime needed to run them, while intentionally leaving out the legacy full-suite launcher surface, installer flow, and non-mining tools.
 
-1. Download `SC_Toolbox_Setup_X.Y.Z.exe`
-2. Run the installer (no admin rights needed — installs per-user)
-3. Launch from the desktop shortcut or Start Menu
-4. First launch: press **Shift + `** to open the launcher, then click any tile or use its hotkey
+After reading this README, you should be able to:
 
----
+1. run the Redux mining launcher from source, or
+2. build a lightweight Redux mining distributable.
 
-## What's New in v2.2.8
-
-- **RGB CNN voter for Mining Signals** — the SC_OCR pipeline now runs an RGB-trained CNN (plus a per-channel-inverted variant) as the primary digit reader, with the original grayscale CNN, CRNN, and Tesseract as fallback voters. Stops losing thin-stroke digits like 9s in low-contrast frames and reads faster on the high-confidence path.
-- **Glyph reviewer drag-select + augmentation cascade** — the training-data review tool (`scripts/review_glyphs.py`) now supports bounding-box drag-select for picking multiple glyphs in one sweep, and automatically moves a sample's augmented siblings (`aug_*.png`) when you re-classify the original.
-- **Stability fixes** — multi-recipe adaptive binarization for wide signature spans, equal-width splitter when blobs survive binarization, glyph-height-proportional comma masking, and a hysteresis gate on signal-value acceptance to suppress single-frame OCR jitter.
-- **Bundled-runtime fixes** — `scipy` now correctly declared in the Mining_Signals runtime requirements (was silently missing). Paddle sidecar pip uses `--only-binary=:all:` to avoid the Rust-toolchain-required `python-bidi` sdist on Python 3.13.
+If you want the original all-tools SC Toolbox experience, use the upstream SC Toolbox project instead.
 
 ---
 
-## Tools
+## Included tools
 
-| Hotkey | Tool | Description | Data Source |
-|--------|------|-------------|------------|
-| Shift+1 | **DPS Calculator** | Ship loadout viewer & DPS calculator with power allocator | erkul.games, fleetyards.net |
-| Shift+2 | **Cargo Loader** | 3D isometric cargo grid viewer & container optimizer | sc-cargo.space |
-| Shift+3 | **Mission Database** | Browse missions, crafting blueprints & mining resources | scmdb.net |
-| Shift+4 | **Mining Loadout** | Mining laser, module & gadget optimizer | uexcorp.space |
-| Shift+5 | **Market Finder** | Searchable catalog of all purchasable items with buy/sell locations | uexcorp.space |
-| Shift+6 | **Trade Hub** | Trade route calculator for single-hop & multi-leg routes | uexcorp.space |
-| Shift+7 | **Craft Database** | Crafting recipe browser with material requirements | scmdb.net |
-| Shift+8 | **Battle Buddy** | Real-time HUD overlay — tracks kills, deaths, and inventory from game logs | Star Citizen game log |
-| — | **Mining Signals** | Live screen overlay reading signal scan %, mass, resistance, and instability from the SCAN RESULTS panel — powered by the new **SC_OCR** engine | Screen capture (SC_OCR + Tesseract) |
+### Mining Signals
 
-Press **Shift + `** to toggle the launcher window.
-
-### SC_OCR — purpose-built for Star Citizen
-
-Mining Signals previously relied on stock Tesseract, which struggled with the SC HUD's sparse digits, anti-aliased glyphs, and varying background luminance. v2.2.6 introduces **SC_OCR**: a CNN-based reader trained on actual in-game captures. Highlights:
-
-- **Adaptive (locally-windowed) thresholding** — handles bright vs dark backgrounds without hand-tuning
-- **Position-based row finder with lock cache** — once a row is found, subsequent frames lock onto it for stability and speed
-- **Multi-frame averaging** — smooths out transient OCR noise from animated panels
-- **Glyph-level confidence** — per-digit classification scores, with an optional live "Glyph Reader" debug view
-- **Self-curating training pipeline** — captures, auto-labels (with consensus voting), quarantines contaminated samples, and stages new data for review
-
-You don't need to do anything to use SC_OCR — it ships pre-trained inside Mining Signals.
-
----
-
-## Screenshots
-
-<p align="center">
-  <img src="assets/screenshots/launcher.png" alt="SC Toolbox Launcher" width="320"><br>
-  <em>The main launcher — click any tile or use the global hotkey to open a tool</em>
-</p>
-
-<p align="center">
-  <img src="assets/screenshots/battle_buddy.png" alt="Battle Buddy" width="800"><br>
-  <em>Battle Buddy — real-time in-game HUD showing equipped weapons, ammo counts, and consumables parsed live from game logs</em>
-</p>
+Mining Signals is the scanner-assist overlay for mining sessions. It reads the Star Citizen HUD and helps identify scan results, signal strength, instability, resistance, mass, and related mining context.
 
 <p align="center">
   <img src="assets/screenshots/mining_signals.png" alt="Mining Signals" width="800"><br>
-  <em>Mining Signals — OCR overlay that identifies ore types and signal strengths directly from your ship's scanner</em>
+  <em>Mining Signals — OCR-assisted mining scanner support.</em>
 </p>
 
-<p align="center">
-  <img src="assets/screenshots/dps_calculator.png" alt="DPS Calculator" width="800"><br>
-  <em>DPS Calculator — live ship loadout viewer with weapon DPS, sustained fire, shield, hull, and power data</em>
-</p>
+### Mining Loadout
 
-<p align="center">
-  <img src="assets/screenshots/cargo_loader.png" alt="Cargo Loader" width="800"><br>
-  <em>Cargo Loader — 3D isometric cargo grid for the Drake Caterpillar (576 SCU) with auto-optimize and commodity assignment</em>
-</p>
-
-<p align="center">
-  <img src="assets/screenshots/mission_database.png" alt="Mission Database" width="800"><br>
-  <em>Mission Database — searchable browser for 1,381 missions across all systems, factions, and mission types</em>
-</p>
+Mining Loadout helps compare mining heads, modules, modifiers, and ship setups so you can tune a mining configuration before heading out.
 
 <p align="center">
   <img src="assets/screenshots/mining_loadout.png" alt="Mining Loadout" width="800"><br>
-  <em>Mining Loadout — configure and compare mining lasers, modules, and gadgets for any ship</em>
+  <em>Mining Loadout — mining component planning and comparison.</em>
 </p>
-
-<p align="center">
-  <img src="assets/screenshots/market_finder.png" alt="Market Finder" width="800"><br>
-  <em>Market Finder — browse 272 ships and items with buy prices, cargo capacity, crew, and all purchase locations</em>
-</p>
-
-<p align="center">
-  <img src="assets/screenshots/trade_hub.png" alt="Trade Hub" width="800"><br>
-  <em>Trade Hub — multi-leg mixed freight route calculator showing 293 routes for a C2 Hercules Starlifter with profits up to 12.6M aUEC per run</em>
-</p>
-
-<p align="center">
-  <img src="assets/screenshots/craft_database.png" alt="Craft Database" width="800"><br>
-  <em>Craft Database — browse 1,040 craftable items with full material requirements and mission unlock conditions</em>
-</p>
-
----
-
-## Features
-
-- **Always-on-top overlay** — stays visible over Star Citizen
-- **Global hotkeys** — toggle any tool without alt-tabbing
-- **Customizable keybinds** — rebind all hotkeys in Settings
-- **Live data** — prices, loadouts, and missions pulled from community APIs
-- **Local caching** — fast startup with automatic background refresh
-- **WingmanAI integration** — works as a voice-activated WingmanAI skill (optional)
 
 ---
 
 ## Requirements
 
-- Windows 10 or 11 (64-bit)
-- Internet connection (for live game data)
+For source runs and local builds, use Windows with Python 3.9 or newer.
+
+The source launcher searches common local Python installs and prints the interpreter it selected. If Python is missing, install Python first and rerun the command.
 
 ---
 
-## Manual Install (Advanced)
+## Run from source
 
-If you prefer to run from source instead of the installer:
+From the repository root, run:
 
-1. Install Python 3.10+
-2. Run `INSTALL_AND_LAUNCH.bat` (installs dependencies and launches)
-3. Or manually: `pip install -r requirements.txt` then `python skill_launcher.py`
+```powershell
+.\RUN_REDUX_MINING.bat
+```
+
+The source launcher:
+
+- starts only the Redux mining surface;
+- verifies the mining entrypoint can import before launching;
+- avoids the legacy full installer, bootstrapper, and user-selected script paths;
+- keeps the visible launcher allowlist limited to Mining Loadout and Mining Signals.
+
+Use this path for fast local iteration and smoke testing.
 
 ---
 
-## Data Sources & Credits
+## Build the Redux mining distributable
 
-- [erkul.games](https://erkul.games) — DPS calculator data, weapon stats ([Patreon](https://patreon.com/erkul))
-- [uexcorp.space](https://uexcorp.space) — Market prices, trade routes, ship data, mining equipment
-- [scmdb.net](https://scmdb.net) — Mission database, crafting blueprints, mining resources
-- [fleetyards.net](https://fleetyards.net) — Ship hardpoint data
-- [sc-cargo.space](https://sc-cargo.space) — Cargo grid layouts
+From the repository root, run:
+
+```powershell
+.\build\build_redux_mining.bat
+```
+
+The Redux build creates a lightweight mining-only distributable under the local build output folder. It is separate from the legacy SC Toolbox installer path.
+
+Use this when you want a portable Redux mining package rather than a source run.
 
 ---
 
-## Community
+## What is intentionally excluded
 
-- [Discord](https://discord.gg/D3hqGU5hNt) — Bug reports, feedback, and discussion
+This repo is not the legacy full SC Toolbox distribution. It intentionally excludes:
+
+- non-mining tool source trees;
+- legacy root launchers and installer scripts;
+- archived source snapshots;
+- generated debug samples and local OCR scratch data;
+- full-suite installer UI assets and packaging files.
+
+That boundary keeps the Redux mining repo smaller and makes the supported launch path explicit.
+
+---
+
+## Development checks
+
+Before publishing a cleaned Redux commit, run the test suite:
+
+```powershell
+python -m pytest -q --tb=short
+```
+
+At minimum, the Redux checks should prove that the mining build surface exists, the non-mining source boundary stays closed, and the cleanup verifiers agree with the current repository shape.
+
+---
+
+## Support
+
+- Report issues in GitHub Issues.
+- Join Discord for usage questions and testing feedback.
+- Include your Star Citizen resolution, Windows version, Python version, and what you were doing when the issue appeared.

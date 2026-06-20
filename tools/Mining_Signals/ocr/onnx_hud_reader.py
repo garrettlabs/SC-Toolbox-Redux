@@ -4863,9 +4863,6 @@ def scan_hud_onnx(region: dict) -> dict[str, Optional[float]]:
         "panel_visible": False,
     }
 
-    if not _ensure_model():
-        return result
-
     t0 = time.time()
 
     # ── SC-OCR ENGINE (primary, legacy disabled) ──

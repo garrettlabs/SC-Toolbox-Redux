@@ -703,12 +703,32 @@ def find_scan_results_anchor(
         return _LAST_CALL_CACHE[5]
 
     variants = _load_template()
-    if not variants:
-        _LAST_CALL_CACHE = (*cache_key, None)
-        return None
 
     W, H = img.size
     if W < 40 or H < 40:
+        _LAST_CALL_CACHE = (*cache_key, None)
+        return None
+
+    if not variants:
+        if sc_norm is None:
+            # Template assets are optional at runtime; when they are missing
+            # or malformed, still allow the independent label-row/layout
+            # evidence to synthesize the SCAN RESULTS title pose. This keeps
+            # the Mining Signals display gate from suppressing valid HUD reads
+            # solely because the NCC template path is unavailable.
+            co = _row_consensus_title(img, [], 0, 0)
+            if co is not None:
+                best_score, x, y, w, h = co
+                raw_anchor = {
+                    "title_x": int(x),
+                    "title_y": int(y),
+                    "title_w": int(w),
+                    "title_h": int(h),
+                    "score": float(best_score),
+                }
+                anchor = _smooth_anchor(raw_anchor, time.monotonic())
+                _LAST_CALL_CACHE = (*cache_key, anchor)
+                return anchor
         _LAST_CALL_CACHE = (*cache_key, None)
         return None
 
@@ -909,9 +929,12 @@ def find_scan_results_anchor(
     # on the name row and tripped EARLY-DIRECT's ratio bounds every
     # cycle). When the cross-frame tracker holds a FRESH reference, a
     # legitimate local hit must look like it: same render scale (width
-    # within ±33%) and no score collapse (≥60% of the reference's).
-    # Anything else returns None so the caller escalates to the
-    # full-frame sweep, which carries the tracker + outlier hysteresis.
+    # within ±33%) and no severe score collapse (≥50% of the reference's).
+    # Local crops are canonicalized independently from full-frame crops,
+    # so clean same-pose titles can score slightly under the old 60% guard
+    # while still being valid. Anything weaker returns None so the caller
+    # escalates to the full-frame sweep, which carries the tracker +
+    # outlier hysteresis.
     if sc_norm is not None:
         with _anchor_tracker_lock:
             _ref = _anchor_tracker_state.get("smoothed")
@@ -920,7 +943,7 @@ def find_scan_results_anchor(
             _ref_w = max(1, int(_ref.get("title_w", 1)))
             _ref_s = float(_ref.get("score", 0.0))
             _wr = float(w) / float(_ref_w)
-            if _wr < 0.75 or _wr > 1.33 or best_score < 0.6 * _ref_s:
+            if _wr < 0.75 or _wr > 1.33 or best_score < 0.5 * _ref_s:
                 log.debug(
                     "scan_results_match: local candidate rejected by "
                     "tracker-reference guard (w=%d vs ref=%d, "

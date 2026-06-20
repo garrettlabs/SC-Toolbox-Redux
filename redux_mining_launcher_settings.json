@@ -1,0 +1,25 @@
+{
+  "hotkey_launcher": "<shift>+`",
+  "language": "en",
+  "scroll_on_hover": false,
+  "grid_rows": 3,
+  "grid_cols": 2,
+  "launcher_opacity": 0.9490196078431372,
+  "ui_scale": 1.0,
+  "hide_on_tool_active": false,
+  "disabled_skills": [
+    "craft_db"
+  ],
+  "keybinds_disabled": [],
+  "grid_layout": {},
+  "mining_x": 100,
+  "mining_y": 100,
+  "mining_w": 1300,
+  "mining_h": 800,
+  "mining_opacity": 0.95,
+  "mining_signals_x": 100,
+  "mining_signals_y": 100,
+  "mining_signals_w": 1300,
+  "mining_signals_h": 800,
+  "mining_signals_opacity": 0.95
+}
